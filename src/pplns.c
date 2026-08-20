@@ -7,10 +7,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Claims smaller than this in absolute value are dropped from the ledger when
- * they would otherwise persist forever. One part in a billion of a block reward
- * is well under a satoshi at any plausible subsidy. */
-#define CLAIM_EPSILON 1e-9
+/* A claim is only worth carrying if it is worth at least one satoshi of the
+ * block that produced it. Anything smaller is floor() residue, not a deferral.
+ *
+ * This has to be satoshi-RELATIVE, not a fixed constant: at a ~3.2 ECX reward a
+ * single satoshi is ~3.2e-9 of the block, so a fixed 1e-9 epsilon kept residue
+ * worth a fraction of a satoshi. That made every paid address linger in the
+ * ledger, inflated the "deferred claims" count in the logs to something
+ * meaningless, and would have grown prop_ledger by a row per address per block
+ * forever. */
+static double claim_epsilon(int64_t reward_after_fee) {
+    return (reward_after_fee > 0) ? (1.0 / (double)reward_after_fee) : 1e-12;
+}
 
 /* Internal working state for one address. */
 typedef struct {
@@ -156,6 +164,7 @@ int pplns_compute_payouts(int64_t reward_after_fee,
      *
      * The largest emitted claim takes the residual, which keeps the ledger
      * summing to exactly zero in floating point instead of drifting. */
+    const double eps = claim_epsilon(reward_after_fee);
     size_t nl = 0;
     double sum_others = 0.0;
     for (size_t i = 0; i < nw; i++) {
@@ -166,7 +175,7 @@ int pplns_compute_payouts(int64_t reward_after_fee,
     largest->claim = -sum_others;
 
     for (size_t i = 0; i < nw; i++) {
-        if (fabs(w[i].claim) < CLAIM_EPSILON) continue;
+        if (fabs(w[i].claim) < eps) continue;   /* worth less than one satoshi */
         if (nl >= ledger_cap) { free(rank); free(w); return -1; }
         snprintf(ledger[nl].address, sizeof ledger[nl].address, "%s", w[i].address);
         ledger[nl].claim_fraction = w[i].claim;

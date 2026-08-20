@@ -48,6 +48,31 @@ static void assert_conserves(const pplns_payout_t *p, size_t n, int64_t reward) 
     }
 }
 
+/* Everyone paid in full means an EMPTY ledger — not a pile of sub-satoshi
+ * residue. Regression: a fixed 1e-9 epsilon is smaller than one satoshi of a
+ * ~3.2 ECX block, so floor() residue survived and every paid address was
+ * reported as a deferred claim. */
+static void test_paid_in_full_leaves_no_ledger(void) {
+    /* Deliberately indivisible: 3 addresses, a reward that does not divide. */
+    pplns_addr_t addrs[] = { { "a", 33.0 }, { "b", 33.0 }, { "c", 34.0 } };
+    pplns_claim_t ledger[8] = {0};
+    pplns_payout_t payouts[8] = {0};
+    size_t np = 0, nl = 0;
+    assert(pplns_compute_payouts(REWARD + 7, 100.0, addrs, 3, ledger, 8, 0, &nl,
+                                 THRESHOLD, 12, payouts, &np) == 0);
+    assert(np == 3);
+    assert_conserves(payouts, np, REWARD + 7);
+    if (nl != 0) {
+        fprintf(stderr, "ledger should be empty, has %zu:\n", nl);
+        for (size_t i = 0; i < nl; i++)
+            fprintf(stderr, "  %s %+.12f (%.3f sat)\n", ledger[i].address,
+                    ledger[i].claim_fraction,
+                    ledger[i].claim_fraction * (double)(REWARD + 7));
+        abort();
+    }
+    printf("ok: everyone paid in full leaves an empty ledger\n");
+}
+
 static void test_simple_split(void) {
     pplns_addr_t addrs[] = { { "addrA", 50.0 }, { "addrB", 50.0 } };
     pplns_claim_t ledger[4] = {0};
@@ -218,10 +243,16 @@ static void test_conserves_over_many_blocks(void) {
         assert(rc == 0);
         assert(n_payouts >= 1 && n_payouts <= 12);
         assert_conserves(payouts, n_payouts, reward);
-        /* Zero-sum: an advance to one miner is a deferral by another. */
-        if (fabs(sum_claims(ledger, n_out)) > 1e-9) {
-            fprintf(stderr, "LEDGER DRIFT at block %d: %.12f\n",
-                    block, sum_claims(ledger, n_out));
+        /* Zero-sum, to within the satoshi the ledger cannot express. A claim
+         * worth under one satoshi is pruned rather than carried — it can never
+         * be paid — so each participant can shed up to a satoshi of residue.
+         * The tolerance is therefore denominated in satoshis and scales with
+         * the working set. What must stay EXACT is the payout total, asserted
+         * separately by assert_conserves(). */
+        double drift_sats = fabs(sum_claims(ledger, n_out)) * (double)reward;
+        if (drift_sats > (double)(n + n_out) + 1.0) {
+            fprintf(stderr, "LEDGER DRIFT at block %d: %.3f sat over %zu entries "
+                    "(%zu addresses)\n", block, drift_sats, n_out, n);
             abort();
         }
         n_ledger = n_out;
@@ -253,6 +284,7 @@ static void test_rejects_bad_input(void) {
 
 int main(void) {
     test_simple_split();
+    test_paid_in_full_leaves_no_ledger();
     test_remainder_to_largest();
     test_deferred_miner_does_not_shrink_the_coinbase();
     test_released_claim_does_not_overpay();
