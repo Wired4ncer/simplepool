@@ -691,6 +691,24 @@ static void test_worker_recent_difficulty(void) {
     double d = store_worker_recent_difficulty(s, "w.ramp", 3600);
     assert(d == 4096.0);                       /* the converged value, not the ramp */
 
+    /* The live failure: a long tail of low-difficulty ramp shares from repeated
+     * reconnects, then a converged value. A median over the whole lookback
+     * returns the ramp; the median of the most RECENT shares must not. */
+    for (int i = 0; i < 200; i++)
+        assert(store_record_share_addr(s, "w.churn", "bcrt1qccc",
+                                       (now_s - 3000 + (uint64_t)i) * 1000ULL,
+                                       (i % 4) + 1.0, 0, NULL, 0, 0.0) == 0);
+    for (int i = 0; i < 24; i++)
+        assert(store_record_share_addr(s, "w.churn", "bcrt1qccc",
+                                       (now_s - 120 + (uint64_t)i) * 1000ULL,
+                                       13680.0, 0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+    double churn = store_worker_recent_difficulty(s, "w.churn", 3600);
+    if (churn != 13680.0) {
+        fprintf(stderr, "expected 13680 (converged), got %.1f — the ramp tail won\n", churn);
+        abort();
+    }
+
     /* Too little history is not worth trusting: fall back to initial_diff. */
     for (int i = 0; i < 3; i++)
         assert(store_record_share_addr(s, "w.new", "bcrt1qbbb",

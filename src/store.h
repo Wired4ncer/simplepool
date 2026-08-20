@@ -179,9 +179,13 @@ void store_get_stats(store_t *s, store_stats_t *out);
 void store_test_set_ring_capacity(size_t cap);
 
 /* Typical share difficulty this worker was recently running at, for seeding a
- * reconnecting miner instead of restarting it at initial_diff. Uses the MEDIAN
- * of its recent shares, not the mean: a vardiff ramp leaves a tail of tiny
- * difficulties from the climb, and a mean would be dragged down by them.
+ * reconnecting miner instead of restarting it at initial_diff.
+ *
+ * The median of its LAST 32 shares — newest first, then median. Not the mean
+ * (a vardiff ramp's tail of tiny difficulties drags it down) and not the
+ * median over the whole lookback (same problem: an Avalon converged at 13,680
+ * had an hour-median of 4, because repeated restarts meant most of its shares
+ * came from the climb). The last few dozen shares are where vardiff settled.
  * Returns 0.0 when the worker has no usable history. */
 double store_worker_recent_difficulty(store_t *s, const char *worker_name,
                                       int lookback_sec);

@@ -1277,13 +1277,21 @@ double store_worker_recent_difficulty(store_t *s, const char *worker_name,
                                       int lookback_sec) {
     if (!s || !worker_name || !*worker_name || lookback_sec <= 0) return 0.0;
 
-    /* Median of the most recent shares. Ordering by difficulty and taking the
-     * middle row is exact and cheap at this row count. */
+    /* Median of the most RECENT shares — newest first, then median of those.
+     *
+     * Not the median over the whole lookback: vardiff climbs 4x per window, so
+     * a miner that has reconnected a few times leaves a long tail of low-
+     * difficulty ramp shares. Observed live — an Avalon that had converged to
+     * 13,680 had an hour-median of 4, because repeated restarts meant most of
+     * its shares were from the climb. The last few dozen shares are where
+     * vardiff had actually settled. */
     static const char *Q =
-        "SELECT s.difficulty FROM shares s"
-        "  JOIN workers w ON s.worker_id = w.id"
-        "  WHERE w.name = ? AND s.ts >= ? AND s.is_block = 0"
-        "  ORDER BY s.difficulty";
+        "SELECT s.difficulty FROM ("
+        "  SELECT s2.difficulty AS difficulty, s2.ts AS ts FROM shares s2"
+        "    JOIN workers w2 ON s2.worker_id = w2.id"
+        "    WHERE w2.name = ? AND s2.ts >= ? AND s2.is_block = 0"
+        "    ORDER BY s2.ts DESC, s2.id DESC LIMIT 32"
+        ") s ORDER BY s.difficulty";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
