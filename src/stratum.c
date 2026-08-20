@@ -971,22 +971,24 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
-    if (c->difficulty <= 0) {
-        /* Prefer what this worker was actually running at. A reconnect or a
-         * pool restart otherwise drops it to initial_diff and makes vardiff
-         * climb again at 4x per window — minutes of flooding and shed shares
-         * for a multi-TH/s miner that was already converged. */
-        double hint = 0.0;
-        if (s->cfg.on_difficulty_hint) {
-            hint = s->cfg.on_difficulty_hint(s->cfg.ctx, c->worker_name);
-        }
-        if (hint > 0.0) {
-            c->difficulty = hint;
-            LOG_INFO("stratum: %s resumed at difficulty %.0f from its own history",
-                     c->worker_name, hint);
-        } else {
-            c->difficulty = s->cfg.initial_diff;
-        }
+    /* Prefer what this worker was actually running at. A reconnect or a pool
+     * restart otherwise drops it to initial_diff and makes vardiff climb again
+     * at 4x per window — minutes of flooding and shed shares for a multi-TH/s
+     * miner that was already converged.
+     *
+     * ⚠️ Do NOT gate this on `c->difficulty <= 0`: the connection constructor
+     * already assigns initial_diff, so that test never holds and the hint is
+     * silently never consulted. That shipped once and did nothing. */
+    double hint = 0.0;
+    if (s->cfg.on_difficulty_hint) {
+        hint = s->cfg.on_difficulty_hint(s->cfg.ctx, c->worker_name);
+    }
+    if (hint > 0.0) {
+        c->difficulty = hint;
+        LOG_INFO("stratum: %s resumed at difficulty %.0f from its own history",
+                 c->worker_name, hint);
+    } else if (c->difficulty <= 0) {
+        c->difficulty = s->cfg.initial_diff;
     }
     /* Same clamp as vardiff: a starting difficulty above the network
      * difficulty would make the miner discard valid blocks locally. */

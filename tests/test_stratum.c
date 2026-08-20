@@ -583,6 +583,72 @@ static void test_dedupe_same_hash_across_job_ids(void) {
 }
 
 
+/* A worker with history must be handed that difficulty at authorize, not
+ * initial_diff. Regression: the first version of this gated the lookup on
+ * `c->difficulty <= 0`, but the connection constructor has already assigned
+ * initial_diff, so the hook was never called and the fix was inert on the
+ * live pool while looking correct in the source. */
+static double hint_cb(void *ctx, const char *worker) {
+    (void)worker;
+    int *called = (int *)ctx;
+    (*called)++;
+    return 4096.0;
+}
+static double hint_none_cb(void *ctx, const char *worker) {
+    (void)ctx; (void)worker; return 0.0;
+}
+
+static void test_authorize_resumes_difficulty_from_hint(void) {
+    int called = 0;
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                          .ctx = &called, .on_difficulty_hint = hint_cb };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    /* No job yet: the authorize-time network clamp has nothing to clamp
+     * against, so the seeded difficulty survives. Same trick as
+     * test_block_wins_over_low_difficulty. */
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(called == 1);
+    CHECK(out != NULL);
+    /* The miner must be told 4096, not the initial_diff of 1. */
+    CHECK(out && strstr(out, "\"params\":[4096]") != NULL);
+    CHECK(out && strstr(out, "\"params\":[1]") == NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: authorize resumes difficulty from history\n");
+}
+
+/* No history: initial_diff still applies. */
+static void test_authorize_without_hint_uses_initial(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 7.0,
+                          .on_difficulty_hint = hint_none_cb };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(out && strstr(out, "\"params\":[7]") != NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: no history falls back to initial_diff\n");
+}
+
 /* ---------- pool_mode=proportional (P.3) ---------- */
 
 /* The enforcer-shaped template from test_coinbase.c: segwit, one 50 BTC
@@ -815,6 +881,8 @@ int main(void) {
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
     test_dedupe_same_hash_across_job_ids();
+    test_authorize_resumes_difficulty_from_hint();
+    test_authorize_without_hint_uses_initial();
     test_proportional_shared_coinbase();
     test_proportional_falls_back_without_window();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
