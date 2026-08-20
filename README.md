@@ -28,13 +28,21 @@ source: <https://github.com/rsantacroce/simplepool>.
 > verify what they're owed. simplepool aims to address this transparency
 > gap. (Hopefully!)
 
-This repository ships **both modes**, selected by `pool_mode` in
+This repository ships **three modes**, selected by `pool_mode` in
 `proxy.conf`:
 
 - **`pool_mode = solo`** (default) — every share lands in the local
   SQLite store, every accepted block is paid directly in its own
   coinbase to the miner who found it, and there is no off-chain
   accounting. Stratum username is a Bitcoin address.
+- **`pool_mode = proportional`** — coinbase-direct PPLNS. One shared
+  coinbase per template pays **every address in the PPLNS window**
+  pro-rata by share difficulty, so a block is split among the miners who
+  contributed to it rather than going to whoever found it. Like solo it
+  holds no funds and needs no payout worker: the coinbase *is* the
+  payment, and every miner can verify their own output in the block.
+  Requires a server-provided coinbase (`coinbasetxn`), e.g. the CUSF
+  enforcer. See [`PROPORTIONAL_PAYOUTS.md`](PROPORTIONAL_PAYOUTS.md).
 - **`pool_mode = pps-classic`** — every accepted block's coinbase pays a
   single pool-owned BTC wallet (`pool_btc_address`) as a normal output.
   Each accepted share credits the miner's `pps_credits.accrued_sats` at
