@@ -1062,6 +1062,33 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
  *
  * Parses only far enough to walk the output list. Returns 0 on success,
  * negative on malformed input; counts are untouched on failure. */
+size_t coinbase_max_payout_outputs(int64_t weight_limit,
+                                   int64_t tx_weight_total,
+                                   size_t template_coinbase_bytes,
+                                   size_t scriptsig_growth_bytes,
+                                   int fee_output,
+                                   size_t ceiling,
+                                   int64_t *out_headroom_wu) {
+    if (out_headroom_wu) *out_headroom_wu = -1;
+    if (ceiling < 1) ceiling = 1;
+    /* No weightlimit from the server: nothing to measure against. */
+    if (weight_limit <= 0) return ceiling;
+
+    int64_t headroom = weight_limit
+                     - tx_weight_total
+                     - (int64_t)template_coinbase_bytes * 4
+                     - (int64_t)scriptsig_growth_bytes * 4
+                     - COINBASE_WEIGHT_SAFETY_WU;
+    if (out_headroom_wu) *out_headroom_wu = headroom;
+    if (headroom < 0) return 1;
+
+    /* The template already budgeted one spendable output, so the first payout
+     * costs nothing extra; the operator fee output takes one of the slots. */
+    int64_t allowed = 1 + headroom / COINBASE_PAYOUT_TXOUT_WU - (fee_output ? 1 : 0);
+    if (allowed < 1) allowed = 1;
+    return ((uint64_t)allowed < (uint64_t)ceiling) ? (size_t)allowed : ceiling;
+}
+
 int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
                              char *errbuf, size_t errlen) {
     if (!coinbase_tx_hex || !out_reward) {

@@ -194,6 +194,38 @@ static double template_net_diff(const bitcoind_template_t *t) {
     return target_to_diff(target_be);
 }
 
+/* Gather this template's weight facts and ask coinbase.c how many payout
+ * outputs fit. A static cap cannot be right — headroom moves block to block.
+ * Measured on the live alpha node, a 1,710-tx template left 2,685 WU (21
+ * outputs) while the configured ceiling was 12; on a fuller block 12 would
+ * have been too many. After the fork, ECX blocks may be nearly empty and the
+ * ceiling is all that limits us. So prop_max_outputs is an upper bound, not
+ * the operating value. */
+static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
+                                            const proxy_config_t *cfg,
+                                            int fee_output,
+                                            int64_t *out_headroom_wu) {
+    size_t ceiling = (size_t)cfg->prop_max_outputs;
+    if (ceiling > PROP_PLAN_MAX_PAY) ceiling = PROP_PLAN_MAX_PAY;
+    if (!t->coinbasetxn_hex) {
+        if (out_headroom_wu) *out_headroom_wu = -1;
+        return ceiling;
+    }
+    int64_t tx_weight = 0;
+    for (size_t i = 0; i < t->tx_count; i++) tx_weight += t->txs[i].weight;
+
+    /* What the builder splices into the scriptSig: both extranonces, plus the
+     * tag and its length byte. Mirrors coinbase_build_from_template_multi. */
+    size_t ss_growth = 4 + 4;
+    size_t taglen = strlen(cfg->coinbase_tag);
+    if (taglen) ss_growth += (taglen > 75 ? 75 : taglen) + 1;
+
+    return coinbase_max_payout_outputs(t->weight_limit, tx_weight,
+                                       strlen(t->coinbasetxn_hex) / 2,
+                                       ss_growth, fee_output, ceiling,
+                                       out_headroom_wu);
+}
+
 /* Compute the PPLNS payout set for a template.
  *
  * Returns 0 with *plan filled when a usable window exists, 1 when there is no
@@ -281,8 +313,9 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     if (n_ledger_in) memcpy(ledger, ledger_in, n_ledger_in * sizeof(*ledger));
     free(ledger_in);
 
-    size_t max_out = (size_t)s->cfg->prop_max_outputs;
-    if (max_out > PROP_PLAN_MAX_PAY) max_out = PROP_PLAN_MAX_PAY;
+    int64_t headroom_wu = -1;
+    size_t max_out = prop_max_outputs_for_template(t, s->cfg, fee_sats > 0,
+                                                   &headroom_wu);
 
     size_t n_payouts = 0, n_ledger_out = 0;
     int rc = pplns_compute_payouts(reward_after_fee, actual_diff,
@@ -330,11 +363,13 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
 
     LOG_INFO("proportional: %zu payout outputs over %.2f window difficulty "
              "(want %.1f x network %.2f = %.2f, floor %d s, window spans %llu s), "
-             "reward-after-fee %lld sats, %zu deferred claims",
+             "reward-after-fee %lld sats, %zu deferred claims, "
+             "cap %zu of %d (weight headroom %lld WU)",
              n_payouts, actual_diff, s->cfg->prop_window_k, net_diff, want_diff,
              s->cfg->prop_window_min_sec,
              (unsigned long long)((now - start_ms) / 1000),
-             (long long)reward_after_fee, n_ledger_out);
+             (long long)reward_after_fee, n_ledger_out,
+             max_out, s->cfg->prop_max_outputs, (long long)headroom_wu);
     return 0;
 }
 

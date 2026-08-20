@@ -49,6 +49,12 @@ typedef struct {
     char *longpollid;                 /* owned, may be NULL */
     bitcoind_template_tx_t *txs;       /* owned array */
     size_t tx_count;
+    /* BIP22 "weightlimit" — the block weight the template was built against.
+     * 0 when the server omits it, in which case callers must assume nothing
+     * about headroom rather than guessing a limit. Needed because our coinbase
+     * adds outputs the server did NOT budget weight for: the enforcer reserves
+     * room for exactly one payout txout. */
+    int64_t weight_limit;
 } bitcoind_template_t;
 
 /* Initialize a client. Does NOT make a network call. Returns 0 on success,

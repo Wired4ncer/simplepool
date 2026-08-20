@@ -366,6 +366,10 @@ int bitcoind_parse_template(void *result_json,
     t->curtime = (uint32_t)jct->valuedouble;
     t->version = (int32_t)jv->valuedouble;
     t->min_time = cJSON_IsNumber(jmt) ? (int64_t)jmt->valuedouble : 0;
+    {
+        cJSON *jwl = cJSON_GetObjectItemCaseSensitive(r, "weightlimit");
+        t->weight_limit = cJSON_IsNumber(jwl) ? (int64_t)jwl->valuedouble : 0;
+    }
     /* curtime can sit below the consensus minimum (median-time-past + 1)
      * when blocks were just mined in a rapid burst, e.g. regtest
      * generatetoaddress — a block stamped with it is rejected

@@ -505,6 +505,50 @@ static void test_template_reward(void) {
     printf("ok: coinbase_template_reward\n");
 }
 
+/* The adaptive output cap. An overweight block is rejected outright, so this
+ * must never return more outputs than the template's spare weight allows —
+ * and must not needlessly defer miners when there is room. */
+static void test_max_payout_outputs(void) {
+    int64_t hr = 0;
+
+    /* No weightlimit from the server: nothing to measure, keep the operator's
+     * number rather than inventing a limit. */
+    assert(coinbase_max_payout_outputs(0, 0, 200, 21, 1, 12, &hr) == 12);
+    assert(hr == -1);
+
+    /* A nearly-empty block: the ceiling binds, not the weight. This is the
+     * post-fork case — ECX blocks with almost no transactions. */
+    assert(coinbase_max_payout_outputs(4000000, 1000, 200, 21, 1, 12, &hr) == 12);
+    assert(hr > 3900000);
+
+    /* The live alpha measurement: 4 MWU limit, 3,997,315 WU of transactions,
+     * a 250-byte template coinbase, tag + extranonce, fee output present.
+     * Headroom 4,000,000-3,997,315-1000-84-400 = 1,201 WU -> 9 extra outputs,
+     * +1 already budgeted, -1 for the fee output = 9. */
+    size_t n = coinbase_max_payout_outputs(4000000, 3997315, 250, 21, 1, 64, &hr);
+    assert(hr == 4000000 - 3997315 - 1000 - 84 - 400);
+    assert(n == (size_t)(1 + hr / COINBASE_PAYOUT_TXOUT_WU - 1));
+    /* Whatever it returns must FIT: the outputs it permits, beyond the one the
+     * template budgeted, must not exceed the headroom. */
+    assert((int64_t)(n + 1 - 1) * COINBASE_PAYOUT_TXOUT_WU <= hr + COINBASE_PAYOUT_TXOUT_WU);
+
+    /* A completely full block: fall back to a single output rather than
+     * building something that will be rejected. */
+    assert(coinbase_max_payout_outputs(4000000, 4000000, 250, 21, 1, 12, &hr) == 1);
+    assert(hr < 0);
+
+    /* The fee output really does consume a slot. */
+    size_t with_fee = coinbase_max_payout_outputs(4000000, 3998000, 250, 21, 1, 64, NULL);
+    size_t no_fee   = coinbase_max_payout_outputs(4000000, 3998000, 250, 21, 0, 64, NULL);
+    assert(no_fee == with_fee + 1);
+
+    /* Never zero, never above the ceiling. */
+    assert(coinbase_max_payout_outputs(4000000, 3999900, 250, 21, 1, 12, NULL) >= 1);
+    assert(coinbase_max_payout_outputs(4000000, 0, 250, 21, 0, 3, NULL) == 3);
+
+    printf("ok: coinbase_max_payout_outputs adapts to template weight\n");
+}
+
 /* Multi-output builder: split the 50 BTC reward three ways. */
 static void test_build_from_template_multi(void) {
     coinbase_parts_t parts = {0};
@@ -656,6 +700,7 @@ int main(void) {
     test_build_from_template();
     test_build_from_template_fee_split();
     test_template_reward();
+    test_max_payout_outputs();
     test_build_from_template_multi();
     test_build_from_template_multi_fee();
     test_build_from_template_multi_sum_check();

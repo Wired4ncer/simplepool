@@ -128,6 +128,48 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
 int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
                              char *errbuf, size_t errlen);
 
+/* Weight of one extra P2WPKH coinbase output: 8-byte value + 1-byte script
+ * length + 22-byte scriptPubKey = 31 bytes, non-witness, so x4. */
+#define COINBASE_PAYOUT_TXOUT_WU 124
+
+/* Weight deliberately left unused. The server's accounting and ours can differ
+ * by a few bytes (varint boundaries, a server that revises its coinbase), and
+ * being one weight unit over the limit costs the entire block. */
+#define COINBASE_WEIGHT_SAFETY_WU 400
+
+/* How many payout outputs a template can carry without going overweight.
+ *
+ * A server that dictates the coinbase budgets weight for the outputs IT put
+ * there — the CUSF enforcer reserves room for exactly one payout txout. Every
+ * output we add beyond that, and the extranonce and tag we splice into the
+ * scriptSig, is weight the template did not plan for. On a nearly-full block
+ * that surplus is what pushes it past the limit and gets it rejected at
+ * submitblock.
+ *
+ * weight_limit:            BIP22 "weightlimit"; <= 0 means the server did not
+ *                          say, so `ceiling` is returned unchanged — with
+ *                          nothing to measure, guessing a limit is worse than
+ *                          deferring to the operator.
+ * tx_weight_total:         summed "weight" of the template's transactions.
+ * template_coinbase_bytes: serialized length of the template's coinbase.
+ *                          Counted as all-non-witness (x4), which over-states
+ *                          it and therefore errs toward fewer outputs.
+ * scriptsig_growth_bytes:  extranonce + tag bytes the builder will splice in.
+ * fee_output:              non-zero if an operator fee output will be emitted;
+ *                          it consumes one of the available slots.
+ * ceiling:                 operator's configured maximum.
+ *
+ * Returns at least 1 — one payout output is already inside the server's own
+ * budget, and a block must pay someone. *out_headroom_wu (optional) receives
+ * the computed spare weight, or -1 when it could not be computed. */
+size_t coinbase_max_payout_outputs(int64_t weight_limit,
+                                   int64_t tx_weight_total,
+                                   size_t template_coinbase_bytes,
+                                   size_t scriptsig_growth_bytes,
+                                   int fee_output,
+                                   size_t ceiling,
+                                   int64_t *out_headroom_wu);
+
 void coinbase_parts_free(coinbase_parts_t *p);
 
 /* Count a serialized coinbase's outputs, split into spendable and OP_RETURN.
