@@ -1312,14 +1312,19 @@ int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
 }
 
 int store_prop_compute_window(store_t *s, double window_difficulty,
-                              uint64_t before_ms,
+                              uint64_t before_ms, int min_window_sec,
                               uint64_t *out_start_ms,
                               double *out_actual_difficulty) {
-    if (!s || window_difficulty <= 0.0 || !out_start_ms || !out_actual_difficulty)
+    if (!s || window_difficulty <= 0.0 || !out_start_ms || !out_actual_difficulty ||
+        min_window_sec < 0)
         return -1;
 
     /* The shares table stores Unix seconds; callers pass milliseconds. */
     sqlite3_int64 before_s = (sqlite3_int64)(before_ms / 1000);
+    /* The floor: the walk must reach at least this far back before it may stop,
+     * however little difficulty it has accumulated by then. */
+    sqlite3_int64 floor_s = before_s - (sqlite3_int64)min_window_sec;
+    if (floor_s < 0) floor_s = 0;
 
     /* Walk backwards from before_ms until cumulative difficulty reaches the
      * target. SQLite window functions are clean but we avoid depending on them
@@ -1341,15 +1346,19 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
     double cum = 0.0;
     uint64_t boundary_s = 0;
     int any = 0;
-    int reached = 0;
+    int done = 0;
     while (sqlite3_step(st) == SQLITE_ROW) {
         uint64_t ts = (uint64_t)sqlite3_column_int64(st, 0);
         double diff = sqlite3_column_double(st, 1);
         any = 1;
-        if (reached && ts != boundary_s) break;
+        /* Stop only once BOTH the work target and the time floor are satisfied,
+         * and only on a second boundary — shares sharing a timestamp are taken
+         * together or not at all. */
+        if (done && ts != boundary_s) break;
         cum += diff;
         boundary_s = ts;
-        if (cum >= window_difficulty) reached = 1;
+        done = (cum >= window_difficulty) &&
+               ((sqlite3_int64)boundary_s <= floor_s);
     }
     sqlite3_finalize(st);
     if (!any) return -1;

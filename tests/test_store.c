@@ -610,6 +610,57 @@ static void test_template_retention(void) {
     printf("  ok test_template_retention\n");
 }
 
+/* The window floor. At a difficulty reset the work target is satisfied by a
+ * couple of shares, which would leave the window a few seconds wide and squeeze
+ * every miner but the most recent out of it. The floor must extend the window
+ * regardless of how little work satisfies the target. */
+static void test_proportional_window_floor(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Ten minutes of shares, one per minute, difficulty 1 — the shape of the
+     * minimum-difficulty window right after a fork. */
+    uint64_t now_ms_ = 1700000600000ULL;
+    for (int i = 0; i < 10; i++) {
+        uint64_t ts = now_ms_ - (uint64_t)i * 60000ULL;
+        assert(store_record_share_addr(s, "w1", "bcrt1qaaa", ts, 1.0,
+                                       0, NULL, 0, 0.0) == 0);
+    }
+    assert(store_flush(s) == 0);
+
+    /* Difficulty 1 network, k=3: the work target is met by three shares, so
+     * without a floor the window is ~3 minutes wide. */
+    uint64_t start_no_floor = 0, start_floor = 0;
+    double diff_no_floor = 0.0, diff_floor = 0.0;
+    assert(store_prop_compute_window(s, 3.0, now_ms_, 0,
+                                     &start_no_floor, &diff_no_floor) == 0);
+    assert(diff_no_floor >= 3.0);
+    assert(diff_no_floor < 5.0);            /* stopped early, as designed */
+
+    /* With a 600-second floor it must reach back over the whole ten minutes. */
+    assert(store_prop_compute_window(s, 3.0, now_ms_, 600,
+                                     &start_floor, &diff_floor) == 0);
+    assert(start_floor < start_no_floor);   /* the floor genuinely widened it */
+    assert(diff_floor >= 9.0);              /* essentially every share */
+    assert(now_ms_ - start_floor >= 540000ULL);
+
+    /* The floor must never SHRINK a window that work alone made wider: a high
+     * work target still wins. */
+    uint64_t start_big = 0; double diff_big = 0.0;
+    assert(store_prop_compute_window(s, 9.0, now_ms_, 60,
+                                     &start_big, &diff_big) == 0);
+    assert(diff_big >= 9.0);
+
+    store_close(s);
+    printf("  ok test_proportional_window_floor\n");
+}
+
 static void test_proportional(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -644,7 +695,7 @@ static void test_proportional(void) {
 
     uint64_t start_ms = 0;
     double actual_diff = 0.0;
-    assert(store_prop_compute_window(s, 8.0, base_ts + 100, &start_ms, &actual_diff) == 0);
+    assert(store_prop_compute_window(s, 8.0, base_ts + 100, 0, &start_ms, &actual_diff) == 0);
     assert(actual_diff >= 8.0);
 
     pplns_addr_t *addrs = NULL;
@@ -742,6 +793,7 @@ int main(void) {
     test_template_retention();
     test_commit_survives_a_locked_db();
     test_proportional();
+    test_proportional_window_floor();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

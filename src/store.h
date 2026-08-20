@@ -185,12 +185,23 @@ void store_test_set_ring_capacity(size_t cap);
 int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n);
 
 /* Find the PPLNS window boundary: starting from the newest share with
- * ts <= before_ms, walk back in time until the cumulative difficulty reaches
- * window_difficulty. Writes the oldest timestamp in the window to
- * *out_start_ms and the actual cumulative difficulty to *out_actual_difficulty
- * (may be >= window_difficulty). Returns 0 ok, -1 if no shares or error. */
+ * ts <= before_ms, walk back in time until BOTH conditions hold — the
+ * cumulative difficulty has reached window_difficulty, AND the walk has reached
+ * at least min_window_sec seconds before before_ms. The window is therefore
+ * whichever of the two is larger.
+ *
+ * min_window_sec is the floor that keeps the window meaningful when difficulty
+ * collapses (it resets to powLimit at every fork, which would otherwise leave
+ * the window a handful of shares wide). Pass 0 to disable it.
+ *
+ * Whole seconds are indivisible: every share sharing the boundary timestamp is
+ * included, so the window never splits a second between two miners.
+ *
+ * Writes the oldest timestamp in the window to *out_start_ms and the actual
+ * cumulative difficulty to *out_actual_difficulty (may be >= window_difficulty,
+ * and will be when the time floor binds). Returns 0 ok, -1 if no shares. */
 int store_prop_compute_window(store_t *s, double window_difficulty,
-                              uint64_t before_ms,
+                              uint64_t before_ms, int min_window_sec,
                               uint64_t *out_start_ms,
                               double *out_actual_difficulty);
 

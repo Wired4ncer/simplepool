@@ -248,10 +248,12 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     uint64_t start_ms = 0;
     double   actual_diff = 0.0;
     if (store_prop_compute_window(s->store, want_diff, now,
+                                  s->cfg->prop_window_min_sec,
                                   &start_ms, &actual_diff) < 0 ||
         actual_diff <= 0.0) {
-        LOG_INFO("proportional: no shares in the window yet "
-                 "(wanted %.2f difficulty); paying the finder directly", want_diff);
+        LOG_INFO("proportional: no shares in the window yet (wanted %.2f "
+                 "difficulty or %d seconds); paying the finder directly",
+                 want_diff, s->cfg->prop_window_min_sec);
         return 1;
     }
 
@@ -327,9 +329,11 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     plan->n_ledger         = n_ledger_out;
 
     LOG_INFO("proportional: %zu payout outputs over %.2f window difficulty "
-             "(%.1f x network %.2f), reward-after-fee %lld sats, "
-             "%zu deferred claims",
-             n_payouts, actual_diff, s->cfg->prop_window_k, net_diff,
+             "(want %.1f x network %.2f = %.2f, floor %d s, window spans %llu s), "
+             "reward-after-fee %lld sats, %zu deferred claims",
+             n_payouts, actual_diff, s->cfg->prop_window_k, net_diff, want_diff,
+             s->cfg->prop_window_min_sec,
+             (unsigned long long)((now - start_ms) / 1000),
              (long long)reward_after_fee, n_ledger_out);
     return 0;
 }

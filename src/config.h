@@ -77,6 +77,17 @@ typedef struct {
     double prop_window_k;
     int64_t prop_min_payout_sats;
     int prop_max_outputs;
+    /* Floor on how far back the window reaches, in seconds. The window is
+     * whichever is LARGER: prop_window_k blocks of work, or this many seconds
+     * of shares.
+     *
+     * Without a floor the window collapses at exactly the moment this pool
+     * exists for. Difficulty resets to powLimit at each fork, so network
+     * difficulty is ~1 and a k of 3 makes the window three difficulty units —
+     * about three shares from one small miner, a couple of seconds of history.
+     * Everyone else falls outside it and payouts go lumpy. A time floor keeps
+     * the window meaningful whatever the difficulty does. */
+    int prop_window_min_sec;
     /* PPS rate override — sats credited per unit of share difficulty.
      *
      * Leave unset (0) and the proxy derives the rate from each block

@@ -61,7 +61,36 @@ redis_reconnect_backoff_ms = 2000
 #               pps_credits. The operator batches accumulated BTC into
 #               Thunder from the admin dashboard, and the payout worker
 #               drains that reserve to miners.
+#   proportional Coinbase-direct PPLNS. ONE shared coinbase per template pays
+#               every address in the PPLNS window pro-rata by share difficulty.
+#               Requires a server-provided coinbase (a CUSF enforcer
+#               getblocktemplate); without one it falls back to solo shape.
+#               The pool holds no funds in any mode, this one included.
 pool_mode = solo
+
+# proportional — the PPLNS window, measured in WORK, not share count and not
+# wall time, so it survives a difficulty retarget without operator action.
+# The window is whichever is LARGER: prop_window_k blocks of work, or
+# prop_window_min_sec seconds of shares.
+#
+# ⚠️ Do not set prop_window_min_sec to 0. Difficulty resets to powLimit at a
+# fork, so k blocks of work can be a handful of shares — a window a few seconds
+# wide, which squeezes out every miner but the most recent at exactly the moment
+# a new chain is most worth mining. The floor is what keeps the window
+# meaningful when difficulty collapses.
+# prop_window_k       = 3
+# prop_window_min_sec = 600
+
+# proportional — an address whose cut falls below this is deferred rather than
+# paid, and its claim (a signed fraction of a block reward, never sats) rolls
+# into a later block. Must be at least the 546-sat dust limit.
+# prop_min_payout_sats = 1000000
+
+# proportional — cap on payout outputs per block. Each extra P2WPKH output is
+# 124 weight units beyond what the template budgeted for, and a block that goes
+# over 4 MWU is rejected at submitblock. Measure the headroom on real templates
+# before raising this.
+# prop_max_outputs = 12
 
 # pps-classic — required
 # pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS

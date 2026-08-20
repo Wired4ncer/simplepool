@@ -63,6 +63,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->prop_window_k = 3.0;
     cfg->prop_min_payout_sats = 1000000LL;  /* ~0.01 ECX at current subsidy */
     cfg->prop_max_outputs = 12;
+    cfg->prop_window_min_sec = 600;         /* 10 minutes */
 }
 
 static char *strtrim(char *s) {
@@ -167,6 +168,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "prop_window_k")             == 0) cfg->prop_window_k = atof(v);
         else if (strcmp(k, "prop_min_payout_sats")      == 0) cfg->prop_min_payout_sats = (int64_t)atoll(v);
         else if (strcmp(k, "prop_max_outputs")          == 0) cfg->prop_max_outputs = atoi(v);
+        else if (strcmp(k, "prop_window_min_sec")       == 0) cfg->prop_window_min_sec = atoi(v);
         /* Retired with pool_mode=pps (the drivechain-in-coinbase build).
          * Accepted and ignored so an existing proxy.conf keeps loading;
          * the Thunder reserve address now lives only on the dashboard,
@@ -249,6 +251,13 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
             set_err(errbuf, errlen,
                     "config: 'prop_max_outputs' must be in [1, 64]");
             return -12;
+        }
+        if (cfg->prop_window_min_sec < 0) {
+            set_err(errbuf, errlen,
+                    "config: 'prop_window_min_sec' must be >= 0 "
+                    "(0 disables the floor, which collapses the window at a "
+                    "difficulty reset — see config.h)");
+            return -13;
         }
     }
     return 0;
