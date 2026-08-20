@@ -178,6 +178,11 @@ void store_get_stats(store_t *s, store_stats_t *out);
  * before store_open by setting a global; for tests only. */
 void store_test_set_ring_capacity(size_t cap);
 
+/* Override the PPLNS window walk's page size and row cap so paging and
+ * truncation can be exercised without inserting millions of shares. Pass <= 0
+ * to restore the defaults. For tests only. */
+void store_test_set_window_limits(int page, long max_rows);
+
 /* Typical share difficulty this worker was recently running at, for seeding a
  * reconnecting miner instead of restarting it at initial_diff.
  *
@@ -211,11 +216,19 @@ int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n);
  *
  * Writes the oldest timestamp in the window to *out_start_ms and the actual
  * cumulative difficulty to *out_actual_difficulty (may be >= window_difficulty,
- * and will be when the time floor binds). Returns 0 ok, -1 if no shares. */
+ * and will be when the time floor binds).
+ *
+ * *out_truncated (optional) is set to 1 when the walk hit its row cap before
+ * satisfying the work target, i.e. the window returned is SHORTER than asked
+ * for. Callers must surface that: a short window is not a wrong answer that
+ * announces itself — the pool keeps paying, just on a window nobody chose.
+ *
+ * Returns 0 ok, -1 if no shares. */
 int store_prop_compute_window(store_t *s, double window_difficulty,
                               uint64_t before_ms, int min_window_sec,
                               uint64_t *out_start_ms,
-                              double *out_actual_difficulty);
+                              double *out_actual_difficulty,
+                              int *out_truncated);
 
 /* Query shares within [start_ms, end_ms] grouped by payout address, sorted by
  * total difficulty descending. Writes *out (caller frees) and *n.

@@ -639,13 +639,13 @@ static void test_proportional_window_floor(void) {
     uint64_t start_no_floor = 0, start_floor = 0;
     double diff_no_floor = 0.0, diff_floor = 0.0;
     assert(store_prop_compute_window(s, 3.0, now_ms_, 0,
-                                     &start_no_floor, &diff_no_floor) == 0);
+                                     &start_no_floor, &diff_no_floor, NULL) == 0);
     assert(diff_no_floor >= 3.0);
     assert(diff_no_floor < 5.0);            /* stopped early, as designed */
 
     /* With a 600-second floor it must reach back over the whole ten minutes. */
     assert(store_prop_compute_window(s, 3.0, now_ms_, 600,
-                                     &start_floor, &diff_floor) == 0);
+                                     &start_floor, &diff_floor, NULL) == 0);
     assert(start_floor < start_no_floor);   /* the floor genuinely widened it */
     assert(diff_floor >= 9.0);              /* essentially every share */
     assert(now_ms_ - start_floor >= 540000ULL);
@@ -654,7 +654,7 @@ static void test_proportional_window_floor(void) {
      * work target still wins. */
     uint64_t start_big = 0; double diff_big = 0.0;
     assert(store_prop_compute_window(s, 9.0, now_ms_, 60,
-                                     &start_big, &diff_big) == 0);
+                                     &start_big, &diff_big, NULL) == 0);
     assert(diff_big >= 9.0);
 
     store_close(s);
@@ -725,6 +725,67 @@ static void test_worker_recent_difficulty(void) {
     printf("  ok test_worker_recent_difficulty\n");
 }
 
+/* The window walk must page rather than stop at a fixed row limit.
+ *
+ * Regression: the walk was a single `LIMIT 100000`, so once the share rate was
+ * high enough that the configured window held more than that, the window
+ * silently shrank. At fork share rates a 600 s window would have held ~813,000
+ * shares and quietly become ~74 s — the pool still paying, just on a window
+ * nobody chose. */
+static void test_proportional_window_pages(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* 600 shares of difficulty 1, one per second. */
+    uint64_t now_s = 1700100000ULL;
+    for (int i = 0; i < 600; i++)
+        assert(store_record_share_addr(s, "w.page", "bcrt1qaaa",
+                                       (now_s - 600 + (uint64_t)i) * 1000ULL,
+                                       1.0, 0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+    uint64_t before_ms = now_s * 1000ULL;
+
+    /* Baseline: one big page, work target 500 -> needs 500 shares. */
+    store_test_set_window_limits(100000, 5000000);
+    uint64_t start_big = 0; double diff_big = 0.0; int trunc_big = -1;
+    assert(store_prop_compute_window(s, 500.0, before_ms, 0,
+                                     &start_big, &diff_big, &trunc_big) == 0);
+    assert(diff_big >= 500.0);
+    assert(trunc_big == 0);
+
+    /* Same query, page size 7. Paging must reach the identical answer — under
+     * the old single-LIMIT walk a small limit silently returned less work. */
+    store_test_set_window_limits(7, 5000000);
+    uint64_t start_pg = 0; double diff_pg = 0.0; int trunc_pg = -1;
+    assert(store_prop_compute_window(s, 500.0, before_ms, 0,
+                                     &start_pg, &diff_pg, &trunc_pg) == 0);
+    assert(trunc_pg == 0);
+    if (start_pg != start_big || diff_pg != diff_big) {
+        fprintf(stderr, "paging changed the window: %llu/%.1f vs %llu/%.1f\n",
+                (unsigned long long)start_pg, diff_pg,
+                (unsigned long long)start_big, diff_big);
+        abort();
+    }
+
+    /* Cap below what the target needs: the window IS short, and that must be
+     * reported rather than passed off as the configured window. */
+    store_test_set_window_limits(7, 21);
+    uint64_t start_t = 0; double diff_t = 0.0; int trunc = 0;
+    assert(store_prop_compute_window(s, 500.0, before_ms, 0,
+                                     &start_t, &diff_t, &trunc) == 0);
+    assert(trunc == 1);
+    assert(diff_t < 500.0);
+
+    store_test_set_window_limits(0, 0);   /* restore defaults */
+    store_close(s);
+    printf("  ok test_proportional_window_pages\n");
+}
+
 static void test_proportional(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -759,7 +820,7 @@ static void test_proportional(void) {
 
     uint64_t start_ms = 0;
     double actual_diff = 0.0;
-    assert(store_prop_compute_window(s, 8.0, base_ts + 100, 0, &start_ms, &actual_diff) == 0);
+    assert(store_prop_compute_window(s, 8.0, base_ts + 100, 0, &start_ms, &actual_diff, NULL) == 0);
     assert(actual_diff >= 8.0);
 
     pplns_addr_t *addrs = NULL;
@@ -857,6 +918,7 @@ int main(void) {
     test_template_retention();
     test_commit_survives_a_locked_db();
     test_worker_recent_difficulty();
+    test_proportional_window_pages();
     test_proportional();
     test_proportional_window_floor();
     cleanup_dbs();

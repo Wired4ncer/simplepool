@@ -279,14 +279,27 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     uint64_t now = now_ms();
     uint64_t start_ms = 0;
     double   actual_diff = 0.0;
+    int win_truncated = 0;
     if (store_prop_compute_window(s->store, want_diff, now,
                                   s->cfg->prop_window_min_sec,
-                                  &start_ms, &actual_diff) < 0 ||
+                                  &start_ms, &actual_diff, &win_truncated) < 0 ||
         actual_diff <= 0.0) {
         LOG_INFO("proportional: no shares in the window yet (wanted %.2f "
                  "difficulty or %d seconds); paying the finder directly",
                  want_diff, s->cfg->prop_window_min_sec);
         return 1;
+    }
+
+    if (win_truncated) {
+        /* Not fatal — the payouts are still exact over the window we DID read —
+         * but the window is shorter than configured, so say so rather than let
+         * the pool quietly pay on a window nobody chose. */
+        LOG_WARN("proportional: PPLNS window TRUNCATED — read the row cap before "
+                 "reaching %.2f difficulty, got %.2f over %llu s. Payouts are "
+                 "correct for that shorter window, but it is not the configured "
+                 "one. Raise prop_window_min_sec or lower prop_window_k.",
+                 want_diff, actual_diff,
+                 (unsigned long long)((now - start_ms) / 1000));
     }
 
     pplns_addr_t  *addrs = NULL; size_t n_addrs = 0;

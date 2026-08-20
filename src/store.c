@@ -1360,57 +1360,134 @@ int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
     return 0;
 }
 
-int store_prop_compute_window(store_t *s, double window_difficulty,
-                              uint64_t before_ms, int min_window_sec,
-                              uint64_t *out_start_ms,
-                              double *out_actual_difficulty) {
-    if (!s || window_difficulty <= 0.0 || !out_start_ms || !out_actual_difficulty ||
-        min_window_sec < 0)
-        return -1;
-
-    /* The shares table stores Unix seconds; callers pass milliseconds. */
-    sqlite3_int64 before_s = (sqlite3_int64)(before_ms / 1000);
-    /* The floor: the walk must reach at least this far back before it may stop,
-     * however little difficulty it has accumulated by then. */
-    sqlite3_int64 floor_s = before_s - (sqlite3_int64)min_window_sec;
-    if (floor_s < 0) floor_s = 0;
-
-    /* Walk backwards from before_ms until cumulative difficulty reaches the
-     * target. SQLite window functions are clean but we avoid depending on them
-     * by walking an ordered result set in C. */
+/* SUM(difficulty), MIN(ts) and COUNT(*) over [from_s, before_s]. One aggregate,
+ * so SQLite never hands the rows back to C. Returns 0 ok, -1 on error. */
+static int prop_window_agg(store_t *s, sqlite3_int64 from_s, sqlite3_int64 before_s,
+                           double *out_sum, sqlite3_int64 *out_min_ts,
+                           sqlite3_int64 *out_count) {
     static const char *Q =
-        "SELECT s.ts, s.difficulty FROM shares s"
-        "  JOIN workers w ON s.worker_id = w.id"
-        "  WHERE s.ts <= ? AND s.is_block = 0"
-        "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
-        "  ORDER BY s.ts DESC, s.id DESC"
-        "  LIMIT 100000";
+        "SELECT COALESCE(SUM(s.difficulty),0), COALESCE(MIN(s.ts),0), COUNT(*)"
+        "  FROM shares s JOIN workers w ON s.worker_id = w.id"
+        "  WHERE s.ts >= ? AND s.ts <= ? AND s.is_block = 0"
+        "    AND w.payout_address IS NOT NULL AND w.payout_address != ''";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
         return -1;
     }
-    sqlite3_bind_int64(st, 1, before_s);
+    sqlite3_bind_int64(st, 1, from_s);
+    sqlite3_bind_int64(st, 2, before_s);
+    int rc = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        *out_sum    = sqlite3_column_double(st, 0);
+        *out_min_ts = sqlite3_column_int64(st, 1);
+        *out_count  = sqlite3_column_int64(st, 2);
+        rc = 0;
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+/* How many share rows the backward walk may read before giving up. Generous:
+ * this is only reached when the work target needs more history than the time
+ * floor holds, and the alternative to a cap is an unbounded scan on every
+ * template. Hitting it is reported, never silently absorbed. */
+#define PROP_WINDOW_MAX_ROWS 5000000
+#define PROP_WINDOW_PAGE     100000
+
+/* Overridable so tests can exercise paging and the cap without inserting
+ * millions of rows. Tests only. */
+static sqlite3_int64 g_window_max_rows = PROP_WINDOW_MAX_ROWS;
+static int           g_window_page     = PROP_WINDOW_PAGE;
+
+void store_test_set_window_limits(int page, long max_rows) {
+    g_window_page     = (page > 0) ? page : PROP_WINDOW_PAGE;
+    g_window_max_rows = (max_rows > 0) ? (sqlite3_int64)max_rows : PROP_WINDOW_MAX_ROWS;
+}
+
+int store_prop_compute_window(store_t *s, double window_difficulty,
+                              uint64_t before_ms, int min_window_sec,
+                              uint64_t *out_start_ms,
+                              double *out_actual_difficulty,
+                              int *out_truncated) {
+    if (!s || window_difficulty <= 0.0 || !out_start_ms || !out_actual_difficulty ||
+        min_window_sec < 0)
+        return -1;
+    if (out_truncated) *out_truncated = 0;
+
+    /* The shares table stores Unix seconds; callers pass milliseconds. */
+    sqlite3_int64 before_s = (sqlite3_int64)(before_ms / 1000);
+    sqlite3_int64 floor_s = before_s - (sqlite3_int64)min_window_sec;
+    if (floor_s < 0) floor_s = 0;
+
+    /* Fast path: does the time floor alone already carry the work target?
+     *
+     * This is the fork case, and the reason the row walk below is not enough on
+     * its own. When difficulty resets to powLimit the work target is a handful
+     * of difficulty units while the floor holds every share of the last ten
+     * minutes — hundreds of thousands of them at fork share rates. Answering
+     * that with one SUM avoids walking any of them. */
+    if (min_window_sec > 0) {
+        double sum = 0.0; sqlite3_int64 min_ts = 0, count = 0;
+        if (prop_window_agg(s, floor_s, before_s, &sum, &min_ts, &count) < 0) return -1;
+        if (count > 0 && sum >= window_difficulty) {
+            *out_start_ms = (uint64_t)min_ts * 1000ULL;
+            *out_actual_difficulty = sum;
+            return 0;
+        }
+    }
+
+    /* Slow path: the floor does not hold enough work, so walk further back.
+     * Paged rather than a single capped query — a fixed LIMIT silently returns
+     * a SHORTER window than asked for, which looks like a working pool paying
+     * on the wrong window. */
+    static const char *Q =
+        "SELECT s.ts, s.id, s.difficulty FROM shares s"
+        "  JOIN workers w ON s.worker_id = w.id"
+        "  WHERE (s.ts < ? OR (s.ts = ? AND s.id < ?)) AND s.is_block = 0"
+        "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
+        "  ORDER BY s.ts DESC, s.id DESC"
+        "  LIMIT ?";
 
     double cum = 0.0;
     uint64_t boundary_s = 0;
-    int any = 0;
-    int done = 0;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        uint64_t ts = (uint64_t)sqlite3_column_int64(st, 0);
-        double diff = sqlite3_column_double(st, 1);
-        any = 1;
-        /* Stop only once BOTH the work target and the time floor are satisfied,
-         * and only on a second boundary — shares sharing a timestamp are taken
-         * together or not at all. */
-        if (done && ts != boundary_s) break;
-        cum += diff;
-        boundary_s = ts;
-        done = (cum >= window_difficulty) &&
-               ((sqlite3_int64)boundary_s <= floor_s);
+    int any = 0, done = 0, exhausted = 0;
+    sqlite3_int64 cur_ts = before_s + 1, cur_id = 0;   /* exclusive cursor */
+    sqlite3_int64 rows_read = 0;
+
+    while (!done && !exhausted && rows_read < g_window_max_rows) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+        sqlite3_bind_int64(st, 1, cur_ts);
+        sqlite3_bind_int64(st, 2, cur_ts);
+        sqlite3_bind_int64(st, 3, cur_id);
+        sqlite3_bind_int  (st, 4, g_window_page);
+
+        sqlite3_int64 in_page = 0;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            sqlite3_int64 ts = sqlite3_column_int64(st, 0);
+            sqlite3_int64 id = sqlite3_column_int64(st, 1);
+            double diff = sqlite3_column_double(st, 2);
+            in_page++; rows_read++;
+            any = 1;
+            /* Stop only once BOTH the work target and the time floor are met,
+             * and only on a second boundary — shares sharing a timestamp are
+             * taken together or not at all. */
+            if (done && (uint64_t)ts != boundary_s) break;
+            cum += diff;
+            boundary_s = (uint64_t)ts;
+            cur_ts = ts; cur_id = id;
+            done = (cum >= window_difficulty) && (ts <= floor_s);
+        }
+        sqlite3_finalize(st);
+        if (in_page < g_window_page) exhausted = 1;   /* no older shares */
     }
-    sqlite3_finalize(st);
+
     if (!any) return -1;
+    if (!done && !exhausted && out_truncated) *out_truncated = 1;
 
     *out_start_ms = boundary_s * 1000ULL;
     *out_actual_difficulty = cum;
