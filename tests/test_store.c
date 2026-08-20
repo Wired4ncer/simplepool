@@ -636,11 +636,11 @@ static void test_proportional(void) {
     }
     assert(store_flush(s) == 0);
 
-    pplns_carry_t *carry = NULL;
-    size_t n_carry = 0;
-    assert(store_prop_get_balances(s, &carry, &n_carry) == 0);
-    assert(n_carry == 0);
-    free(carry);
+    pplns_claim_t *ledger = NULL;
+    size_t n_ledger = 0;
+    assert(store_prop_get_ledger(s, &ledger, &n_ledger) == 0);
+    assert(n_ledger == 0);
+    free(ledger);
 
     uint64_t start_ms = 0;
     double actual_diff = 0.0;
@@ -655,29 +655,32 @@ static void test_proportional(void) {
     for (size_t i = 0; i < n_addrs; i++) sum_diff += addrs[i].total_difficulty;
     assert(sum_diff > actual_diff - 0.001 && sum_diff < actual_diff + 0.001);
 
-    /* Compute payouts with a high min_payout so some balance carries forward. */
-    size_t max_outputs = 12;
+    /* A min_payout high enough that the smallest miner is deferred. */
     pplns_payout_t payouts[12] = {0};
     size_t n_payouts = 0;
-    pplns_carry_t carry_buf[16] = {0};
-    size_t n_carry_out = 0;
+    pplns_claim_t ledger_buf[16] = {0};
+    size_t n_ledger_out = 0;
     int64_t reward = 1000000LL;
     int rc = pplns_compute_payouts(reward, actual_diff, addrs, n_addrs,
-                                   carry_buf, 16, 0, &n_carry_out,
-                                   300000LL, max_outputs,
-                                   payouts, &n_payouts);
+                                   ledger_buf, 16, 0, &n_ledger_out,
+                                   300000LL, 12, payouts, &n_payouts);
     assert(rc == 0);
-    assert(n_payouts + n_carry_out == n_addrs);
+    assert(n_payouts >= 1 && n_payouts < n_addrs);
 
+    /* The coinbase pays the whole reward — that is the point of the model. */
     int64_t paid = 0;
     for (size_t i = 0; i < n_payouts; i++) paid += payouts[i].sats;
-    int64_t carried = 0;
-    for (size_t i = 0; i < n_carry_out; i++) carried += carry_buf[i].pending_sats;
-    assert(paid + carried == reward);
+    assert(paid == reward);
 
-    /* Settle the block and verify prop_balances. */
+    /* And the claims it leaves behind cancel out. */
+    double claim_sum = 0.0;
+    for (size_t i = 0; i < n_ledger_out; i++) claim_sum += ledger_buf[i].claim_fraction;
+    assert(claim_sum < 1e-9 && claim_sum > -1e-9);
+    assert(n_ledger_out > 0);   /* somebody was deferred at this threshold */
+
+    /* Settle the block and verify the ledger round-trips through SQLite. */
     rc = store_prop_settle_block(s, base_ts + 200, 100, "blockhash1",
-                                 payouts, n_payouts, carry_buf, n_carry_out);
+                                 payouts, n_payouts, ledger_buf, n_ledger_out);
     assert(rc == 0);
 
     sqlite3 *db = NULL;
@@ -685,16 +688,43 @@ static void test_proportional(void) {
     int64_t nblocks = scalar_i64(db, "SELECT count(*) FROM blocks_found");
     assert(nblocks == 1);
 
-    pplns_carry_t *bal = NULL;
-    size_t n_bal = 0;
-    assert(store_prop_get_balances(s, &bal, &n_bal) == 0);
-    int64_t db_carried = 0;
-    for (size_t i = 0; i < n_bal; i++) db_carried += bal[i].pending_sats;
-    assert(db_carried == carried);
+    pplns_claim_t *stored = NULL;
+    size_t n_stored = 0;
+    assert(store_prop_get_ledger(s, &stored, &n_stored) == 0);
+    assert(n_stored == n_ledger_out);
+    double stored_sum = 0.0;
+    for (size_t i = 0; i < n_stored; i++) stored_sum += stored[i].claim_fraction;
+    assert(stored_sum < 1e-9 && stored_sum > -1e-9);
+    /* Every claim survived with its sign and magnitude intact. */
+    for (size_t i = 0; i < n_ledger_out; i++) {
+        int seen = 0;
+        for (size_t j = 0; j < n_stored; j++) {
+            if (strcmp(stored[j].address, ledger_buf[i].address) != 0) continue;
+            double d = stored[j].claim_fraction - ledger_buf[i].claim_fraction;
+            assert(d < 1e-12 && d > -1e-12);
+            seen = 1;
+        }
+        assert(seen);
+    }
+
+    /* Settling a second block must REPLACE the ledger, not accumulate stale
+     * rows — the ledger is whole-state, not a delta. */
+    size_t n_second = 0;
+    rc = pplns_compute_payouts(reward, actual_diff, addrs, n_addrs,
+                               ledger_buf, 16, n_ledger_out, &n_second,
+                               300000LL, 12, payouts, &n_payouts);
+    assert(rc == 0);
+    rc = store_prop_settle_block(s, base_ts + 300, 101, "blockhash2",
+                                 payouts, n_payouts, ledger_buf, n_second);
+    assert(rc == 0);
+    free(stored);
+    stored = NULL;
+    assert(store_prop_get_ledger(s, &stored, &n_stored) == 0);
+    assert(n_stored == n_second);
 
     sqlite3_close(db);
     free(addrs);
-    free(bal);
+    free(stored);
     store_close(s);
     printf("  ok test_proportional\n");
 }

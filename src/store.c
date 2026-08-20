@@ -252,17 +252,20 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);",
 
     /* ---- part 3 ---- */
-    /* Proportional / PPLNS carry-forward balances. The pool holds pending_sats
-     * as a liability until a future block makes the address eligible for a
-     * coinbase output. address is the miner's payout_address from the workers
-     * table. pending_sats includes any amount that was below prop_min_payout_sats
-     * or was demoted to keep the block under the output/weight cap. */
-    "CREATE TABLE IF NOT EXISTS prop_balances ("
+    /* Proportional / PPLNS deferred-claim ledger. NOT a balance: the pool holds
+     * no funds. claim_fraction is a signed fraction of one block reward —
+     * positive means the address was skipped (its cut fell below
+     * prop_min_payout_sats, or it was demoted to keep the block under the
+     * output/weight cap) and is owed that fraction of a future block; negative
+     * means it was paid early, covering someone else's skipped share. The ledger
+     * sums to zero. See src/pplns.h for why this is a fraction and not sats or
+     * raw difficulty. address is the miner's payout_address from workers. */
+    "CREATE TABLE IF NOT EXISTS prop_ledger ("
     "  address         TEXT PRIMARY KEY,"
-    "  pending_sats    INTEGER NOT NULL DEFAULT 0,"
+    "  claim_fraction  REAL NOT NULL DEFAULT 0,"
     "  last_settled_ts INTEGER"
     ");"
-    "CREATE INDEX IF NOT EXISTS prop_balances_ts_idx ON prop_balances(last_settled_ts);"
+    "CREATE INDEX IF NOT EXISTS prop_ledger_ts_idx ON prop_ledger(last_settled_ts);"
 };
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
@@ -296,13 +299,17 @@ static const char *MIGRATIONS_SQL[] = {
     /* See the pool_meta comment above: without this the counter added in
      * PR #32 is only ever readable at shutdown. */
     "ALTER TABLE pool_meta    ADD COLUMN events_lost    INTEGER NOT NULL DEFAULT 0",
-    /* Proportional / PPLNS carry-forward ledger, added alongside pool_mode=proportional. */
-    "CREATE TABLE IF NOT EXISTS prop_balances ("
+    /* Proportional / PPLNS deferred-claim ledger, added alongside
+     * pool_mode=proportional. The earlier prop_balances table held sats, a model
+     * that could not be settled inside a single coinbase; it never ran anywhere,
+     * so it is dropped rather than migrated. */
+    "DROP TABLE IF EXISTS prop_balances",
+    "CREATE TABLE IF NOT EXISTS prop_ledger ("
     "  address         TEXT PRIMARY KEY,"
-    "  pending_sats    INTEGER NOT NULL DEFAULT 0,"
+    "  claim_fraction  REAL NOT NULL DEFAULT 0,"
     "  last_settled_ts INTEGER"
     ")",
-    "CREATE INDEX IF NOT EXISTS prop_balances_ts_idx ON prop_balances(last_settled_ts)",
+    "CREATE INDEX IF NOT EXISTS prop_ledger_ts_idx ON prop_ledger(last_settled_ts)",
 };
 
 /* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
@@ -1268,12 +1275,13 @@ int store_record_template(store_t *s, const store_template_t *t) {
 
 /* ---------- proportional / PPLNS helpers ---------- */
 
-int store_prop_get_balances(store_t *s, pplns_carry_t **out, size_t *n) {
+int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
     if (!s || !out || !n) return -1;
     *out = NULL; *n = 0;
 
     static const char *Q =
-        "SELECT address, pending_sats FROM prop_balances WHERE pending_sats > 0";
+        "SELECT address, claim_fraction FROM prop_ledger"
+        "  WHERE claim_fraction != 0";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
@@ -1281,20 +1289,20 @@ int store_prop_get_balances(store_t *s, pplns_carry_t **out, size_t *n) {
     }
 
     size_t cap = 64, count = 0;
-    pplns_carry_t *buf = (pplns_carry_t *)calloc(cap, sizeof(*buf));
+    pplns_claim_t *buf = (pplns_claim_t *)calloc(cap, sizeof(*buf));
     if (!buf) { sqlite3_finalize(st); return -1; }
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (count >= cap) {
             size_t ncap = cap * 2;
-            pplns_carry_t *nb = (pplns_carry_t *)realloc(buf, ncap * sizeof(*nb));
+            pplns_claim_t *nb = (pplns_claim_t *)realloc(buf, ncap * sizeof(*nb));
             if (!nb) { free(buf); sqlite3_finalize(st); return -1; }
             buf = nb; cap = ncap;
         }
         const char *addr = (const char *)sqlite3_column_text(st, 0);
         snprintf(buf[count].address, sizeof buf[count].address, "%s",
                  addr ? addr : "");
-        buf[count].pending_sats = (int64_t)sqlite3_column_int64(st, 1);
+        buf[count].claim_fraction = sqlite3_column_double(st, 1);
         count++;
     }
     sqlite3_finalize(st);
@@ -1401,35 +1409,44 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
 int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
                             const char *block_hash,
                             const pplns_payout_t *payouts, size_t n_payouts,
-                            const pplns_carry_t *carry, size_t n_carry) {
+                            const pplns_claim_t *ledger, size_t n_ledger) {
     if (!s || !block_hash) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
 
-    /* Upsert carry balances. Zero or negative rows are deleted. */
+    /* Replace the ledger wholesale: pplns_compute_payouts returns the complete
+     * post-block state, and a claim that has settled to zero is simply absent
+     * from it. Merging row by row would leave stale rows behind and break the
+     * sums-to-zero invariant. */
     static const char *Q_UPSERT =
-        "INSERT INTO prop_balances (address, pending_sats, last_settled_ts)"
+        "INSERT INTO prop_ledger (address, claim_fraction, last_settled_ts)"
         "  VALUES (?, ?, ?)"
         "  ON CONFLICT(address) DO UPDATE SET"
-        "    pending_sats = excluded.pending_sats,"
-        "    last_settled_ts = excluded.last_settled_ts"
-        "  WHERE excluded.pending_sats > 0";
-    static const char *Q_DELETE =
-        "DELETE FROM prop_balances WHERE address = ?";
+        "    claim_fraction = excluded.claim_fraction,"
+        "    last_settled_ts = excluded.last_settled_ts";
+    static const char *Q_CLEAR = "DELETE FROM prop_ledger";
 
     sqlite3_exec(s->db, "BEGIN TRANSACTION", NULL, NULL, NULL);
 
-    for (size_t i = 0; i < n_carry; i++) {
-        if (carry[i].pending_sats <= 0) continue;
+    if (sqlite3_prepare_v2(s->db, Q_CLEAR, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+
+    for (size_t i = 0; i < n_ledger; i++) {
+        if (ledger[i].claim_fraction == 0.0) continue;
         if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &st, NULL) != SQLITE_OK) {
             sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
             atomic_fetch_add(&s->pg_errors, 1);
             return -1;
         }
-        sqlite3_bind_text(st, 1, carry[i].address, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 2, (sqlite3_int64)carry[i].pending_sats);
-        sqlite3_bind_int64(st, 3, (sqlite3_int64)(ts_ms / 1000));
+        sqlite3_bind_text  (st, 1, ledger[i].address, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(st, 2, ledger[i].claim_fraction);
+        sqlite3_bind_int64 (st, 3, (sqlite3_int64)(ts_ms / 1000));
         rc = sqlite3_step(st);
         sqlite3_finalize(st);
         if (rc != SQLITE_DONE) {
@@ -1437,18 +1454,6 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
             atomic_fetch_add(&s->pg_errors, 1);
             return -1;
         }
-    }
-
-    /* Paid-out addresses have zero carry. */
-    for (size_t i = 0; i < n_payouts; i++) {
-        if (sqlite3_prepare_v2(s->db, Q_DELETE, -1, &st, NULL) != SQLITE_OK) {
-            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-            atomic_fetch_add(&s->pg_errors, 1);
-            return -1;
-        }
-        sqlite3_bind_text(st, 1, payouts[i].address, -1, SQLITE_TRANSIENT);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
     }
 
     /* Record the block. */

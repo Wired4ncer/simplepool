@@ -178,11 +178,11 @@ void store_get_stats(store_t *s, store_stats_t *out);
  * before store_open by setting a global; for tests only. */
 void store_test_set_ring_capacity(size_t cap);
 
-/* ---------- proportional / Pplns helpers ---------- */
+/* ---------- proportional / PPLNS helpers ---------- */
 
-/* Read all carry-forward balances into *out. Caller must free(*out).
+/* Read the deferred-claim ledger into *out. Caller must free(*out).
  * Returns 0 ok, negative on error. */
-int store_prop_get_balances(store_t *s, pplns_carry_t **out, size_t *n);
+int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n);
 
 /* Find the PPLNS window boundary: starting from the newest share with
  * ts <= before_ms, walk back in time until the cumulative difficulty reaches
@@ -200,15 +200,14 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
 int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
                             pplns_addr_t **out, size_t *n);
 
-/* Apply the result of a found block: update prop_balances with the new carry
- * balances and insert a row into blocks_found. This must only be called once
- * the block has actually been accepted by the network, because it commits
- * carry-forward changes. payouts/n_payouts are the coinbase outputs; carry/
- * n_carry are the post-settle balances (pending_sats > 0 retained, zero rows
- * deleted). Returns 0 ok, negative on error. */
+/* Apply the result of a found block: replace prop_ledger with the post-block
+ * deferred claims and insert a row into blocks_found. payouts/n_payouts are the
+ * coinbase outputs; ledger/n_ledger is the complete new ledger, which replaces
+ * the stored one wholesale — a settled claim is absent from it rather than
+ * zeroed. Returns 0 ok, negative on error. */
 int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
                             const char *block_hash,
                             const pplns_payout_t *payouts, size_t n_payouts,
-                            const pplns_carry_t *carry, size_t n_carry);
+                            const pplns_claim_t *ledger, size_t n_ledger);
 
 #endif /* SIMPLEPOOL_STORE_H */

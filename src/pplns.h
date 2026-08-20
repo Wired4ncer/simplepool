@@ -4,20 +4,39 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* One address in the PPLNS window, already aggregated by payout address and
- * sorted by total_difficulty descending (largest first). */
+/* One address in the PPLNS window, aggregated by payout address. */
 typedef struct {
     char    address[128];
     double  total_difficulty;
 } pplns_addr_t;
 
-/* Carry-forward balance for an address. The pool holds these pending_sats as a
- * liability until a future block makes the address eligible for a coinbase
- * output. */
+/* A deferred claim against future blocks, carried as a SIGNED FRACTION of one
+ * block reward rather than as sats.
+ *
+ * Why not sats: a coinbase pays exactly one block reward, no more and no less.
+ * Holding back sats for a small miner means that block's coinbase pays less
+ * than the reward — and the shortfall is never minted, so the debt is backed by
+ * nothing — while releasing it later would need a coinbase that overpays, which
+ * is an invalid block.
+ *
+ * Why not raw difficulty: shares stay in the PPLNS window across several
+ * blocks, so rolling an unpaid miner's difficulty forward would count the same
+ * work twice. Difficulty is also not comparable across time on this chain —
+ * it swings +/-4x every 2016 blocks and resets to powLimit at each fork — so a
+ * claim recorded in difficulty units silently changes meaning at every
+ * retarget. A fraction of a block reward does not.
+ *
+ * Semantics: claim_fraction > 0 means the address was skipped and is owed that
+ * fraction of a future block; < 0 means it was paid early, covering someone
+ * else's skipped share, and owes it back. The pool holds no funds either way —
+ * this is a fairness memory, not a balance.
+ *
+ * INVARIANT: the ledger sums to zero. Every block pays out exactly one reward,
+ * so an advance to one miner is always a deferral by another. */
 typedef struct {
     char    address[128];
-    int64_t pending_sats;
-} pplns_carry_t;
+    double  claim_fraction;
+} pplns_claim_t;
 
 /* One coinbase payout output. */
 typedef struct {
@@ -25,33 +44,29 @@ typedef struct {
     int64_t sats;
 } pplns_payout_t;
 
-/* Compute the PPLNS payout list and updated carry-forward balances.
+/* Compute the coinbase payout list and the updated deferred-claim ledger.
  *
- * reward_after_fee: sats available for miners (block reward minus operator fee).
- * window_difficulty: sum of difficulties in the window; must be > 0.
- * addrs: window shares aggregated by address, sorted by total_difficulty
- *        descending. The largest shareholder receives the rounding remainder.
- * n_addrs: number of aggregated addresses.
- * carry: in/out array of existing carry balances. On output it contains every
- *        address that did not receive a payout, including new addresses. The
- *        caller must provide enough capacity (n_addrs + n_carry_in entries).
- * n_carry_in: number of valid entries in carry on input.
- * n_carry_out: number of valid entries in carry on output.
- * min_payout_sats: smallest output value emitted; smaller balances are carried.
- * max_outputs: maximum number of payout outputs (not counting operator fee).
- * payouts: output array, caller must allocate at least max_outputs entries.
- * n_payouts_out: number of payouts written.
- *
- * Accounting invariant: sum(payouts) + (sum(new_carry) - sum(old_carry)) ==
- * reward_after_fee. The coinbase therefore pays exactly sum(payouts) to miners
- * and the operator fee is separate.
+ * reward_after_fee: sats available to miners (block reward minus operator fee).
+ *                   The payouts ALWAYS sum to exactly this. That is the
+ *                   property the whole design turns on.
+ * window_difficulty: sum of share difficulty in the window; must be > 0.
+ * addrs / n_addrs: window shares aggregated by payout address.
+ * ledger: in/out. On input, the stored claims. On output, the claims after this
+ *         block, including addresses that appear only in the window. Needs
+ *         capacity for n_addrs + n_ledger_in entries.
+ * min_payout_sats: an address whose cut falls below this is deferred rather
+ *         than paid, and its claim rolls forward. If that would leave nobody to
+ *         pay, the single largest claim is paid anyway — a block must pay
+ *         someone, and the threshold is a convenience, not a rule.
+ * max_outputs: cap on payout outputs (block weight, see the plan note §2). The
+ *         smallest cuts are deferred until the list fits.
  *
  * Returns 0 on success, -1 on invalid input. */
 int pplns_compute_payouts(int64_t reward_after_fee,
                           double window_difficulty,
                           const pplns_addr_t *addrs, size_t n_addrs,
-                          pplns_carry_t *carry, size_t carry_cap,
-                          size_t n_carry_in, size_t *n_carry_out,
+                          pplns_claim_t *ledger, size_t ledger_cap,
+                          size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
                           pplns_payout_t *payouts, size_t *n_payouts_out);
 

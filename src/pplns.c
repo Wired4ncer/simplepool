@@ -2,179 +2,179 @@
 #include "pplns.h"
 #include "coinbase.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* Claims smaller than this in absolute value are dropped from the ledger when
+ * they would otherwise persist forever. One part in a billion of a block reward
+ * is well under a satoshi at any plausible subsidy. */
+#define CLAIM_EPSILON 1e-9
+
 /* Internal working state for one address. */
 typedef struct {
     char    address[128];
-    double  weight;
-    int64_t base_sats;       /* floor(reward * weight), before carry */
-    int64_t old_carry;
-    int64_t balance;         /* base_sats + old_carry */
-    int     emit;            /* 1 if emitted as payout */
-} work_addr_t;
+    double  window_fraction;  /* this block's pro-rata share, from shares */
+    double  old_claim;        /* signed carry from the ledger */
+    double  claim;            /* window_fraction + old_claim */
+    int64_t paid;             /* sats actually emitted */
+    int     emit;
+} work_t;
 
-static int cmp_addr_desc(const void *a, const void *b) {
-    const pplns_addr_t *x = (const pplns_addr_t *)a;
-    const pplns_addr_t *y = (const pplns_addr_t *)b;
-    if (x->total_difficulty > y->total_difficulty) return -1;
-    if (x->total_difficulty < y->total_difficulty) return 1;
-    return 0;
-}
-
-static int cmp_payout_asc(const void *a, const void *b) {
-    const work_addr_t *x = (const work_addr_t *)a;
-    const work_addr_t *y = (const work_addr_t *)b;
-    if (x->balance < y->balance) return -1;
-    if (x->balance > y->balance) return 1;
-    return 0;
-}
-
-static work_addr_t *find_work_addr(work_addr_t *wa, size_t n, const char *addr) {
+static work_t *find_work(work_t *w, size_t n, const char *addr) {
     for (size_t i = 0; i < n; i++) {
-        if (strcmp(wa[i].address, addr) == 0) return &wa[i];
+        if (strcmp(w[i].address, addr) == 0) return &w[i];
     }
     return NULL;
 }
 
-static pplns_carry_t *find_carry(pplns_carry_t *carry, size_t n, const char *addr) {
-    for (size_t i = 0; i < n; i++) {
-        if (strcmp(carry[i].address, addr) == 0) return &carry[i];
-    }
-    return NULL;
+static int cmp_claim_desc(const void *a, const void *b) {
+    const work_t *const *x = (const work_t *const *)a;
+    const work_t *const *y = (const work_t *const *)b;
+    if ((*x)->claim > (*y)->claim) return -1;
+    if ((*x)->claim < (*y)->claim) return 1;
+    return 0;
 }
 
 int pplns_compute_payouts(int64_t reward_after_fee,
                           double window_difficulty,
                           const pplns_addr_t *addrs, size_t n_addrs,
-                          pplns_carry_t *carry, size_t carry_cap,
-                          size_t n_carry_in, size_t *n_carry_out,
+                          pplns_claim_t *ledger, size_t ledger_cap,
+                          size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
                           pplns_payout_t *payouts, size_t *n_payouts_out) {
     if (!addrs || n_addrs == 0 || !payouts || !n_payouts_out ||
-        !carry || !n_carry_out || window_difficulty <= 0.0 ||
-        reward_after_fee < 0 || min_payout_sats < COINBASE_DUST_SATS ||
-        max_outputs == 0 || carry_cap < n_addrs + n_carry_in) {
+        !ledger || !n_ledger_out || window_difficulty <= 0.0 ||
+        reward_after_fee <= 0 || min_payout_sats < COINBASE_DUST_SATS ||
+        max_outputs == 0 || ledger_cap < n_addrs + n_ledger_in) {
         return -1;
     }
 
-    /* Make a mutable copy and ensure descending order. */
-    pplns_addr_t *sorted = (pplns_addr_t *)calloc(n_addrs, sizeof(*sorted));
-    if (!sorted) return -1;
-    memcpy(sorted, addrs, n_addrs * sizeof(*sorted));
-    qsort(sorted, n_addrs, sizeof(*sorted), cmp_addr_desc);
+    /* The working set is every address in the window, plus every address that
+     * still holds a claim from an earlier block — a miner who has gone away is
+     * still owed, and still gets paid out of a later block. */
+    size_t cap = n_addrs + n_ledger_in;
+    work_t *w = (work_t *)calloc(cap, sizeof(*w));
+    if (!w) return -1;
+    size_t nw = 0;
 
-    work_addr_t *wa = (work_addr_t *)calloc(n_addrs, sizeof(*wa));
-    if (!wa) { free(sorted); return -1; }
+    for (size_t i = 0; i < n_addrs; i++) {
+        if (addrs[i].address[0] == '\0') continue;
+        work_t *e = find_work(w, nw, addrs[i].address);
+        if (!e) {
+            e = &w[nw++];
+            snprintf(e->address, sizeof e->address, "%s", addrs[i].address);
+        }
+        /* Duplicate rows are summed rather than overwritten — the store groups
+         * by address, but nothing in the type says it must. */
+        e->window_fraction += addrs[i].total_difficulty / window_difficulty;
+    }
+    for (size_t i = 0; i < n_ledger_in; i++) {
+        if (ledger[i].address[0] == '\0') continue;
+        work_t *e = find_work(w, nw, ledger[i].address);
+        if (!e) {
+            e = &w[nw++];
+            snprintf(e->address, sizeof e->address, "%s", ledger[i].address);
+        }
+        e->old_claim += ledger[i].claim_fraction;
+    }
+    if (nw == 0) { free(w); return -1; }
 
-    /* Distribute the reward proportionally, truncating to whole sats. */
+    for (size_t i = 0; i < nw; i++) {
+        w[i].claim = w[i].window_fraction + w[i].old_claim;
+        if (!isfinite(w[i].claim)) { free(w); return -1; }
+    }
+
+    /* Rank by claim so both the threshold and the output cap fall on the
+     * smallest claims, and the largest is easy to reach. */
+    work_t **rank = (work_t **)calloc(nw, sizeof(*rank));
+    if (!rank) { free(w); return -1; }
+    for (size_t i = 0; i < nw; i++) rank[i] = &w[i];
+    qsort(rank, nw, sizeof(*rank), cmp_claim_desc);
+
+    /* Emit the addresses whose cut clears the threshold, best claims first,
+     * up to the output cap. A negative claim is an address that was paid early
+     * and is repaying; it is never emitted. */
+    size_t n_emit = 0;
+    for (size_t i = 0; i < nw && n_emit < max_outputs; i++) {
+        if (rank[i]->claim <= 0.0) break;   /* sorted: nothing better follows */
+        double cut = (double)reward_after_fee * rank[i]->claim;
+        if (cut < (double)min_payout_sats) break;
+        rank[i]->emit = 1;
+        n_emit++;
+    }
+    /* A block must pay someone: if the threshold excluded everybody, pay the
+     * single largest positive claim regardless. */
+    if (n_emit == 0) {
+        if (rank[0]->claim <= 0.0) { free(rank); free(w); return -1; }
+        rank[0]->emit = 1;
+        n_emit = 1;
+    }
+
+    /* Renormalise over the emitted set, so the coinbase pays out the reward
+     * exactly. Whoever is deferred this block keeps their claim; whoever is
+     * paid absorbs the deferred share as an advance and goes claim-negative. */
+    double emit_claim = 0.0;
+    for (size_t i = 0; i < nw; i++) if (w[i].emit) emit_claim += w[i].claim;
+    if (!(emit_claim > 0.0)) { free(rank); free(w); return -1; }
+
     int64_t distributed = 0;
-    for (size_t i = 0; i < n_addrs; i++) {
-        snprintf(wa[i].address, sizeof wa[i].address, "%s", sorted[i].address);
-        wa[i].weight = sorted[i].total_difficulty / window_difficulty;
-        double d = (double)reward_after_fee * wa[i].weight;
+    for (size_t i = 0; i < nw; i++) {
+        if (!w[i].emit) continue;
+        double d = (double)reward_after_fee * (w[i].claim / emit_claim);
         if (d < 0.0) d = 0.0;
-        if (d > (double)INT64_MAX) d = (double)INT64_MAX;
-        wa[i].base_sats = (int64_t)d;
-        wa[i].old_carry = 0;
-        wa[i].emit = 0;
-        distributed += wa[i].base_sats;
+        if (d > (double)reward_after_fee) d = (double)reward_after_fee;
+        w[i].paid = (int64_t)d;             /* floor */
+        distributed += w[i].paid;
     }
-
-    /* Remainder from floor() goes to the largest shareholder deterministically,
-     * keeping the total base allocation exactly equal to reward_after_fee. */
-    int64_t remainder = reward_after_fee - distributed;
-    if (remainder != 0 && n_addrs > 0) {
-        /* Guard against negative remainder from rounding edge cases. */
-        if (wa[0].base_sats + remainder < 0) remainder = -wa[0].base_sats;
-        wa[0].base_sats += remainder;
+    /* The floor() remainder goes to the largest emitted claim, deterministically.
+     * Sum of outputs must equal the reward exactly — under and the difference is
+     * never minted, over and the block is invalid. */
+    work_t *largest = NULL;
+    for (size_t i = 0; i < nw; i++) {
+        if (w[i].emit && (!largest || w[i].claim > largest->claim)) largest = &w[i];
     }
+    if (!largest) { free(rank); free(w); return -1; }
+    largest->paid += reward_after_fee - distributed;
+    if (largest->paid < 0) { free(rank); free(w); return -1; }
 
-    /* Merge existing carry balances into the working state. */
-    for (size_t i = 0; i < n_carry_in; i++) {
-        work_addr_t *w = find_work_addr(wa, n_addrs, carry[i].address);
-        if (w) {
-            w->old_carry = carry[i].pending_sats;
-        }
-    }
-
-    for (size_t i = 0; i < n_addrs; i++) {
-        wa[i].balance = wa[i].base_sats + wa[i].old_carry;
-        if (wa[i].balance < 0) wa[i].balance = 0;
-        if (wa[i].balance >= min_payout_sats) {
-            wa[i].emit = 1;
-        }
-    }
-
-    /* If too many outputs, convert the smallest payouts to carry until under
-     * the cap. This is the output-weight safety valve. */
-    size_t emit_count = 0;
-    for (size_t i = 0; i < n_addrs; i++) if (wa[i].emit) emit_count++;
-    if (emit_count > max_outputs) {
-        /* Sort only the emitting addresses by balance ascending and demote the
-         * smallest until the count fits. */
-        work_addr_t **emitting = (work_addr_t **)calloc(emit_count, sizeof(*emitting));
-        if (!emitting) { free(wa); free(sorted); return -1; }
-        size_t e = 0;
-        for (size_t i = 0; i < n_addrs; i++) {
-            if (wa[i].emit) emitting[e++] = &wa[i];
-        }
-        qsort(emitting, emit_count, sizeof(*emitting),
-              (int (*)(const void *, const void *))cmp_payout_asc);
-        size_t demote = emit_count - max_outputs;
-        for (size_t i = 0; i < demote; i++) {
-            emitting[i]->emit = 0;
-        }
-        free(emitting);
-    }
-
-    /* Write outputs. */
+    /* Write the payout list, largest claim first. */
     size_t np = 0;
-    for (size_t i = 0; i < n_addrs; i++) {
-        if (wa[i].emit) {
-            if (np >= max_outputs) break; /* should not happen */
-            snprintf(payouts[np].address, sizeof payouts[np].address, "%s", wa[i].address);
-            payouts[np].sats = wa[i].balance;
-            np++;
-        }
+    for (size_t i = 0; i < nw && np < max_outputs; i++) {
+        work_t *e = rank[i];
+        if (!e->emit || e->paid <= 0) continue;
+        snprintf(payouts[np].address, sizeof payouts[np].address, "%s", e->address);
+        payouts[np].sats = e->paid;
+        np++;
     }
     *n_payouts_out = np;
 
-    /* Write updated carry balances. Every address in the window ends up either
-     * paid out (carry drops to 0) or carried forward at its full balance. */
-    size_t nc = 0;
-    for (size_t i = 0; i < n_addrs; i++) {
-        if (wa[i].emit) {
-            /* Payout consumed the old carry too. */
-            if (wa[i].old_carry > 0) {
-                pplns_carry_t *c = find_carry(carry, n_carry_in, wa[i].address);
-                if (c) c->pending_sats = 0;
-            }
-        } else {
-            int64_t new_carry = wa[i].balance;
-            pplns_carry_t *c = find_carry(carry, n_carry_in, wa[i].address);
-            if (c) {
-                c->pending_sats = new_carry;
-            } else {
-                if (nc + n_carry_in >= n_addrs + n_carry_in) {
-                    /* Caller did not provide enough capacity. */
-                    free(wa); free(sorted); return -1;
-                }
-                if (n_carry_in + nc >= carry_cap) {
-                    free(wa); free(sorted); return -1;
-                }
-                snprintf(carry[n_carry_in + nc].address,
-                         sizeof carry[n_carry_in + nc].address, "%s", wa[i].address);
-                carry[n_carry_in + nc].pending_sats = new_carry;
-                nc++;
-            }
-        }
+    /* New ledger: what each address was owed this block, minus what it actually
+     * received. Computed against the sats really emitted, not the ideal split,
+     * so rounding is absorbed here rather than accumulating silently.
+     *
+     * The largest emitted claim takes the residual, which keeps the ledger
+     * summing to exactly zero in floating point instead of drifting. */
+    size_t nl = 0;
+    double sum_others = 0.0;
+    for (size_t i = 0; i < nw; i++) {
+        if (&w[i] == largest) continue;
+        w[i].claim -= (double)w[i].paid / (double)reward_after_fee;
+        sum_others += w[i].claim;
     }
-    *n_carry_out = n_carry_in + nc;
+    largest->claim = -sum_others;
 
-    free(wa);
-    free(sorted);
+    for (size_t i = 0; i < nw; i++) {
+        if (fabs(w[i].claim) < CLAIM_EPSILON) continue;
+        if (nl >= ledger_cap) { free(rank); free(w); return -1; }
+        snprintf(ledger[nl].address, sizeof ledger[nl].address, "%s", w[i].address);
+        ledger[nl].claim_fraction = w[i].claim;
+        nl++;
+    }
+    *n_ledger_out = nl;
+
+    free(rank);
+    free(w);
     return 0;
 }

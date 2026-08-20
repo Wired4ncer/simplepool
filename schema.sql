@@ -207,17 +207,20 @@ CREATE TABLE IF NOT EXISTS payouts (
 CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);
 CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);
 
-/* Proportional / PPLNS carry-forward balances. The pool holds pending_sats
- * as a liability until a future block makes the address eligible for a
- * coinbase output. address is the miner's payout_address from the workers
- * table. pending_sats includes any amount that was below prop_min_payout_sats
- * or was demoted to keep the block under the output/weight cap. */
-CREATE TABLE IF NOT EXISTS prop_balances (
+/* Proportional / PPLNS deferred-claim ledger. NOT a balance: the pool holds no
+ * funds. claim_fraction is a signed fraction of one block reward — positive
+ * means the address was skipped (its cut fell below prop_min_payout_sats, or it
+ * was demoted to keep the block under the output/weight cap) and is owed that
+ * fraction of a future block; negative means it was paid early, covering
+ * someone else's skipped share. The ledger sums to zero. See src/pplns.h for
+ * why this is a fraction and not sats or raw difficulty. address is the miner's
+ * payout_address from the workers table. */
+CREATE TABLE IF NOT EXISTS prop_ledger (
   address         TEXT PRIMARY KEY,
-  pending_sats    INTEGER NOT NULL DEFAULT 0,
+  claim_fraction  REAL NOT NULL DEFAULT 0,
   last_settled_ts INTEGER
 );
-CREATE INDEX IF NOT EXISTS prop_balances_ts_idx ON prop_balances(last_settled_ts);
+CREATE INDEX IF NOT EXISTS prop_ledger_ts_idx ON prop_ledger(last_settled_ts);
 
 /* In-flight payout ledger. The payout worker INSERTs a row before
  * broadcasting a Thunder transaction; on successful broadcast it

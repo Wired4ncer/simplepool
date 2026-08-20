@@ -112,7 +112,7 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 /* ---------- shared server state ---------- */
 
 /* One PPLNS settle plan: the coinbase payouts that went into a job, plus the
- * carry-forward balances that become authoritative if (and only if) that job's
+ * deferred-claim ledger that becomes authoritative if (and only if) that job's
  * block is accepted. Held until the job can no longer be solved. */
 #define PROP_PLAN_RING     8
 #define PROP_PLAN_MAX_PAY  64
@@ -123,8 +123,8 @@ typedef struct {
     int64_t         reward_after_fee;
     pplns_payout_t  payouts[PROP_PLAN_MAX_PAY];
     size_t          n_payouts;
-    pplns_carry_t  *carry;      /* owned */
-    size_t          n_carry;
+    pplns_claim_t  *ledger;     /* owned */
+    size_t          n_ledger;
 } prop_plan_t;
 
 typedef struct {
@@ -177,7 +177,7 @@ static double effective_pps_rate(const proxy_config_t *cfg,
 
 static void prop_plan_clear(prop_plan_t *p) {
     if (!p) return;
-    free(p->carry);
+    free(p->ledger);
     memset(p, 0, sizeof *p);
 }
 
@@ -264,33 +264,33 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
         return 1;
     }
 
-    pplns_carry_t *carry_in = NULL; size_t n_carry_in = 0;
-    if (store_prop_get_balances(s->store, &carry_in, &n_carry_in) < 0) {
+    pplns_claim_t *ledger_in = NULL; size_t n_ledger_in = 0;
+    if (store_prop_get_ledger(s->store, &ledger_in, &n_ledger_in) < 0) {
         free(addrs);
-        LOG_WARN("proportional: reading carry balances failed; falling back");
+        LOG_WARN("proportional: reading the claim ledger failed; falling back");
         return 1;
     }
 
-    /* pplns_compute_payouts writes new carry entries in place, so the array
-     * needs room for every window address on top of what is already there. */
-    size_t carry_cap = n_addrs + n_carry_in + 1;
-    pplns_carry_t *carry = (pplns_carry_t *)calloc(carry_cap, sizeof(*carry));
-    if (!carry) { free(addrs); free(carry_in); return -1; }
-    if (n_carry_in) memcpy(carry, carry_in, n_carry_in * sizeof(*carry));
-    free(carry_in);
+    /* pplns_compute_payouts rewrites the ledger in place, so the array needs
+     * room for every window address on top of what is already there. */
+    size_t ledger_cap = n_addrs + n_ledger_in + 1;
+    pplns_claim_t *ledger = (pplns_claim_t *)calloc(ledger_cap, sizeof(*ledger));
+    if (!ledger) { free(addrs); free(ledger_in); return -1; }
+    if (n_ledger_in) memcpy(ledger, ledger_in, n_ledger_in * sizeof(*ledger));
+    free(ledger_in);
 
     size_t max_out = (size_t)s->cfg->prop_max_outputs;
     if (max_out > PROP_PLAN_MAX_PAY) max_out = PROP_PLAN_MAX_PAY;
 
-    size_t n_payouts = 0, n_carry_out = 0;
+    size_t n_payouts = 0, n_ledger_out = 0;
     int rc = pplns_compute_payouts(reward_after_fee, actual_diff,
                                    addrs, n_addrs,
-                                   carry, carry_cap, n_carry_in, &n_carry_out,
+                                   ledger, ledger_cap, n_ledger_in, &n_ledger_out,
                                    s->cfg->prop_min_payout_sats, max_out,
                                    plan->payouts, &n_payouts);
     free(addrs);
     if (rc < 0 || n_payouts == 0) {
-        free(carry);
+        free(ledger);
         LOG_WARN("proportional: payout computation produced nothing "
                  "(rc=%d, %zu addresses, window difficulty %.2f); falling back",
                  rc, n_addrs, actual_diff);
@@ -302,18 +302,20 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
      * refuses either way, which would take every job down rather than one, so
      * check it here and fall back instead.
      *
-     * ⚠️ This fires whenever carry-forward is non-empty — see the carry-model
-     * note in ecash-pool-proportional-plan.md §3.3. It is a guard, not a fix. */
+     * With the deferred-claim ledger this must never fire: the payout list is
+     * renormalised over the emitted set precisely so it sums to the reward. It
+     * stays as a belt-and-braces check because the cost of being wrong here is
+     * an invalid block or unminted value, not a bad log line. */
     int64_t total = 0;
     for (size_t i = 0; i < n_payouts; i++) total += plan->payouts[i].sats;
     if (total != reward_after_fee) {
         LOG_ERROR("proportional: payout total %lld != reward-after-fee %lld "
-                  "(%zu outputs, delta %+lld sats). Carry-forward cannot be "
-                  "settled inside one coinbase; falling back to per-miner "
+                  "(%zu outputs, delta %+lld sats) — this is a bug in the payout "
+                  "split, not a configuration problem. Falling back to per-miner "
                   "coinbase for this template.",
                   (long long)total, (long long)reward_after_fee,
                   n_payouts, (long long)(total - reward_after_fee));
-        free(carry);
+        free(ledger);
         return 1;
     }
 
@@ -321,19 +323,19 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     plan->height           = (uint32_t)t->height;
     plan->reward_after_fee = reward_after_fee;
     plan->n_payouts        = n_payouts;
-    plan->carry            = carry;
-    plan->n_carry          = n_carry_out;
+    plan->ledger           = ledger;
+    plan->n_ledger         = n_ledger_out;
 
     LOG_INFO("proportional: %zu payout outputs over %.2f window difficulty "
              "(%.1f x network %.2f), reward-after-fee %lld sats, "
-             "%zu carried balances",
+             "%zu deferred claims",
              n_payouts, actual_diff, s->cfg->prop_window_k, net_diff,
-             (long long)reward_after_fee, n_carry_out);
+             (long long)reward_after_fee, n_ledger_out);
     return 0;
 }
 
 /* Store a plan in the ring, replacing the oldest. Takes ownership of
- * plan->carry. */
+ * plan->ledger. */
 static void prop_plan_remember(server_ctx_t *s, const prop_plan_t *plan) {
     pthread_mutex_lock(&s->lock);
     prop_plan_t *slot = &s->prop_plans[s->prop_plan_next % PROP_PLAN_RING];
@@ -691,9 +693,10 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
      * committed twice — the plan is consumed here.
      *
      * ⚠️ This runs on acceptance by the pool, not by the network. A block that
-     * is later reorged out leaves these balances credited. Solo mode has no
-     * such state, which is why the reorg exposure is new in this mode; see
-     * ecash-pool-proportional-plan.md §3.6. */
+     * is later reorged out leaves the ledger reflecting a payment that no longer
+     * exists. No funds are at stake — the ledger only records who is owed a turn
+     * — but the fairness memory is wrong until it washes out. Solo mode has no
+     * such state; see ecash-pool-proportional-plan.md §3.6. */
     if (s && s->store && s->cfg &&
         strcmp(s->cfg->pool_mode, "proportional") == 0 && job_id) {
         prop_plan_t settled;
@@ -714,16 +717,16 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         if (found) {
             if (store_prop_settle_block(s->store, ts_ms, (int)height, block_hash,
                                         settled.payouts, settled.n_payouts,
-                                        settled.carry, settled.n_carry) < 0) {
+                                        settled.ledger, settled.n_ledger) < 0) {
                 LOG_ERROR("proportional: settling block %s (job %s) failed — "
-                          "%zu payouts and %zu carry balances are NOT recorded",
+                          "%zu payouts and %zu deferred claims are NOT recorded",
                           block_hash ? block_hash : "?", job_id,
-                          settled.n_payouts, settled.n_carry);
+                          settled.n_payouts, settled.n_ledger);
             } else {
                 LOG_INFO("proportional: settled block %s — %zu coinbase payouts, "
-                         "%zu carry balances",
+                         "%zu deferred claims",
                          block_hash ? block_hash : "?",
-                         settled.n_payouts, settled.n_carry);
+                         settled.n_payouts, settled.n_ledger);
             }
             prop_plan_clear(&settled);
         } else {
