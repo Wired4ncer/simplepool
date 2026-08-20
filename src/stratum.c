@@ -781,6 +781,21 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
 /* Send mining.notify for the current job to a specific connection, using
  * that connection's rendered coinbase. Skips silently if the conn is not
  * yet authorized (we have no payout address to render against). */
+/* Give vardiff a chance to act on a connection that is NOT submitting.
+ *
+ * vardiff_maybe_retarget only runs after an accepted share, so a miner whose
+ * difficulty is set too high for its hashrate submits nothing, never
+ * retargets, and stays stuck there forever. That is reachable now that
+ * authorize can seed a difficulty from history: hardware gets swapped behind
+ * the same worker name. Called on every job broadcast, so an idle connection
+ * ratchets down 4x per vardiff window until it can produce shares again. */
+static void vardiff_check_idle(stratum_server_t *s, stratum_conn_t *c,
+                               char **buf, size_t *len) {
+    if (!s->cfg.vardiff_enabled || !c->authorized) return;
+    if (c->vd_window_shares > 0) return;      /* it is submitting; leave it */
+    vardiff_maybe_retarget(s, c, now_ms(), buf, len);
+}
+
 static void send_current_notify(stratum_server_t *s, stratum_conn_t *c,
                                 char **buf, size_t *len, int clean) {
     pthread_rwlock_rdlock(&s->job_lock);
@@ -956,7 +971,23 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
-    if (c->difficulty <= 0) c->difficulty = s->cfg.initial_diff;
+    if (c->difficulty <= 0) {
+        /* Prefer what this worker was actually running at. A reconnect or a
+         * pool restart otherwise drops it to initial_diff and makes vardiff
+         * climb again at 4x per window — minutes of flooding and shed shares
+         * for a multi-TH/s miner that was already converged. */
+        double hint = 0.0;
+        if (s->cfg.on_difficulty_hint) {
+            hint = s->cfg.on_difficulty_hint(s->cfg.ctx, c->worker_name);
+        }
+        if (hint > 0.0) {
+            c->difficulty = hint;
+            LOG_INFO("stratum: %s resumed at difficulty %.0f from its own history",
+                     c->worker_name, hint);
+        } else {
+            c->difficulty = s->cfg.initial_diff;
+        }
+    }
     /* Same clamp as vardiff: a starting difficulty above the network
      * difficulty would make the miner discard valid blocks locally. */
     double net_diff = current_net_diff(s);
@@ -1581,6 +1612,7 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
         if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
         char *out = NULL; size_t olen = 0;
+        vardiff_check_idle(s, c, &out, &olen);
         send_current_notify(s, c, &out, &olen, 1);
         if (out) {
             pthread_mutex_lock(&c->write_lock);

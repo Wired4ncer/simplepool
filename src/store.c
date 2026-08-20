@@ -1273,6 +1273,47 @@ int store_record_template(store_t *s, const store_template_t *t) {
     return 0;
 }
 
+double store_worker_recent_difficulty(store_t *s, const char *worker_name,
+                                      int lookback_sec) {
+    if (!s || !worker_name || !*worker_name || lookback_sec <= 0) return 0.0;
+
+    /* Median of the most recent shares. Ordering by difficulty and taking the
+     * middle row is exact and cheap at this row count. */
+    static const char *Q =
+        "SELECT s.difficulty FROM shares s"
+        "  JOIN workers w ON s.worker_id = w.id"
+        "  WHERE w.name = ? AND s.ts >= ? AND s.is_block = 0"
+        "  ORDER BY s.difficulty";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return 0.0;
+    }
+    sqlite3_bind_text (st, 1, worker_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(time(NULL) - lookback_sec));
+
+    size_t cap = 256, n = 0;
+    double *vals = (double *)calloc(cap, sizeof(*vals));
+    if (!vals) { sqlite3_finalize(st); return 0.0; }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n >= cap) {
+            size_t ncap = cap * 2;
+            double *nv = (double *)realloc(vals, ncap * sizeof(*nv));
+            if (!nv) { free(vals); sqlite3_finalize(st); return 0.0; }
+            vals = nv; cap = ncap;
+        }
+        vals[n++] = sqlite3_column_double(st, 0);
+    }
+    sqlite3_finalize(st);
+
+    /* Too few samples to be worth trusting — let initial_diff stand. */
+    if (n < 8) { free(vals); return 0.0; }
+    double med = (n % 2) ? vals[n / 2]
+                         : (vals[n / 2 - 1] + vals[n / 2]) / 2.0;
+    free(vals);
+    return (med > 0.0) ? med : 0.0;
+}
+
 /* ---------- proportional / PPLNS helpers ---------- */
 
 int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {

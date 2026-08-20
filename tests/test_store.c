@@ -661,6 +661,52 @@ static void test_proportional_window_floor(void) {
     printf("  ok test_proportional_window_floor\n");
 }
 
+/* A reconnecting worker must resume near the difficulty it was actually
+ * running at. Restarting every miner at initial_diff makes a multi-TH/s ASIC
+ * climb again at 4x per vardiff window, flooding the pool and shedding shares
+ * at every step -- observed live on the alpha pool after a restart. */
+static void test_worker_recent_difficulty(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    uint64_t now_s = (uint64_t)time(NULL);
+    /* A vardiff ramp: a tail of tiny difficulties from the climb, then the
+     * converged value. The median must ignore the ramp; a mean would not. */
+    double ramp[] = { 1, 4, 16, 64, 256 };
+    for (int i = 0; i < 5; i++)
+        assert(store_record_share_addr(s, "w.ramp", "bcrt1qaaa",
+                                       (now_s - 300 + (uint64_t)i) * 1000ULL,
+                                       ramp[i], 0, NULL, 0, 0.0) == 0);
+    for (int i = 0; i < 20; i++)
+        assert(store_record_share_addr(s, "w.ramp", "bcrt1qaaa",
+                                       (now_s - 200 + (uint64_t)i) * 1000ULL,
+                                       4096.0, 0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+
+    double d = store_worker_recent_difficulty(s, "w.ramp", 3600);
+    assert(d == 4096.0);                       /* the converged value, not the ramp */
+
+    /* Too little history is not worth trusting: fall back to initial_diff. */
+    for (int i = 0; i < 3; i++)
+        assert(store_record_share_addr(s, "w.new", "bcrt1qbbb",
+                                       (now_s - 10 + (uint64_t)i) * 1000ULL,
+                                       999.0, 0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+    assert(store_worker_recent_difficulty(s, "w.new", 3600) == 0.0);
+
+    /* Unknown worker, and stale history, both yield nothing. */
+    assert(store_worker_recent_difficulty(s, "nobody", 3600) == 0.0);
+    assert(store_worker_recent_difficulty(s, "w.ramp", 1) == 0.0);
+
+    store_close(s);
+    printf("  ok test_worker_recent_difficulty\n");
+}
+
 static void test_proportional(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -792,6 +838,7 @@ int main(void) {
     test_template_history();
     test_template_retention();
     test_commit_survives_a_locked_db();
+    test_worker_recent_difficulty();
     test_proportional();
     test_proportional_window_floor();
     cleanup_dbs();

@@ -178,6 +178,14 @@ void store_get_stats(store_t *s, store_stats_t *out);
  * before store_open by setting a global; for tests only. */
 void store_test_set_ring_capacity(size_t cap);
 
+/* Typical share difficulty this worker was recently running at, for seeding a
+ * reconnecting miner instead of restarting it at initial_diff. Uses the MEDIAN
+ * of its recent shares, not the mean: a vardiff ramp leaves a tail of tiny
+ * difficulties from the climb, and a mean would be dragged down by them.
+ * Returns 0.0 when the worker has no usable history. */
+double store_worker_recent_difficulty(store_t *s, const char *worker_name,
+                                      int lookback_sec);
+
 /* ---------- proportional / PPLNS helpers ---------- */
 
 /* Read the deferred-claim ledger into *out. Caller must free(*out).

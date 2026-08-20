@@ -784,6 +784,15 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
              block_hash ? block_hash : "?");
 }
 
+/* Starting share difficulty for a reconnecting worker: what it was actually
+ * running at, so a pool restart does not send every miner back down to
+ * initial_diff and make it climb again. Looks back an hour. */
+static double on_difficulty_hint_cb(void *ctx, const char *worker_name) {
+    server_ctx_t *s = (server_ctx_t *)ctx;
+    if (!s || !s->store || !worker_name) return 0.0;
+    return store_worker_recent_difficulty(s->store, worker_name, 3600);
+}
+
 /* ---------- tip watcher ---------- */
 
 static void *tip_watcher(void *arg) {
@@ -1098,6 +1107,7 @@ int main(int argc, char **argv) {
     }
     stcfg.ctx            = &sctx;
     stcfg.on_share       = on_share_cb;
+    stcfg.on_difficulty_hint = on_difficulty_hint_cb;
     stcfg.on_reject      = on_reject_cb;
     stcfg.on_block       = on_block_cb;
     stcfg.on_block_found = on_block_found_cb;
