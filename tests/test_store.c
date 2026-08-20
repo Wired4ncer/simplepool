@@ -2,6 +2,8 @@
 
 #include "store.h"
 #include "log.h"
+#include "pplns.h"
+#include "coinbase.h"
 
 #include <sqlite3.h>
 
@@ -608,6 +610,95 @@ static void test_template_retention(void) {
     printf("  ok test_template_retention\n");
 }
 
+static void test_proportional(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Three miners with different share rates. */
+    struct { const char *worker; const char *addr; double diff; int count; } miners[] = {
+        { "m1", "bcrt1qaaa", 1.0, 5 },
+        { "m2", "bcrt1qbbb", 2.0, 3 },
+        { "m3", "bcrt1qccc", 0.5, 4 },
+    };
+    uint64_t base_ts = 1700000000000ULL;
+    for (size_t m = 0; m < 3; m++) {
+        for (int i = 0; i < miners[m].count; i++) {
+            int rc = store_record_share_addr(s, miners[m].worker, miners[m].addr,
+                base_ts + (uint64_t)(m * 10 + i), miners[m].diff, 0, NULL, 0, 0.0);
+            assert(rc == 0);
+        }
+    }
+    assert(store_flush(s) == 0);
+
+    pplns_carry_t *carry = NULL;
+    size_t n_carry = 0;
+    assert(store_prop_get_balances(s, &carry, &n_carry) == 0);
+    assert(n_carry == 0);
+    free(carry);
+
+    uint64_t start_ms = 0;
+    double actual_diff = 0.0;
+    assert(store_prop_compute_window(s, 8.0, base_ts + 100, &start_ms, &actual_diff) == 0);
+    assert(actual_diff >= 8.0);
+
+    pplns_addr_t *addrs = NULL;
+    size_t n_addrs = 0;
+    assert(store_prop_window_addrs(s, start_ms, base_ts + 100, &addrs, &n_addrs) == 0);
+    assert(n_addrs == 3);
+    double sum_diff = 0.0;
+    for (size_t i = 0; i < n_addrs; i++) sum_diff += addrs[i].total_difficulty;
+    assert(sum_diff > actual_diff - 0.001 && sum_diff < actual_diff + 0.001);
+
+    /* Compute payouts with a high min_payout so some balance carries forward. */
+    size_t max_outputs = 12;
+    pplns_payout_t payouts[12] = {0};
+    size_t n_payouts = 0;
+    pplns_carry_t carry_buf[16] = {0};
+    size_t n_carry_out = 0;
+    int64_t reward = 1000000LL;
+    int rc = pplns_compute_payouts(reward, actual_diff, addrs, n_addrs,
+                                   carry_buf, 16, 0, &n_carry_out,
+                                   300000LL, max_outputs,
+                                   payouts, &n_payouts);
+    assert(rc == 0);
+    assert(n_payouts + n_carry_out == n_addrs);
+
+    int64_t paid = 0;
+    for (size_t i = 0; i < n_payouts; i++) paid += payouts[i].sats;
+    int64_t carried = 0;
+    for (size_t i = 0; i < n_carry_out; i++) carried += carry_buf[i].pending_sats;
+    assert(paid + carried == reward);
+
+    /* Settle the block and verify prop_balances. */
+    rc = store_prop_settle_block(s, base_ts + 200, 100, "blockhash1",
+                                 payouts, n_payouts, carry_buf, n_carry_out);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t nblocks = scalar_i64(db, "SELECT count(*) FROM blocks_found");
+    assert(nblocks == 1);
+
+    pplns_carry_t *bal = NULL;
+    size_t n_bal = 0;
+    assert(store_prop_get_balances(s, &bal, &n_bal) == 0);
+    int64_t db_carried = 0;
+    for (size_t i = 0; i < n_bal; i++) db_carried += bal[i].pending_sats;
+    assert(db_carried == carried);
+
+    sqlite3_close(db);
+    free(addrs);
+    free(bal);
+    store_close(s);
+    printf("  ok test_proportional\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -620,6 +711,7 @@ int main(void) {
     test_template_history();
     test_template_retention();
     test_commit_survives_a_locked_db();
+    test_proportional();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

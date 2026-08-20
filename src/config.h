@@ -2,6 +2,7 @@
 #define SIMPLEPOOL_CONFIG_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     /* listener */
@@ -54,11 +55,28 @@ typedef struct {
      * operator later batches that BTC into Thunder via the admin
      * dashboard's deposit action, and the payout worker drains the Thunder
      * reserve to miners. */
-    char pool_mode[16];                       /* "solo" | "pps-classic" */
+    char pool_mode[16];                       /* "solo" | "pps-classic" | "proportional" */
     /* pps-classic: coinbase pays this BTC address (P2WPKH/P2PKH/P2SH) for
      * the net-of-fee reward. Required when pool_mode = pps-classic;
      * ignored otherwise. */
     char pool_btc_address[128];
+    /* Proportional / coinbase-direct PPLNS settings.
+     *
+     * window_difficulty = prop_window_k * current_network_difficulty. The PPLNS
+     * window walks back from the current tip over the newest shares until the
+     * cumulative difficulty reaches window_difficulty. Shares are grouped by
+     * payout address.
+     *
+     * prop_min_payout_sats is the minimum a coinbase output may pay; smaller
+     * amounts are carried forward in prop_balances and paid once the balance
+     * crosses the threshold.
+     *
+     * prop_max_outputs caps the number of payout outputs per block to keep the
+     * block within the 4 MWU weight limit; the smallest payouts are carried
+     * forward until under the cap. */
+    double prop_window_k;
+    int64_t prop_min_payout_sats;
+    int prop_max_outputs;
     /* PPS rate override — sats credited per unit of share difficulty.
      *
      * Leave unset (0) and the proxy derives the rate from each block

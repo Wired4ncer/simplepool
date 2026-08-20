@@ -82,6 +82,15 @@ struct stratum_job {
     char   **tx_hex_list;   /* owned */
     size_t   tx_count;
 
+    /* pool_mode=proportional: the PPLNS payout set for this template, shared
+     * by every connection (unlike solo, where each connection's coinbase pays
+     * its own miner). Attached by main.c via stratum_job_set_payouts after it
+     * has queried the window. NULL/0 means no window was available, and the
+     * render path falls back to paying the connection's own address. The
+     * address strings are owned by the job. */
+    coinbase_payout_t *payouts;
+    size_t             n_payouts;
+
     uint64_t created_ms;    /* for retention ring */
 };
 
@@ -153,13 +162,52 @@ void stratum_job_free(stratum_job_t *j) {
         for (size_t i = 0; i < j->tx_count; ++i) free(j->tx_hex_list[i]);
         free(j->tx_hex_list);
     }
+    if (j->payouts) {
+        for (size_t i = 0; i < j->n_payouts; ++i) free((char *)j->payouts[i].address);
+        free(j->payouts);
+    }
     free(j);
+}
+
+int stratum_job_set_payouts(stratum_job_t *j,
+                            const coinbase_payout_t *payouts,
+                            size_t n_payouts)
+{
+    if (!j) return -1;
+    /* Replace any previous set outright — a job is only ever populated once,
+     * but making this idempotent keeps a retry from leaking. */
+    if (j->payouts) {
+        for (size_t i = 0; i < j->n_payouts; ++i) free((char *)j->payouts[i].address);
+        free(j->payouts);
+        j->payouts = NULL;
+        j->n_payouts = 0;
+    }
+    if (!payouts || n_payouts == 0) return 0;
+
+    coinbase_payout_t *copy = calloc(n_payouts, sizeof(*copy));
+    if (!copy) return -1;
+    for (size_t i = 0; i < n_payouts; ++i) {
+        copy[i].address = strdup(payouts[i].address ? payouts[i].address : "");
+        if (!copy[i].address) {
+            for (size_t k = 0; k < i; ++k) free((char *)copy[k].address);
+            free(copy);
+            return -1;
+        }
+        copy[i].sats = payouts[i].sats;
+    }
+    j->payouts   = copy;
+    j->n_payouts = n_payouts;
+    return 0;
 }
 
 /* ============================================================ server ==== */
 
 struct stratum_server {
     stratum_cfg_t cfg;
+
+    /* Derived once from cfg.pool_mode so the render path does not string-compare
+     * per share. Mirrors cfg.pps_enabled, which main.c derives the same way. */
+    int prop_enabled;
 
     int  listen_fd;
     atomic_int  stop;
@@ -518,11 +566,32 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
         }
+    } else if (s->prop_enabled && job->payouts && job->n_payouts > 0 &&
+               job->coinbasetxn_hex) {
+        /* pool_mode=proportional: one coinbase per template, shared by every
+         * connection, paying the PPLNS window's shareholders directly. Sessions
+         * differ only by extranonce1, so this render is identical for all of
+         * them — the per-connection cache below still holds because it is keyed
+         * on job_id.
+         *
+         * main.c has already checked that sum(payouts) + fee == the template's
+         * reward; the builder re-checks and refuses rather than emitting a
+         * coinbase that pays the wrong total. */
+        rc = coinbase_build_from_template_multi(job->coinbasetxn_hex,
+                                          job->payouts, job->n_payouts,
+                                          s->cfg.operator_address, s->cfg.fee_bps,
+                                          s->cfg.coinbase_tag,
+                                          job->en1_size, job->en2_size,
+                                          &parts, NULL, NULL, NULL, err, sizeof err);
     } else if (job->coinbasetxn_hex) {
         /* Backend dictated the coinbase (e.g. CUSF enforcer): build from it,
          * redirecting the reward output to this miner and preserving the
          * mandatory commitment outputs. The witness commitment is already in
-         * the server's coinbase, so job->wc_hex is not used here. */
+         * the server's coinbase, so job->wc_hex is not used here.
+         *
+         * In proportional mode this is also the fallback when no PPLNS window
+         * exists yet (first block, or an empty shares table): paying the finder
+         * directly is correct and non-custodial, just not yet proportional. */
         rc = coinbase_build_from_template(job->coinbasetxn_hex,
                                           c->payout_address,
                                           s->cfg.operator_address, s->cfg.fee_bps,
@@ -1199,7 +1268,8 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         int64_t reward_sats = job->value_sats - fee_sats;
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,
                               c->payout_address, ts_now, job->height,
-                              block_hash_hex, reward_sats, fee_sats);
+                              job->job_id, block_hash_hex,
+                              reward_sats, fee_sats);
     }
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }
@@ -1459,6 +1529,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     /* Negative → explicit disable. 0 → apply default (10 min). Positive kept. */
     if (s->cfg.idle_timeout_sec == 0) s->cfg.idle_timeout_sec = 600;
     else if (s->cfg.idle_timeout_sec < 0) s->cfg.idle_timeout_sec = 0;
+    s->prop_enabled = (strcmp(s->cfg.pool_mode, "proportional") == 0);
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);

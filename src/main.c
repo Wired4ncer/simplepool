@@ -4,6 +4,7 @@
 #include "coinbase.h"
 #include "config.h"
 #include "log.h"
+#include "pplns.h"
 #include "share.h"
 #include "store.h"
 #include "stratum.h"
@@ -110,6 +111,22 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 
 /* ---------- shared server state ---------- */
 
+/* One PPLNS settle plan: the coinbase payouts that went into a job, plus the
+ * carry-forward balances that become authoritative if (and only if) that job's
+ * block is accepted. Held until the job can no longer be solved. */
+#define PROP_PLAN_RING     8
+#define PROP_PLAN_MAX_PAY  64
+
+typedef struct {
+    char            job_id[32];
+    uint32_t        height;
+    int64_t         reward_after_fee;
+    pplns_payout_t  payouts[PROP_PLAN_MAX_PAY];
+    size_t          n_payouts;
+    pplns_carry_t  *carry;      /* owned */
+    size_t          n_carry;
+} prop_plan_t;
+
 typedef struct {
     bitcoind_client_t *btc;
     /* Dedicated client for the tip watcher's (possibly long-polled) GBT
@@ -126,6 +143,16 @@ typedef struct {
     int             last_height;
     char            last_prev_hash[65];
     uint64_t        last_built_ms;
+
+    /* pool_mode=proportional: the last few PPLNS settle plans, keyed on the
+     * job_id they were computed for. A block is settled against the plan of the
+     * job the miner actually solved, not the newest one — several templates can
+     * exist for the same height (mempool churn), each with its own window, and
+     * crediting the wrong one would mis-pay carry-forward. Guarded by `lock`.
+     * Eight is generous: a plan older than the last handful of templates cannot
+     * still be solvable, because stratum has already dropped the job. */
+    prop_plan_t     prop_plans[PROP_PLAN_RING];
+    size_t          prop_plan_next;
 
     /* Live PPS rate, refreshed whenever a new template arrives. Read on the
      * share path, so it is an atomic double rather than taking `lock` —
@@ -146,13 +173,187 @@ static double effective_pps_rate(const proxy_config_t *cfg,
     return pps_rate_from_template(value_sats, net_diff, cfg->fee_bps);
 }
 
-/* Build a job from a freshly fetched template. The coinbase is rendered
- * per-connection inside stratum.c (each miner pays their own address),
- * so we only pass template-level data here. */
-static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
+/* ---------- proportional / PPLNS ---------- */
+
+static void prop_plan_clear(prop_plan_t *p) {
+    if (!p) return;
+    free(p->carry);
+    memset(p, 0, sizeof *p);
+}
+
+/* Network difficulty implied by a template, by the same route refresh_pps_rate
+ * takes: GBT's target when it supplies one, else derived from nbits. */
+static double template_net_diff(const bitcoind_template_t *t) {
+    uint8_t target_be[32] = {0};
+    if (t->target_hex[0] != '\0' && strlen(t->target_hex) == 64) {
+        if (hex_to_bytes_display(t->target_hex, target_be, 32) < 0)
+            nbits_to_target(t->bits, target_be);
+    } else {
+        nbits_to_target(t->bits, target_be);
+    }
+    return target_to_diff(target_be);
+}
+
+/* Compute the PPLNS payout set for a template.
+ *
+ * Returns 0 with *plan filled when a usable window exists, 1 when there is no
+ * proportional split to make and the caller should fall back to per-miner
+ * (solo) rendering, and -1 on a hard error.
+ *
+ * The 1 case is deliberately not an error: an empty shares table, a template
+ * without a server coinbase, or a window whose payouts do not conserve the
+ * reward all mean "cannot split this block safely". Paying the finder directly
+ * is always valid and never custodial, so the pool keeps mining. */
+static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
+                          const char *job_id, prop_plan_t *plan) {
+    if (!s || !s->cfg || !s->store || !t || !plan) return -1;
+    memset(plan, 0, sizeof *plan);
+
+    if (!t->coinbasetxn_hex || !t->coinbasetxn_hex[0]) {
+        LOG_WARN("proportional: template has no coinbasetxn (needs the enforcer "
+                 "GBT); falling back to per-miner coinbase for this template");
+        return 1;
+    }
+
+    /* The reward the builder will check against — read from the serialized
+     * coinbase, not from the template's coinbasevalue field. */
+    int64_t reward = 0;
+    char cerr[256] = {0};
+    if (coinbase_template_reward(t->coinbasetxn_hex, &reward, cerr, sizeof cerr) < 0) {
+        LOG_WARN("proportional: cannot read template reward (%s); falling back", cerr);
+        return 1;
+    }
+
+    /* Operator fee, byte-identical to the builder's arithmetic. */
+    int64_t fee_sats = 0;
+    if (s->cfg->operator_address[0] && s->cfg->fee_bps > 0 && reward > 0) {
+        fee_sats = (reward * (int64_t)s->cfg->fee_bps) / 10000;
+        if (fee_sats < COINBASE_DUST_SATS) fee_sats = 0;
+    }
+    int64_t reward_after_fee = reward - fee_sats;
+    if (reward_after_fee <= 0) {
+        LOG_WARN("proportional: nothing to split (reward=%lld fee=%lld); falling back",
+                 (long long)reward, (long long)fee_sats);
+        return 1;
+    }
+
+    /* Window, in difficulty units so it survives a retarget unchanged. */
+    double net_diff = template_net_diff(t);
+    if (!isfinite(net_diff) || net_diff <= 0.0) {
+        LOG_WARN("proportional: template difficulty is %.4f; falling back", net_diff);
+        return 1;
+    }
+    double want_diff = s->cfg->prop_window_k * net_diff;
+    uint64_t now = now_ms();
+    uint64_t start_ms = 0;
+    double   actual_diff = 0.0;
+    if (store_prop_compute_window(s->store, want_diff, now,
+                                  &start_ms, &actual_diff) < 0 ||
+        actual_diff <= 0.0) {
+        LOG_INFO("proportional: no shares in the window yet "
+                 "(wanted %.2f difficulty); paying the finder directly", want_diff);
+        return 1;
+    }
+
+    pplns_addr_t  *addrs = NULL; size_t n_addrs = 0;
+    if (store_prop_window_addrs(s->store, start_ms, now, &addrs, &n_addrs) < 0 ||
+        n_addrs == 0) {
+        free(addrs);
+        LOG_INFO("proportional: window has no payable addresses; "
+                 "paying the finder directly");
+        return 1;
+    }
+
+    pplns_carry_t *carry_in = NULL; size_t n_carry_in = 0;
+    if (store_prop_get_balances(s->store, &carry_in, &n_carry_in) < 0) {
+        free(addrs);
+        LOG_WARN("proportional: reading carry balances failed; falling back");
+        return 1;
+    }
+
+    /* pplns_compute_payouts writes new carry entries in place, so the array
+     * needs room for every window address on top of what is already there. */
+    size_t carry_cap = n_addrs + n_carry_in + 1;
+    pplns_carry_t *carry = (pplns_carry_t *)calloc(carry_cap, sizeof(*carry));
+    if (!carry) { free(addrs); free(carry_in); return -1; }
+    if (n_carry_in) memcpy(carry, carry_in, n_carry_in * sizeof(*carry));
+    free(carry_in);
+
+    size_t max_out = (size_t)s->cfg->prop_max_outputs;
+    if (max_out > PROP_PLAN_MAX_PAY) max_out = PROP_PLAN_MAX_PAY;
+
+    size_t n_payouts = 0, n_carry_out = 0;
+    int rc = pplns_compute_payouts(reward_after_fee, actual_diff,
+                                   addrs, n_addrs,
+                                   carry, carry_cap, n_carry_in, &n_carry_out,
+                                   s->cfg->prop_min_payout_sats, max_out,
+                                   plan->payouts, &n_payouts);
+    free(addrs);
+    if (rc < 0 || n_payouts == 0) {
+        free(carry);
+        LOG_WARN("proportional: payout computation produced nothing "
+                 "(rc=%d, %zu addresses, window difficulty %.2f); falling back",
+                 rc, n_addrs, actual_diff);
+        return 1;
+    }
+
+    /* Conservation guard. A coinbase must pay the reward exactly: short and the
+     * difference is never minted, over and the block is invalid. The builder
+     * refuses either way, which would take every job down rather than one, so
+     * check it here and fall back instead.
+     *
+     * ⚠️ This fires whenever carry-forward is non-empty — see the carry-model
+     * note in ecash-pool-proportional-plan.md §3.3. It is a guard, not a fix. */
+    int64_t total = 0;
+    for (size_t i = 0; i < n_payouts; i++) total += plan->payouts[i].sats;
+    if (total != reward_after_fee) {
+        LOG_ERROR("proportional: payout total %lld != reward-after-fee %lld "
+                  "(%zu outputs, delta %+lld sats). Carry-forward cannot be "
+                  "settled inside one coinbase; falling back to per-miner "
+                  "coinbase for this template.",
+                  (long long)total, (long long)reward_after_fee,
+                  n_payouts, (long long)(total - reward_after_fee));
+        free(carry);
+        return 1;
+    }
+
+    snprintf(plan->job_id, sizeof plan->job_id, "%s", job_id ? job_id : "");
+    plan->height           = (uint32_t)t->height;
+    plan->reward_after_fee = reward_after_fee;
+    plan->n_payouts        = n_payouts;
+    plan->carry            = carry;
+    plan->n_carry          = n_carry_out;
+
+    LOG_INFO("proportional: %zu payout outputs over %.2f window difficulty "
+             "(%.1f x network %.2f), reward-after-fee %lld sats, "
+             "%zu carried balances",
+             n_payouts, actual_diff, s->cfg->prop_window_k, net_diff,
+             (long long)reward_after_fee, n_carry_out);
+    return 0;
+}
+
+/* Store a plan in the ring, replacing the oldest. Takes ownership of
+ * plan->carry. */
+static void prop_plan_remember(server_ctx_t *s, const prop_plan_t *plan) {
+    pthread_mutex_lock(&s->lock);
+    prop_plan_t *slot = &s->prop_plans[s->prop_plan_next % PROP_PLAN_RING];
+    prop_plan_clear(slot);
+    *slot = *plan;
+    s->prop_plan_next++;
+    pthread_mutex_unlock(&s->lock);
+}
+
+/* Build a job from a freshly fetched template.
+ *
+ * In solo and pps-classic modes the coinbase is rendered per-connection inside
+ * stratum.c, so only template-level data is passed. In pool_mode=proportional
+ * the coinbase is shared by every connection, so the PPLNS payout set is
+ * computed here and attached to the job. sctx may be NULL, which skips the
+ * proportional path. */
+static stratum_job_t *build_job_from_template(server_ctx_t *sctx,
+                                              const proxy_config_t *cfg,
                                               const bitcoind_template_t *t,
                                               char *errbuf, size_t errlen) {
-    (void)cfg;
     /* Convert tx txids: hex (display BE) -> internal LE. */
     uint8_t (*txids_le)[32] = NULL;
     char **tx_hex_list = NULL;
@@ -250,6 +451,31 @@ static stratum_job_t *build_job_from_template(const proxy_config_t *cfg,
     if (!job) {
         snprintf(errbuf, errlen, "stratum_job_new failed");
         return NULL;
+    }
+
+    /* pool_mode=proportional: one shared coinbase paying the PPLNS window.
+     * A failure here is never fatal — the job goes out without a payout set and
+     * stratum.c renders per-miner coinbases instead, which is what solo does. */
+    if (sctx && strcmp(cfg->pool_mode, "proportional") == 0) {
+        prop_plan_t plan;
+        int prc = prop_build_plan(sctx, t, job_id, &plan);
+        if (prc == 0) {
+            coinbase_payout_t cb[PROP_PLAN_MAX_PAY];
+            for (size_t i = 0; i < plan.n_payouts; i++) {
+                cb[i].address = plan.payouts[i].address;
+                cb[i].sats    = plan.payouts[i].sats;
+            }
+            if (stratum_job_set_payouts(job, cb, plan.n_payouts) < 0) {
+                LOG_WARN("proportional: attaching payouts to job %s failed; "
+                         "this template pays the finder directly", job_id);
+                prop_plan_clear(&plan);
+            } else {
+                prop_plan_remember(sctx, &plan);
+            }
+        } else if (prc < 0) {
+            LOG_WARN("proportional: plan build errored for job %s; "
+                     "this template pays the finder directly", job_id);
+        }
     }
     return job;
 }
@@ -449,6 +675,7 @@ static void on_block_cb(void *ctx, const char *block_hex) {
 static void on_block_found_cb(void *ctx, const char *worker_name,
                               const char *finder_address,
                               uint64_t ts_ms, uint32_t height,
+                              const char *job_id,
                               const char *block_hash,
                               int64_t reward_sats, int64_t fee_sats) {
     server_ctx_t *s = (server_ctx_t *)ctx;
@@ -456,6 +683,54 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
                            reward_sats, fee_sats);
+    }
+
+    /* pool_mode=proportional: commit the carry-forward balances belonging to
+     * the job that was actually solved. Nothing is committed for a job that had
+     * no plan (a fallback template paid its finder directly), and nothing is
+     * committed twice — the plan is consumed here.
+     *
+     * ⚠️ This runs on acceptance by the pool, not by the network. A block that
+     * is later reorged out leaves these balances credited. Solo mode has no
+     * such state, which is why the reorg exposure is new in this mode; see
+     * ecash-pool-proportional-plan.md §3.6. */
+    if (s && s->store && s->cfg &&
+        strcmp(s->cfg->pool_mode, "proportional") == 0 && job_id) {
+        prop_plan_t settled;
+        memset(&settled, 0, sizeof settled);
+        int found = 0;
+        pthread_mutex_lock(&s->lock);
+        for (size_t i = 0; i < PROP_PLAN_RING; i++) {
+            prop_plan_t *p = &s->prop_plans[i];
+            if (p->job_id[0] && strcmp(p->job_id, job_id) == 0) {
+                settled = *p;            /* takes the carry allocation */
+                memset(p, 0, sizeof *p); /* consumed: never settle it twice */
+                found = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&s->lock);
+
+        if (found) {
+            if (store_prop_settle_block(s->store, ts_ms, (int)height, block_hash,
+                                        settled.payouts, settled.n_payouts,
+                                        settled.carry, settled.n_carry) < 0) {
+                LOG_ERROR("proportional: settling block %s (job %s) failed — "
+                          "%zu payouts and %zu carry balances are NOT recorded",
+                          block_hash ? block_hash : "?", job_id,
+                          settled.n_payouts, settled.n_carry);
+            } else {
+                LOG_INFO("proportional: settled block %s — %zu coinbase payouts, "
+                         "%zu carry balances",
+                         block_hash ? block_hash : "?",
+                         settled.n_payouts, settled.n_carry);
+            }
+            prop_plan_clear(&settled);
+        } else {
+            LOG_INFO("proportional: block %s came from job %s, which had no "
+                     "payout plan — its coinbase paid the finder directly",
+                     block_hash ? block_hash : "?", job_id);
+        }
     }
     if (s && s->bcast) {
         broadcast_block(s->bcast, worker_name, finder_address,
@@ -536,7 +811,7 @@ static void *tip_watcher(void *arg) {
 
         if (need_rebuild) {
             char berr[256] = {0};
-            stratum_job_t *job = build_job_from_template(s->cfg, t, berr, sizeof berr);
+            stratum_job_t *job = build_job_from_template(s, s->cfg, t, berr, sizeof berr);
             if (!job) {
                 LOG_ERROR("rebuild job failed: %s", berr);
                 bitcoind_template_free(t);
@@ -696,17 +971,9 @@ int main(int argc, char **argv) {
         return 5;
     }
 
-    stratum_job_t *initial_job = build_job_from_template(&cfg, tmpl, err, sizeof err);
-    if (!initial_job) {
-        fprintf(stderr, "build initial job failed: %s\n", err);
-        bitcoind_template_free(tmpl);
-        store_close(store);
-        bitcoind_client_free(&btc);
-        bitcoind_client_free(&btc_lp);
-        return 6;
-    }
-
-    /* Server context (must outlive callbacks). */
+    /* Server context (must outlive callbacks). Built before the first job
+     * because pool_mode=proportional computes that job's payout set from the
+     * store, and a first job without one would pay the finder alone. */
     server_ctx_t sctx;
     memset(&sctx, 0, sizeof sctx);
     pthread_mutex_init(&sctx.lock, NULL);
@@ -718,6 +985,16 @@ int main(int argc, char **argv) {
     sctx.last_height = tmpl->height;
     snprintf(sctx.last_prev_hash, sizeof sctx.last_prev_hash, "%s", tmpl->prev_hash_hex);
     sctx.last_built_ms = now_ms();
+
+    stratum_job_t *initial_job = build_job_from_template(&sctx, &cfg, tmpl, err, sizeof err);
+    if (!initial_job) {
+        fprintf(stderr, "build initial job failed: %s\n", err);
+        bitcoind_template_free(tmpl);
+        store_close(store);
+        bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
+        return 6;
+    }
 
     /* Seed node_status from the initial template so the dashboard has data
      * to show before the first watcher poll fires. */
@@ -756,6 +1033,8 @@ int main(int argc, char **argv) {
     /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
      * coinbase into the pool's BTC wallet, and accrues per-share credits. */
     stcfg.pps_enabled = (strcmp(cfg.pool_mode, "pps-classic") == 0);
+    /* pool_mode is what stratum.c derives its proportional render path from. */
+    snprintf(stcfg.pool_mode, sizeof stcfg.pool_mode, "%s", cfg.pool_mode);
     snprintf(stcfg.pool_btc_address, sizeof stcfg.pool_btc_address, "%s",
              cfg.pool_btc_address);
 

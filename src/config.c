@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "config.h"
+#include "coinbase.h"
 #include "log.h"
 
 #include <ctype.h>
@@ -58,6 +59,10 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     snprintf(cfg->pool_mode, sizeof cfg->pool_mode, "%s", "solo");
     cfg->pool_btc_address[0] = '\0';
     cfg->pps_sats_per_diff = 0.0;
+
+    cfg->prop_window_k = 3.0;
+    cfg->prop_min_payout_sats = 1000000LL;  /* ~0.01 ECX at current subsidy */
+    cfg->prop_max_outputs = 12;
 }
 
 static char *strtrim(char *s) {
@@ -159,6 +164,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "pool_mode")                 == 0) copy_str(cfg->pool_mode, sizeof cfg->pool_mode, v);
         else if (strcmp(k, "pool_btc_address")          == 0) copy_str(cfg->pool_btc_address, sizeof cfg->pool_btc_address, v);
         else if (strcmp(k, "pps_sats_per_diff")         == 0) cfg->pps_sats_per_diff = atof(v);
+        else if (strcmp(k, "prop_window_k")             == 0) cfg->prop_window_k = atof(v);
+        else if (strcmp(k, "prop_min_payout_sats")      == 0) cfg->prop_min_payout_sats = (int64_t)atoll(v);
+        else if (strcmp(k, "prop_max_outputs")          == 0) cfg->prop_max_outputs = atoi(v);
         /* Retired with pool_mode=pps (the drivechain-in-coinbase build).
          * Accepted and ignored so an existing proxy.conf keeps loading;
          * the Thunder reserve address now lives only on the dashboard,
@@ -202,9 +210,10 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         return -5;
     }
     if (strcmp(cfg->pool_mode, "solo")        != 0 &&
-        strcmp(cfg->pool_mode, "pps-classic") != 0) {
+        strcmp(cfg->pool_mode, "pps-classic") != 0 &&
+        strcmp(cfg->pool_mode, "proportional") != 0) {
         set_err(errbuf, errlen,
-                "config: 'pool_mode' must be 'solo' or 'pps-classic', got '%s'",
+                "config: 'pool_mode' must be 'solo', 'pps-classic' or 'proportional', got '%s'",
                 cfg->pool_mode);
         return -5;
     }
@@ -222,6 +231,24 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
             set_err(errbuf, errlen,
                     "config: 'pool_btc_address' is required when pool_mode=pps-classic");
             return -9;
+        }
+    }
+    if (strcmp(cfg->pool_mode, "proportional") == 0) {
+        if (cfg->prop_window_k <= 0.0) {
+            set_err(errbuf, errlen,
+                    "config: 'prop_window_k' must be > 0");
+            return -10;
+        }
+        if (cfg->prop_min_payout_sats < COINBASE_DUST_SATS) {
+            set_err(errbuf, errlen,
+                    "config: 'prop_min_payout_sats' must be at least %d (dust)",
+                    COINBASE_DUST_SATS);
+            return -11;
+        }
+        if (cfg->prop_max_outputs < 1 || cfg->prop_max_outputs > 64) {
+            set_err(errbuf, errlen,
+                    "config: 'prop_max_outputs' must be in [1, 64]");
+            return -12;
         }
     }
     return 0;

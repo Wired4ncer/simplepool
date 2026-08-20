@@ -62,6 +62,7 @@ VERSION_H  := $(BUILD_DIR)/version_gen.h
 # Sources compiled in this wave. More modules land in later waves.
 SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
+        src/pplns.c \
         src/bitcoind.c src/broadcast.c src/thunder.c src/version.c \
         src/cjson/cJSON.c
 OBJS := $(SRCS:%.c=$(BUILD_DIR)/%.o)
@@ -115,8 +116,9 @@ include tests/test_store.mk
 include tests/test_coinbase.mk
 include tests/test_broadcast.mk
 include tests/test_thunder.mk
+include tests/test_pplns.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_pplns
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
@@ -124,6 +126,7 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_coinbase
 	./build/test_broadcast
 	./build/test_thunder
+	./build/test_pplns
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \

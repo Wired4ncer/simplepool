@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "pplns.h"
+
 typedef struct store store_t;
 
 typedef struct {
@@ -175,5 +177,38 @@ void store_get_stats(store_t *s, store_stats_t *out);
 /* Optional: override default ring buffer capacity (events). Must be called
  * before store_open by setting a global; for tests only. */
 void store_test_set_ring_capacity(size_t cap);
+
+/* ---------- proportional / Pplns helpers ---------- */
+
+/* Read all carry-forward balances into *out. Caller must free(*out).
+ * Returns 0 ok, negative on error. */
+int store_prop_get_balances(store_t *s, pplns_carry_t **out, size_t *n);
+
+/* Find the PPLNS window boundary: starting from the newest share with
+ * ts <= before_ms, walk back in time until the cumulative difficulty reaches
+ * window_difficulty. Writes the oldest timestamp in the window to
+ * *out_start_ms and the actual cumulative difficulty to *out_actual_difficulty
+ * (may be >= window_difficulty). Returns 0 ok, -1 if no shares or error. */
+int store_prop_compute_window(store_t *s, double window_difficulty,
+                              uint64_t before_ms,
+                              uint64_t *out_start_ms,
+                              double *out_actual_difficulty);
+
+/* Query shares within [start_ms, end_ms] grouped by payout address, sorted by
+ * total difficulty descending. Writes *out (caller frees) and *n.
+ * Returns 0 ok, negative on error. */
+int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
+                            pplns_addr_t **out, size_t *n);
+
+/* Apply the result of a found block: update prop_balances with the new carry
+ * balances and insert a row into blocks_found. This must only be called once
+ * the block has actually been accepted by the network, because it commits
+ * carry-forward changes. payouts/n_payouts are the coinbase outputs; carry/
+ * n_carry are the post-settle balances (pending_sats > 0 retained, zero rows
+ * deleted). Returns 0 ok, negative on error. */
+int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
+                            const char *block_hash,
+                            const pplns_payout_t *payouts, size_t n_payouts,
+                            const pplns_carry_t *carry, size_t n_carry);
 
 #endif /* SIMPLEPOOL_STORE_H */

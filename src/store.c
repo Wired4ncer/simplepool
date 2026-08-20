@@ -250,6 +250,19 @@ static const char *SCHEMA_SQL_PARTS[] = {
     ");"
     "CREATE INDEX IF NOT EXISTS payouts_worker_ts_idx ON payouts(worker_id, paid_at);"
     "CREATE INDEX IF NOT EXISTS payouts_paid_at_idx   ON payouts(paid_at);",
+
+    /* ---- part 3 ---- */
+    /* Proportional / PPLNS carry-forward balances. The pool holds pending_sats
+     * as a liability until a future block makes the address eligible for a
+     * coinbase output. address is the miner's payout_address from the workers
+     * table. pending_sats includes any amount that was below prop_min_payout_sats
+     * or was demoted to keep the block under the output/weight cap. */
+    "CREATE TABLE IF NOT EXISTS prop_balances ("
+    "  address         TEXT PRIMARY KEY,"
+    "  pending_sats    INTEGER NOT NULL DEFAULT 0,"
+    "  last_settled_ts INTEGER"
+    ");"
+    "CREATE INDEX IF NOT EXISTS prop_balances_ts_idx ON prop_balances(last_settled_ts);"
 };
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
@@ -283,6 +296,13 @@ static const char *MIGRATIONS_SQL[] = {
     /* See the pool_meta comment above: without this the counter added in
      * PR #32 is only ever readable at shutdown. */
     "ALTER TABLE pool_meta    ADD COLUMN events_lost    INTEGER NOT NULL DEFAULT 0",
+    /* Proportional / PPLNS carry-forward ledger, added alongside pool_mode=proportional. */
+    "CREATE TABLE IF NOT EXISTS prop_balances ("
+    "  address         TEXT PRIMARY KEY,"
+    "  pending_sats    INTEGER NOT NULL DEFAULT 0,"
+    "  last_settled_ts INTEGER"
+    ")",
+    "CREATE INDEX IF NOT EXISTS prop_balances_ts_idx ON prop_balances(last_settled_ts)",
 };
 
 /* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
@@ -1243,6 +1263,219 @@ int store_record_template(store_t *s, const store_template_t *t) {
         }
     }
     pthread_mutex_unlock(&s->node_tip_mu);
+    return 0;
+}
+
+/* ---------- proportional / PPLNS helpers ---------- */
+
+int store_prop_get_balances(store_t *s, pplns_carry_t **out, size_t *n) {
+    if (!s || !out || !n) return -1;
+    *out = NULL; *n = 0;
+
+    static const char *Q =
+        "SELECT address, pending_sats FROM prop_balances WHERE pending_sats > 0";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
+
+    size_t cap = 64, count = 0;
+    pplns_carry_t *buf = (pplns_carry_t *)calloc(cap, sizeof(*buf));
+    if (!buf) { sqlite3_finalize(st); return -1; }
+
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (count >= cap) {
+            size_t ncap = cap * 2;
+            pplns_carry_t *nb = (pplns_carry_t *)realloc(buf, ncap * sizeof(*nb));
+            if (!nb) { free(buf); sqlite3_finalize(st); return -1; }
+            buf = nb; cap = ncap;
+        }
+        const char *addr = (const char *)sqlite3_column_text(st, 0);
+        snprintf(buf[count].address, sizeof buf[count].address, "%s",
+                 addr ? addr : "");
+        buf[count].pending_sats = (int64_t)sqlite3_column_int64(st, 1);
+        count++;
+    }
+    sqlite3_finalize(st);
+    *out = buf;
+    *n = count;
+    return 0;
+}
+
+int store_prop_compute_window(store_t *s, double window_difficulty,
+                              uint64_t before_ms,
+                              uint64_t *out_start_ms,
+                              double *out_actual_difficulty) {
+    if (!s || window_difficulty <= 0.0 || !out_start_ms || !out_actual_difficulty)
+        return -1;
+
+    /* The shares table stores Unix seconds; callers pass milliseconds. */
+    sqlite3_int64 before_s = (sqlite3_int64)(before_ms / 1000);
+
+    /* Walk backwards from before_ms until cumulative difficulty reaches the
+     * target. SQLite window functions are clean but we avoid depending on them
+     * by walking an ordered result set in C. */
+    static const char *Q =
+        "SELECT s.ts, s.difficulty FROM shares s"
+        "  JOIN workers w ON s.worker_id = w.id"
+        "  WHERE s.ts <= ? AND s.is_block = 0"
+        "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
+        "  ORDER BY s.ts DESC, s.id DESC"
+        "  LIMIT 100000";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, before_s);
+
+    double cum = 0.0;
+    uint64_t boundary_s = 0;
+    int any = 0;
+    int reached = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t ts = (uint64_t)sqlite3_column_int64(st, 0);
+        double diff = sqlite3_column_double(st, 1);
+        any = 1;
+        if (reached && ts != boundary_s) break;
+        cum += diff;
+        boundary_s = ts;
+        if (cum >= window_difficulty) reached = 1;
+    }
+    sqlite3_finalize(st);
+    if (!any) return -1;
+
+    *out_start_ms = boundary_s * 1000ULL;
+    *out_actual_difficulty = cum;
+    return 0;
+}
+
+int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
+                            pplns_addr_t **out, size_t *n) {
+    if (!s || !out || !n) return -1;
+    *out = NULL; *n = 0;
+
+    sqlite3_int64 start_s = (sqlite3_int64)(start_ms / 1000);
+    sqlite3_int64 end_s   = (sqlite3_int64)(end_ms   / 1000);
+
+    static const char *Q =
+        "SELECT w.payout_address, SUM(s.difficulty) AS total_diff"
+        "  FROM shares s"
+        "  JOIN workers w ON s.worker_id = w.id"
+        "  WHERE s.ts >= ? AND s.ts <= ? AND s.is_block = 0"
+        "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
+        "  GROUP BY w.payout_address"
+        "  ORDER BY total_diff DESC";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, start_s);
+    sqlite3_bind_int64(st, 2, end_s);
+
+    size_t cap = 64, count = 0;
+    pplns_addr_t *buf = (pplns_addr_t *)calloc(cap, sizeof(*buf));
+    if (!buf) { sqlite3_finalize(st); return -1; }
+
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (count >= cap) {
+            size_t ncap = cap * 2;
+            pplns_addr_t *nb = (pplns_addr_t *)realloc(buf, ncap * sizeof(*nb));
+            if (!nb) { free(buf); sqlite3_finalize(st); return -1; }
+            buf = nb; cap = ncap;
+        }
+        const char *addr = (const char *)sqlite3_column_text(st, 0);
+        snprintf(buf[count].address, sizeof buf[count].address, "%s",
+                 addr ? addr : "");
+        buf[count].total_difficulty = sqlite3_column_double(st, 1);
+        count++;
+    }
+    sqlite3_finalize(st);
+    *out = buf;
+    *n = count;
+    return 0;
+}
+
+int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
+                            const char *block_hash,
+                            const pplns_payout_t *payouts, size_t n_payouts,
+                            const pplns_carry_t *carry, size_t n_carry) {
+    if (!s || !block_hash) return -1;
+
+    sqlite3_stmt *st = NULL;
+    int rc;
+
+    /* Upsert carry balances. Zero or negative rows are deleted. */
+    static const char *Q_UPSERT =
+        "INSERT INTO prop_balances (address, pending_sats, last_settled_ts)"
+        "  VALUES (?, ?, ?)"
+        "  ON CONFLICT(address) DO UPDATE SET"
+        "    pending_sats = excluded.pending_sats,"
+        "    last_settled_ts = excluded.last_settled_ts"
+        "  WHERE excluded.pending_sats > 0";
+    static const char *Q_DELETE =
+        "DELETE FROM prop_balances WHERE address = ?";
+
+    sqlite3_exec(s->db, "BEGIN TRANSACTION", NULL, NULL, NULL);
+
+    for (size_t i = 0; i < n_carry; i++) {
+        if (carry[i].pending_sats <= 0) continue;
+        if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+        sqlite3_bind_text(st, 1, carry[i].address, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)carry[i].pending_sats);
+        sqlite3_bind_int64(st, 3, (sqlite3_int64)(ts_ms / 1000));
+        rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) {
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+    }
+
+    /* Paid-out addresses have zero carry. */
+    for (size_t i = 0; i < n_payouts; i++) {
+        if (sqlite3_prepare_v2(s->db, Q_DELETE, -1, &st, NULL) != SQLITE_OK) {
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+        sqlite3_bind_text(st, 1, payouts[i].address, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+
+    /* Record the block. */
+    static const char *Q_BLOCK =
+        "INSERT INTO blocks_found (ts, height, hash, finder_id, finder_address,"
+        "  reward_sats, fee_sats) VALUES (?, ?, ?, NULL, ?, ?, ?)";
+    if (sqlite3_prepare_v2(s->db, Q_BLOCK, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)(ts_ms / 1000));
+    sqlite3_bind_int  (st, 2, height);
+    sqlite3_bind_text (st, 3, block_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text (st, 4, n_payouts ? payouts[0].address : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, 0);
+    sqlite3_bind_int64(st, 6, 0);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
+
+    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    atomic_fetch_add(&s->blocks_committed, 1);
     return 0;
 }
 

@@ -415,11 +415,6 @@ int coinbase_address_to_script(const char *addr,
 
 /* ---------- main builder ---------- */
 
-/* Bitcoin's standard relay dust threshold for legacy outputs. Below this
- * the operator fee output would not be relayed; we collapse to a single
- * miner-only output in that case. */
-#define COINBASE_DUST_SATS 546
-
 void coinbase_parts_free(coinbase_parts_t *p) {
     if (!p) return;
     free(p->cb1); p->cb1 = NULL; p->cb1_len = 0;
@@ -824,6 +819,236 @@ done:
     return ret;
 }
 
+int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
+                                       const coinbase_payout_t *payouts,
+                                       size_t n_payouts,
+                                       const char *operator_address,
+                                       int fee_bps,
+                                       const char *coinbase_tag,
+                                       size_t extranonce1_size,
+                                       size_t extranonce2_size,
+                                       coinbase_parts_t *out,
+                                       int *out_has_witness,
+                                       int64_t *out_total_payout_sats,
+                                       int64_t *out_fee_sats,
+                                       char *errbuf, size_t errlen) {
+    if (!out || !coinbase_tx_hex || !payouts || n_payouts == 0) {
+        set_err(errbuf, errlen, "null arg or no payouts");
+        return -1;
+    }
+    out->cb1 = NULL; out->cb1_len = 0;
+    out->cb2 = NULL; out->cb2_len = 0;
+    if (out_has_witness) *out_has_witness = 0;
+    if (out_total_payout_sats) *out_total_payout_sats = 0;
+    if (out_fee_sats) *out_fee_sats = 0;
+
+    struct cb_out { uint64_t value; size_t spk_off; size_t spk_len; int op_return; };
+
+    uint8_t *tx = NULL;
+    struct cb_out *outs = NULL;
+    uint8_t *payout_spk = NULL;
+    size_t *payout_spk_len = NULL;
+    bbuf_t c1, ob, c2;
+    bbuf_init(&c1); bbuf_init(&ob); bbuf_init(&c2);
+    int ret = -1;
+
+    size_t hexlen = strlen(coinbase_tx_hex);
+    if (hexlen % 2 != 0) { set_err(errbuf, errlen, "odd coinbasetxn hex"); goto done; }
+    size_t txlen = hexlen / 2;
+    tx = (uint8_t *)malloc(txlen ? txlen : 1);
+    if (!tx) { set_err(errbuf, errlen, "oom"); goto done; }
+    size_t dl = 0;
+    if (hex_decode(coinbase_tx_hex, tx, txlen, &dl) < 0 || dl != txlen) {
+        set_err(errbuf, errlen, "bad coinbasetxn hex");
+        goto done;
+    }
+
+    size_t off = 0;
+    uint32_t version;
+    if (rd_u32(tx, txlen, &off, &version) < 0) { set_err(errbuf, errlen, "truncated coinbasetxn"); goto done; }
+
+    int has_witness = 0;
+    if (off + 2 <= txlen && tx[off] == 0x00 && tx[off + 1] != 0x00) {
+        has_witness = 1;
+        off += 2;
+    }
+
+    uint64_t vin = 0;
+    if (rd_varint(tx, txlen, &off, &vin) < 0) { set_err(errbuf, errlen, "truncated coinbasetxn"); goto done; }
+    if (vin != 1) { set_err(errbuf, errlen, "coinbasetxn input count %llu != 1", (unsigned long long)vin); goto done; }
+
+    size_t prevout_off = off;
+    if (off + 36 > txlen) { set_err(errbuf, errlen, "truncated coinbasetxn input"); goto done; }
+    off += 36;
+    uint64_t ss_len = 0;
+    if (rd_varint(tx, txlen, &off, &ss_len) < 0) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    size_t ss_off = off;
+    if (off + ss_len > txlen) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    off += ss_len;
+    uint32_t sequence;
+    if (rd_u32(tx, txlen, &off, &sequence) < 0) { set_err(errbuf, errlen, "truncated sequence"); goto done; }
+
+    uint64_t vout = 0;
+    if (rd_varint(tx, txlen, &off, &vout) < 0) { set_err(errbuf, errlen, "truncated output count"); goto done; }
+    if (vout == 0) { set_err(errbuf, errlen, "coinbasetxn has no outputs"); goto done; }
+
+    outs = (struct cb_out *)calloc((size_t)vout, sizeof(*outs));
+    if (!outs) { set_err(errbuf, errlen, "oom"); goto done; }
+
+    int64_t reward_idx = -1;
+    int reward_count = 0;
+    for (uint64_t i = 0; i < vout; i++) {
+        uint64_t val = 0, spk_len = 0;
+        if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
+        if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        if (off + spk_len > txlen) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        outs[i].value = val;
+        outs[i].spk_off = off;
+        outs[i].spk_len = (size_t)spk_len;
+        outs[i].op_return = (spk_len >= 1 && tx[off] == 0x6a);
+        off += spk_len;
+        if (!outs[i].op_return) { reward_idx = (int64_t)i; reward_count++; }
+    }
+
+    if (has_witness) {
+        uint64_t stack = 0;
+        if (rd_varint(tx, txlen, &off, &stack) < 0) { set_err(errbuf, errlen, "truncated witness"); goto done; }
+        for (uint64_t i = 0; i < stack; i++) {
+            uint64_t il = 0;
+            if (rd_varint(tx, txlen, &off, &il) < 0) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
+            if (off + il > txlen) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
+            off += il;
+        }
+    }
+
+    uint32_t locktime;
+    if (rd_u32(tx, txlen, &off, &locktime) < 0) { set_err(errbuf, errlen, "truncated locktime"); goto done; }
+    if (off != txlen) { set_err(errbuf, errlen, "coinbasetxn trailing bytes"); goto done; }
+
+    if (reward_count != 1) {
+        set_err(errbuf, errlen, "coinbasetxn has %d spendable outputs (expected 1)", reward_count);
+        goto done;
+    }
+    int64_t reward = (int64_t)outs[reward_idx].value;
+
+    /* Compute fee and verify payouts cover the remainder exactly. */
+    int64_t fee_sats = 0;
+    int has_operator = 0;
+    uint8_t operator_spk[64]; size_t operator_spk_len = 0;
+    if (operator_address && operator_address[0] && fee_bps > 0 && reward > 0) {
+        fee_sats = (reward * (int64_t)fee_bps) / 10000;
+        if (fee_sats >= COINBASE_DUST_SATS) {
+            if (coinbase_address_to_script(operator_address, operator_spk,
+                                           sizeof operator_spk, &operator_spk_len,
+                                           errbuf, errlen) < 0) goto done;
+            has_operator = 1;
+        } else {
+            fee_sats = 0;
+        }
+    }
+
+    int64_t total_payout = 0;
+    for (size_t i = 0; i < n_payouts; i++) {
+        if (!payouts[i].address || payouts[i].address[0] == '\0') {
+            set_err(errbuf, errlen, "payout %zu has empty address", i);
+            goto done;
+        }
+        if (payouts[i].sats < COINBASE_DUST_SATS) {
+            set_err(errbuf, errlen, "payout %zu is below dust (%lld < %d)",
+                    i, (long long)payouts[i].sats, COINBASE_DUST_SATS);
+            goto done;
+        }
+        total_payout += payouts[i].sats;
+    }
+    if (total_payout + fee_sats != reward) {
+        set_err(errbuf, errlen,
+                "payout total %lld + fee %lld != reward %lld",
+                (long long)total_payout, (long long)fee_sats, (long long)reward);
+        goto done;
+    }
+
+    /* Pre-resolve every payout scriptPubKey. */
+    payout_spk = (uint8_t *)calloc(n_payouts, 64);
+    payout_spk_len = (size_t *)calloc(n_payouts, sizeof(*payout_spk_len));
+    if (!payout_spk || !payout_spk_len) { set_err(errbuf, errlen, "oom"); goto done; }
+    for (size_t i = 0; i < n_payouts; i++) {
+        if (coinbase_address_to_script(payouts[i].address, payout_spk + i * 64,
+                                       64, &payout_spk_len[i],
+                                       errbuf, errlen) < 0) goto done;
+    }
+
+    /* Optional coinbase tag, appended into the scriptSig. */
+    uint8_t tag_push[80]; size_t tag_push_len = 0;
+    if (coinbase_tag && *coinbase_tag) {
+        size_t tlen = strlen(coinbase_tag);
+        if (tlen > 75) tlen = 75;
+        tag_push[0] = (uint8_t)tlen;
+        memcpy(tag_push + 1, coinbase_tag, tlen);
+        tag_push_len = tlen + 1;
+    }
+
+    size_t en_total = extranonce1_size + extranonce2_size;
+    uint64_t new_ss_len = ss_len + tag_push_len + en_total;
+    if (new_ss_len < 2 || new_ss_len > 100) {
+        set_err(errbuf, errlen, "coinbase scriptSig length %llu out of range",
+                (unsigned long long)new_ss_len);
+        goto done;
+    }
+
+    /* cb1: version | vin(1) | prevout(36) | varint(scriptSig_len) |
+     *      server scriptSig | tag. */
+    if (bbuf_push_u32_le(&c1, version) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_varint(&c1, 1) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push(&c1, tx + prevout_off, 36) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_varint(&c1, new_ss_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (ss_len && bbuf_push(&c1, tx + ss_off, (size_t)ss_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (tag_push_len && bbuf_push(&c1, tag_push, tag_push_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+
+    /* Outputs: replace the reward output with N payout outputs + operator. */
+    uint64_t new_vout = vout - 1 + n_payouts + (has_operator ? 1u : 0u);
+    for (uint64_t i = 0; i < vout; i++) {
+        if ((int64_t)i == reward_idx) {
+            for (size_t k = 0; k < n_payouts; k++) {
+                if (bbuf_push_u64_le(&ob, (uint64_t)payouts[k].sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push_varint(&ob, payout_spk_len[k]) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push(&ob, payout_spk + k * 64, payout_spk_len[k]) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            }
+            if (has_operator) {
+                if (bbuf_push_u64_le(&ob, (uint64_t)fee_sats) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push_varint(&ob, operator_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+                if (bbuf_push(&ob, operator_spk, operator_spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            }
+        } else {
+            if (bbuf_push_u64_le(&ob, outs[i].value) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (bbuf_push_varint(&ob, outs[i].spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+            if (bbuf_push(&ob, tx + outs[i].spk_off, outs[i].spk_len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+        }
+    }
+
+    /* cb2: sequence | varint(out_count) | outputs | locktime. */
+    if (bbuf_push_u32_le(&c2, sequence) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_varint(&c2, new_vout) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push(&c2, ob.data, ob.len) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+    if (bbuf_push_u32_le(&c2, locktime) < 0) { set_err(errbuf, errlen, "oom"); goto done; }
+
+    out->cb1 = c1.data; out->cb1_len = c1.len; c1.data = NULL;
+    out->cb2 = c2.data; out->cb2_len = c2.len; c2.data = NULL;
+    if (out_has_witness) *out_has_witness = has_witness;
+    if (out_total_payout_sats) *out_total_payout_sats = total_payout;
+    if (out_fee_sats) *out_fee_sats = fee_sats;
+    ret = 0;
+
+ done:
+    bbuf_free(&c1);
+    bbuf_free(&ob);
+    bbuf_free(&c2);
+    free(payout_spk);
+    free(payout_spk_len);
+    free(outs);
+    free(tx);
+    return ret;
+}
+
 
 /* Count the outputs of a serialized coinbase, split into spendable and
  * OP_RETURN.
@@ -837,6 +1062,71 @@ done:
  *
  * Parses only far enough to walk the output list. Returns 0 on success,
  * negative on malformed input; counts are untouched on failure. */
+int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
+                             char *errbuf, size_t errlen) {
+    if (!coinbase_tx_hex || !out_reward) {
+        set_err(errbuf, errlen, "null arg");
+        return -1;
+    }
+    *out_reward = 0;
+
+    size_t hexlen = strlen(coinbase_tx_hex);
+    if (hexlen % 2 != 0) { set_err(errbuf, errlen, "odd coinbasetxn hex"); return -1; }
+    size_t txlen = hexlen / 2;
+    uint8_t *tx = (uint8_t *)malloc(txlen ? txlen : 1);
+    if (!tx) { set_err(errbuf, errlen, "oom"); return -1; }
+    size_t dl = 0;
+    int ret = -1;
+    if (hex_decode(coinbase_tx_hex, tx, txlen, &dl) < 0 || dl != txlen) {
+        set_err(errbuf, errlen, "bad coinbasetxn hex");
+        goto done;
+    }
+
+    size_t off = 0;
+    uint32_t version;
+    if (rd_u32(tx, txlen, &off, &version) < 0) { set_err(errbuf, errlen, "truncated coinbasetxn"); goto done; }
+    if (off + 2 <= txlen && tx[off] == 0x00 && tx[off + 1] != 0x00) off += 2; /* segwit marker */
+
+    uint64_t vin = 0;
+    if (rd_varint(tx, txlen, &off, &vin) < 0) { set_err(errbuf, errlen, "truncated coinbasetxn"); goto done; }
+    if (vin != 1) { set_err(errbuf, errlen, "coinbasetxn input count %llu != 1", (unsigned long long)vin); goto done; }
+    if (off + 36 > txlen) { set_err(errbuf, errlen, "truncated coinbasetxn input"); goto done; }
+    off += 36;
+    uint64_t ss_len = 0;
+    if (rd_varint(tx, txlen, &off, &ss_len) < 0) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    if (off + ss_len > txlen) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    off += ss_len;
+    uint32_t sequence;
+    if (rd_u32(tx, txlen, &off, &sequence) < 0) { set_err(errbuf, errlen, "truncated sequence"); goto done; }
+
+    uint64_t vout = 0;
+    if (rd_varint(tx, txlen, &off, &vout) < 0) { set_err(errbuf, errlen, "truncated output count"); goto done; }
+    if (vout == 0) { set_err(errbuf, errlen, "coinbasetxn has no outputs"); goto done; }
+
+    int spendable = 0;
+    uint64_t reward = 0;
+    for (uint64_t i = 0; i < vout; i++) {
+        uint64_t val = 0, spk_len = 0;
+        if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
+        if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        if (off + spk_len > txlen) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        int op_return = (spk_len >= 1 && tx[off] == 0x6a);
+        off += spk_len;
+        if (!op_return) { spendable++; reward = val; }
+    }
+    if (spendable != 1) {
+        set_err(errbuf, errlen, "coinbasetxn has %d spendable outputs (expected 1)", spendable);
+        goto done;
+    }
+    if (reward > (uint64_t)INT64_MAX) { set_err(errbuf, errlen, "reward overflows int64"); goto done; }
+
+    *out_reward = (int64_t)reward;
+    ret = 0;
+done:
+    free(tx);
+    return ret;
+}
+
 int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
                            int *op_return_out) {
     if (!tx_hex) return -1;

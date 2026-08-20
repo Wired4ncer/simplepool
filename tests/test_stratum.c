@@ -582,6 +582,225 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_free(s);
 }
 
+
+/* ---------- pool_mode=proportional (P.3) ---------- */
+
+/* The enforcer-shaped template from test_coinbase.c: segwit, one 50 BTC
+ * spendable output between two OP_RETURN commitments. */
+static const char *PROP_COINBASE_HEX =
+    "02000000"
+    "0001"
+    "01"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "ffffffff"
+    "04" "0300350c"
+    "ffffffff"
+    "03"
+    "0000000000000000" "06" "6a04deadbeef"
+    "00f2052a01000000" "16" "0014" "1111111111111111111111111111111111111111"
+    "0000000000000000" "26" "6a24aa21a9ed"
+        "2222222222222222222222222222222222222222222222222222222222222222"
+    "0120" "0000000000000000000000000000000000000000000000000000000000000000"
+    "00000000";
+
+/* Two real P2WPKH regtest addresses, hash160 = 0x33*20 and 0x44*20. Chosen so
+ * neither their scripts nor the template's own recipient (0x11*20) nor its
+ * witness commitment (0x22*32) can be confused for one another in the
+ * serialized coinbase. */
+#define PROP_ADDR_A "bcrt1qxvenxvenxvenxvenxvenxvenxvenxvenztev8a"
+#define PROP_ADDR_B "bcrt1qg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyay3npn"
+
+static stratum_job_t *make_prop_job(const char *job_id,
+                                    const uint8_t *network_target_be) {
+    uint8_t prev[32] = {0};
+    return stratum_job_new(job_id, 1, prev,
+                           /*value_sats*/ 5000000000LL,
+                           /*wc_hex*/ NULL,
+                           /*en1*/ 4, /*en2*/ 4,
+                           NULL, 0, 0x1d00ffffu, 0x60000000u,
+                           network_target_be, 800000, NULL, 0,
+                           PROP_COINBASE_HEX,
+                           /*coinbase_has_witness*/ 1);
+}
+
+/* Pull the coinbase1/coinbase2 halves out of a mining.notify line. */
+static int notify_coinbase(const char *out, char *cb1, size_t cb1n,
+                           char *cb2, size_t cb2n) {
+    const char *p = strstr(out, "mining.notify");
+    if (!p) return -1;
+    cJSON *root = NULL;
+    /* Each notification is one JSON line; find the one carrying notify. */
+    const char *line = out;
+    while (line && *line) {
+        const char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        char *buf = (char *)malloc(len + 1);
+        if (!buf) return -1;
+        memcpy(buf, line, len); buf[len] = '\0';
+        if (strstr(buf, "mining.notify")) {
+            root = cJSON_Parse(buf);
+            free(buf);
+            break;
+        }
+        free(buf);
+        line = nl ? nl + 1 : NULL;
+    }
+    if (!root) return -1;
+    cJSON *params = cJSON_GetObjectItemCaseSensitive(root, "params");
+    /* params: [job_id, prevhash, coinb1, coinb2, merkle, ver, nbits, ntime, clean] */
+    cJSON *c1 = cJSON_GetArrayItem(params, 2);
+    cJSON *c2 = cJSON_GetArrayItem(params, 3);
+    int ok = -1;
+    if (cJSON_IsString(c1) && cJSON_IsString(c2)) {
+        snprintf(cb1, cb1n, "%s", c1->valuestring);
+        snprintf(cb2, cb2n, "%s", c2->valuestring);
+        ok = 0;
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+/* Extract extranonce1 from a mining.subscribe reply. */
+static int subscribe_extranonce1(const char *out, char *en1, size_t n) {
+    cJSON *root = cJSON_Parse(out);
+    if (!root) return -1;
+    cJSON *res = cJSON_GetObjectItemCaseSensitive(root, "result");
+    cJSON *e   = cJSON_GetArrayItem(res, 1);
+    int ok = -1;
+    if (cJSON_IsString(e)) { snprintf(en1, n, "%s", e->valuestring); ok = 0; }
+    cJSON_Delete(root);
+    return ok;
+}
+
+/* The P.3 gate: in proportional mode two miners must be handed the SAME
+ * coinbase — paying the window's shareholders, not either miner — while their
+ * extranonce1 values still differ, and both must be able to submit an accepted
+ * share against it. */
+static void test_proportional_shared_coinbase(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_mode, sizeof(cfg.pool_mode), "proportional");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+
+    /* A window split 60/40 between two addresses, summing to the full reward
+     * so the builder's conservation check passes. */
+    coinbase_payout_t payouts[2] = {
+        { PROP_ADDR_A, 3000000000LL },
+        { PROP_ADDR_B, 2000000000LL },
+    };
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_prop_job("P1", net);
+    CHECK(job != NULL);
+    CHECK(stratum_job_set_payouts(job, payouts, 2) == 0);
+    stratum_server_set_job(s, job);
+
+    char cb1[2][4096] = {{0}}, cb2[2][4096] = {{0}}, en1[2][64] = {{0}};
+    stratum_conn_t *c[2];
+    for (int i = 0; i < 2; i++) {
+        c[i] = stratum_conn_new_for_test(s);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}", &out, &olen);
+        CHECK(out && subscribe_extranonce1(out, en1[i], sizeof en1[i]) == 0);
+        free(out); out = NULL; olen = 0;
+
+        /* Each miner authorizes with its OWN address — which proportional mode
+         * must then ignore when building the coinbase. */
+        char auth[256];
+        snprintf(auth, sizeof auth,
+            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",
+            i == 0 ? PROP_ADDR_A : PROP_ADDR_B);
+        stratum_handle_message(s, c[i], auth, &out, &olen);
+        CHECK(out != NULL);
+        CHECK(notify_coinbase(out, cb1[i], sizeof cb1[i],
+                              cb2[i], sizeof cb2[i]) == 0);
+        free(out);
+    }
+
+    /* Same coinbase for both miners. */
+    CHECK(cb1[0][0] != '\0' && cb2[0][0] != '\0');
+    CHECK(strcmp(cb1[0], cb1[1]) == 0);
+    CHECK(strcmp(cb2[0], cb2[1]) == 0);
+    /* Distinct extranonce1, so their search spaces do not collide. */
+    CHECK(strcmp(en1[0], en1[1]) != 0);
+    /* Both payout scripts are in the shared coinbase, and the template's own
+     * recipient (0x11*20) is gone — the reward output really was replaced. */
+    CHECK(strstr(cb2[0], "3333333333333333333333333333333333333333") != NULL);
+    CHECK(strstr(cb2[0], "4444444444444444444444444444444444444444") != NULL);
+    CHECK(strstr(cb2[0], "1111111111111111111111111111111111111111") == NULL);
+
+    /* Both miners submit, both accepted. */
+    for (int i = 0; i < 2; i++) {
+        char *out = NULL; size_t olen = 0;
+        char sub[256];
+        snprintf(sub, sizeof sub,
+            "{\"id\":3,\"method\":\"mining.submit\","
+            "\"params\":[\"w%d\",\"P1\",\"deadbeef\",\"60000000\",\"0000000%d\"]}",
+            i, i + 1);
+        CHECK(stratum_handle_message(s, c[i], sub, &out, &olen) == 0);
+        free(out);
+    }
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == 0);
+
+    for (int i = 0; i < 2; i++) stratum_conn_free_for_test(c[i]);
+    stratum_server_free(s);
+    printf("ok: proportional shares one coinbase across miners\n");
+}
+
+/* With no payout set attached — no PPLNS window yet — proportional mode must
+ * fall back to paying the connection's own address rather than dropping the
+ * job. Each miner then gets a DIFFERENT coinbase, as in solo. */
+static void test_proportional_falls_back_without_window(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_mode, sizeof(cfg.pool_mode), "proportional");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+
+    /* No stratum_job_set_payouts call at all. */
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_prop_job("P2", net));
+
+    char cb2[2][4096] = {{0}}, cb1[2][4096] = {{0}};
+    stratum_conn_t *c[2];
+    for (int i = 0; i < 2; i++) {
+        c[i] = stratum_conn_new_for_test(s);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}", &out, &olen);
+        free(out); out = NULL; olen = 0;
+        char auth[256];
+        snprintf(auth, sizeof auth,
+            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",
+            i == 0 ? PROP_ADDR_A : PROP_ADDR_B);
+        stratum_handle_message(s, c[i], auth, &out, &olen);
+        CHECK(out != NULL);
+        CHECK(notify_coinbase(out, cb1[i], sizeof cb1[i],
+                              cb2[i], sizeof cb2[i]) == 0);
+        free(out);
+    }
+    /* Jobs still went out, and each pays its own miner. */
+    CHECK(cb2[0][0] != '\0' && cb2[1][0] != '\0');
+    CHECK(strcmp(cb2[0], cb2[1]) != 0);
+    CHECK(strstr(cb2[0], "3333333333333333333333333333333333333333") != NULL);
+    CHECK(strstr(cb2[0], "4444444444444444444444444444444444444444") == NULL);
+    CHECK(strstr(cb2[1], "4444444444444444444444444444444444444444") != NULL);
+
+    for (int i = 0; i < 2; i++) stratum_conn_free_for_test(c[i]);
+    stratum_server_free(s);
+    printf("ok: proportional falls back to per-miner without a window\n");
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -596,6 +815,8 @@ int main(void) {
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
     test_dedupe_same_hash_across_job_ids();
+    test_proportional_shared_coinbase();
+    test_proportional_falls_back_without_window();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

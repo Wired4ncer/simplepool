@@ -11,6 +11,17 @@ typedef struct {
     size_t   cb2_len;
 } coinbase_parts_t;
 
+/* Bitcoin's standard relay dust threshold for legacy outputs. Below this an
+ * output would not be relayed, so sub-dust operator fees and PPLNS payouts
+ * are dropped or carried forward instead of emitted. */
+#define COINBASE_DUST_SATS 546
+
+/* One payout destination for coinbase_build_from_template_multi(). */
+typedef struct {
+    const char *address;
+    int64_t     sats;
+} coinbase_payout_t;
+
 /* Build coinbase1/coinbase2 halves around the extranonce placeholder,
  * single-payout — the entire value_sats goes to payout_address.
  *
@@ -81,6 +92,41 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
                                  int64_t *out_miner_sats,
                                  int64_t *out_fee_sats,
                                  char *errbuf, size_t errlen);
+
+/* Same as coinbase_build_from_template, but the single spendable reward output
+ * is replaced by N payout outputs (in the order given) plus an optional
+ * operator-fee output. The caller is responsible for ensuring the payout list
+ * fits the block weight budget; this builder only enforces:
+ *   - sum(payouts[i].sats) + operator_fee == reward
+ *   - every payout and the operator output are at or above COINBASE_DUST_SATS
+ *   - scriptSig length stays within the 100-byte coinbase limit
+ *
+ * out_total_payout_sats receives sum(payouts[i].sats) (may be NULL).
+ * out_fee_sats receives the operator fee (may be NULL).
+ * Returns 0 ok, negative on error (errbuf populated). */
+int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
+                                       const coinbase_payout_t *payouts,
+                                       size_t n_payouts,
+                                       const char *operator_address,
+                                       int fee_bps,
+                                       const char *coinbase_tag,
+                                       size_t extranonce1_size,
+                                       size_t extranonce2_size,
+                                       coinbase_parts_t *out,
+                                       int *out_has_witness,
+                                       int64_t *out_total_payout_sats,
+                                       int64_t *out_fee_sats,
+                                       char *errbuf, size_t errlen);
+
+/* Read the value of a template coinbase's single spendable output — the figure
+ * coinbase_build_from_template_multi() derives its fee from and requires the
+ * payout list to sum to. Callers computing a payout split must use this rather
+ * than the template's "coinbasevalue" field: the builder works off the
+ * serialized transaction, and a split computed against a different number is
+ * rejected at render time. Refuses a coinbase without exactly one spendable
+ * output, matching the builder. Returns 0 ok, negative on error. */
+int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
+                             char *errbuf, size_t errlen);
 
 void coinbase_parts_free(coinbase_parts_t *p);
 

@@ -475,6 +475,177 @@ static void test_count_outputs(void) {
     printf("ok: coinbase_count_outputs\n");
 }
 
+/* coinbase_template_reward must return the value the multi builder checks
+ * against — the spendable output only, ignoring the zero-value OP_RETURNs, and
+ * refusing anything without exactly one spendable output. */
+static void test_template_reward(void) {
+    char err[256] = {0};
+    int64_t reward = 0;
+
+    assert(coinbase_template_reward(ENF_COINBASE_HEX, &reward, err, sizeof err) == 0);
+    assert(reward == 5000000000LL);
+
+    /* The figure the builder derives its fee from must agree exactly, or a
+     * payout split computed from it is rejected at render time. */
+    coinbase_parts_t parts = {0};
+    int64_t total_payout = 0, fee_sats = 0;
+    int64_t fee_expect = (reward * 100) / 10000;
+    coinbase_payout_t payouts[] = { { ENF_ADDR, reward - fee_expect } };
+    assert(coinbase_build_from_template_multi(
+               ENF_COINBASE_HEX, payouts, 1, ENF_ADDR, 100, "/x/", 4, 4,
+               &parts, NULL, &total_payout, &fee_sats, err, sizeof err) == 0);
+    assert(fee_sats == fee_expect);
+    assert(total_payout + fee_sats == reward);
+    coinbase_parts_free(&parts);
+
+    /* Garbage in, refusal out — never a silent zero. */
+    assert(coinbase_template_reward("nothex", &reward, err, sizeof err) < 0);
+    assert(coinbase_template_reward(NULL, &reward, err, sizeof err) < 0);
+
+    printf("ok: coinbase_template_reward\n");
+}
+
+/* Multi-output builder: split the 50 BTC reward three ways. */
+static void test_build_from_template_multi(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int has_witness = 0;
+    int64_t total_payout = 0, fee_sats = 0;
+
+    coinbase_payout_t payouts[] = {
+        { ENF_ADDR, 1500000000LL }, /* 15 BTC */
+        { ENF_ADDR, 2000000000LL }, /* 20 BTC */
+        { ENF_ADDR, 1500000000LL }, /* 15 BTC */
+    };
+
+    int rc = coinbase_build_from_template_multi(
+        ENF_COINBASE_HEX, payouts, 3, NULL, 0, "/x/", 4, 4,
+        &parts, &has_witness, &total_payout, &fee_sats, err, sizeof err);
+    if (rc != 0) fprintf(stderr, "build_from_template_multi err: %s\n", err);
+    assert(rc == 0);
+    assert(has_witness == 1);
+    assert(total_payout == 5000000000LL);
+    assert(fee_sats == 0);
+
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0xaa, 4);
+    memset(tx + parts.cb1_len + 4, 0xbb, 4);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    size_t off = 4; /* version */
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 36; /* prevout + idx */
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    off += ss_len + 4; /* scriptSig + sequence */
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    /* commitment + 3 payouts + witness commitment */
+    assert(out_count == 5);
+
+    /* out0: BIP301 commitment preserved. */
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    uint64_t l = 0;
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 6 && tx[off] == 0x6a && tx[off + 1] == 0x04);
+    off += l;
+
+    /* out1..3: payouts in order. */
+    uint64_t expected[3] = { 1500000000ULL, 2000000000ULL, 1500000000ULL };
+    for (int k = 0; k < 3; k++) {
+        v = 0;
+        for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+        off += 8;
+        assert(v == expected[k]);
+        assert(read_varint(tx, total, &off, &l) == 0);
+        assert(l == 22 && tx[off] == 0x00 && tx[off + 1] == 0x14);
+        off += l;
+    }
+
+    /* out4: witness commitment preserved. */
+    v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)tx[off + i] << (8 * i);
+    off += 8;
+    assert(v == 0);
+    assert(read_varint(tx, total, &off, &l) == 0);
+    assert(l == 38 && tx[off] == 0x6a && tx[off + 1] == 0x24);
+    off += l;
+
+    /* locktime */
+    off += 4;
+    assert(off == total);
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: coinbase_build_from_template_multi\n");
+}
+
+/* Multi-output builder with operator fee. */
+static void test_build_from_template_multi_fee(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int64_t total_payout = 0, fee_sats = 0;
+
+    coinbase_payout_t payouts[] = {
+        { ENF_ADDR, 2475000000LL }, /* 24.75 BTC */
+        { ENF_ADDR, 2475000000LL }, /* 24.75 BTC */
+    };
+
+    int rc = coinbase_build_from_template_multi(
+        ENF_COINBASE_HEX, payouts, 2, ENF_ADDR, 100, "/x/", 4, 4,
+        &parts, NULL, &total_payout, &fee_sats, err, sizeof err);
+    assert(rc == 0);
+    assert(total_payout == 4950000000LL);
+    assert(fee_sats == 50000000LL);
+
+    size_t total = parts.cb1_len + 8 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    memcpy(tx, parts.cb1, parts.cb1_len);
+    memset(tx + parts.cb1_len, 0, 8);
+    memcpy(tx + parts.cb1_len + 8, parts.cb2, parts.cb2_len);
+
+    size_t off = 4;
+    uint64_t in_count = 0;
+    assert(read_varint(tx, total, &off, &in_count) == 0);
+    off += 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+    off += ss_len + 4;
+    uint64_t out_count = 0;
+    assert(read_varint(tx, total, &off, &out_count) == 0);
+    /* commitment + 2 payouts + operator + witness commitment */
+    assert(out_count == 5);
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: coinbase_build_from_template_multi fee split\n");
+}
+
+/* Multi-output builder refuses when payouts + fee do not equal reward. */
+static void test_build_from_template_multi_sum_check(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+
+    coinbase_payout_t payouts[] = {
+        { ENF_ADDR, 2000000000LL },
+        { ENF_ADDR, 2000000000LL },
+    };
+
+    int rc = coinbase_build_from_template_multi(
+        ENF_COINBASE_HEX, payouts, 2, NULL, 0, "/x/", 4, 4,
+        &parts, NULL, NULL, NULL, err, sizeof err);
+    assert(rc < 0);
+    printf("ok: coinbase_build_from_template_multi sum check\n");
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -484,6 +655,10 @@ int main(void) {
     test_bip34_small_height_uses_opn();
     test_build_from_template();
     test_build_from_template_fee_split();
+    test_template_reward();
+    test_build_from_template_multi();
+    test_build_from_template_multi_fee();
+    test_build_from_template_multi_sum_check();
     test_count_outputs();
     printf("test_coinbase: all tests passed\n");
     return 0;

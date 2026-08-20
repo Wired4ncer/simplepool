@@ -5,6 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* coinbase_payout_t, used by stratum_job_set_payouts below. */
+#include "coinbase.h"
+
 typedef struct stratum_job stratum_job_t;
 
 /* Create a job from template fields. The coinbase is *not* baked into the
@@ -39,6 +42,13 @@ stratum_job_t *stratum_job_new(
 
 void stratum_job_free(stratum_job_t *j);
 
+/* Attach a proportional payout list to a job. Copies the array. Called by
+ * main.c after computing the PPLNS window for a new template. Returns 0 ok,
+ * -1 on oom. */
+int stratum_job_set_payouts(stratum_job_t *j,
+                            const coinbase_payout_t *payouts,
+                            size_t n_payouts);
+
 /* Observer hooks filled in by main.c (typically routed to the sqlite store). */
 typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   const char *payout_address,
@@ -53,6 +63,7 @@ typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
                                uint64_t ts_ms, uint32_t height,
+                               const char *job_id,
                                const char *block_hash,
                                int64_t reward_sats, int64_t fee_sats);
 
@@ -63,11 +74,16 @@ typedef struct {
     double initial_diff;         /* default 1.0 */
     /* Coinbase split — in solo mode each connection's coinbase pays the
      * miner directly. In PPS mode (pps_enabled=1) every coinbase instead
-     * pays the single pool-owned pool_btc_address. In both modes
-     * (value * fee_bps / 10000) goes to operator_address as a BTC fee. */
+     * pays the single pool-owned pool_btc_address. In proportional mode
+     * the coinbase pays the PPLNS window shareholders directly. In all
+     * modes (value * fee_bps / 10000) goes to operator_address as a BTC
+     * fee. */
     char   operator_address[128];
     int    fee_bps;
     char   coinbase_tag[64];
+
+    /* pool_mode: "solo" | "pps-classic" | "proportional". */
+    char    pool_mode[16];
 
     /* PPS (pool_mode=pps-classic). When pps_enabled = 1:
      *  - mining.authorize accepts Thunder addresses (base58 of 20-byte hash)
