@@ -1307,7 +1307,11 @@ double store_worker_recent_difficulty(store_t *s, const char *worker_name,
         "SELECT s.difficulty FROM ("
         "  SELECT s2.difficulty AS difficulty, s2.ts AS ts FROM shares s2"
         "    JOIN workers w2 ON s2.worker_id = w2.id"
-        "    WHERE w2.name = ? AND s2.ts >= ? AND s2.is_block = 0"
+        /* Block-shares count here too: at low difficulty every share is a
+         * block, and filtering them reported 0 for every worker -- which
+         * both blanked the dashboard hashrate and reset reconnecting
+         * miners to initial_diff. Same root cause as prop_window_agg. */
+        "    WHERE w2.name = ? AND s2.ts >= ?"
         "    ORDER BY s2.ts DESC, s2.id DESC LIMIT 32"
         ") s ORDER BY s.difficulty";
     sqlite3_stmt *st = NULL;
@@ -1379,14 +1383,29 @@ int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
 }
 
 /* SUM(difficulty), MIN(ts) and COUNT(*) over [from_s, before_s]. One aggregate,
- * so SQLite never hands the rows back to C. Returns 0 ok, -1 on error. */
+ * so SQLite never hands the rows back to C. Returns 0 ok, -1 on error.
+ *
+ * !! Do NOT re-add an `is_block = 0` filter here or in the other window
+ * queries. A share that also cleared the network target is still work the
+ * miner performed, and in proportional mode the finder gets no separate
+ * payment -- prop_build_plan replaces the coinbase outputs wholesale -- so
+ * counting it double-pays nobody.
+ *
+ * Excluding them looked harmless because blocks are one share in millions
+ * at normal difficulty. It is fatal at low difficulty: vardiff clamps the
+ * share difficulty to never exceed the network difficulty (stratum.c,
+ * vardiff_maybe_retarget), and is_block is `hash <= network_target`. Once
+ * that clamp binds, share target == network target, so EVERY share is a
+ * block, every row is filtered out, the window is empty, and every block
+ * falls through to paying its finder directly. PPLNS silently becomes solo
+ * -- exactly during the post-fork minimum-difficulty window. */
 static int prop_window_agg(store_t *s, sqlite3_int64 from_s, sqlite3_int64 before_s,
                            double *out_sum, sqlite3_int64 *out_min_ts,
                            sqlite3_int64 *out_count) {
     static const char *Q =
         "SELECT COALESCE(SUM(s.difficulty),0), COALESCE(MIN(s.ts),0), COUNT(*)"
         "  FROM shares s JOIN workers w ON s.worker_id = w.id"
-        "  WHERE s.ts >= ? AND s.ts <= ? AND s.is_block = 0"
+        "  WHERE s.ts >= ? AND s.ts <= ?"
         "    AND w.payout_address IS NOT NULL AND w.payout_address != ''";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
@@ -1462,7 +1481,8 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
     static const char *Q =
         "SELECT s.ts, s.id, s.difficulty FROM shares s"
         "  JOIN workers w ON s.worker_id = w.id"
-        "  WHERE (s.ts < ? OR (s.ts = ? AND s.id < ?)) AND s.is_block = 0"
+        /* No is_block filter -- see prop_window_agg. */
+        "  WHERE (s.ts < ? OR (s.ts = ? AND s.id < ?))"
         "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
         "  ORDER BY s.ts DESC, s.id DESC"
         "  LIMIT ?";
@@ -1524,7 +1544,8 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
         "SELECT w.payout_address, SUM(s.difficulty) AS total_diff"
         "  FROM shares s"
         "  JOIN workers w ON s.worker_id = w.id"
-        "  WHERE s.ts >= ? AND s.ts <= ? AND s.is_block = 0"
+        /* No is_block filter -- see prop_window_agg. */
+        "  WHERE s.ts >= ? AND s.ts <= ?"
         "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
         "  GROUP BY w.payout_address"
         "  ORDER BY total_diff DESC";
