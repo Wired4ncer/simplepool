@@ -517,6 +517,18 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
     size_t en_total = extranonce1_size + extranonce2_size;
     size_t script_sig_len = height_push_len + tag_push_len + en_total;
 
+    /* Consensus caps a coinbase scriptSig at 2..100 bytes. The template-based
+     * builders check this; this one did not, purely by omission. Today the max
+     * is ~94 (6 height + 76 tag + 12 extranonce) so it cannot trip — but a
+     * longer extranonce would silently start producing blocks the network
+     * rejects, which is the worst possible way to find out. */
+    if (script_sig_len < 2 || script_sig_len > 100) {
+        set_err(errbuf, errlen,
+                "coinbase scriptSig length %zu out of range (2..100)",
+                script_sig_len);
+        return -1;
+    }
+
     /* Build outputs blob: miner payout, [operator fee], [witness commitment]. */
     bbuf_t outs;
     bbuf_init(&outs);
@@ -580,7 +592,12 @@ oom:
 
 /* ---------- coinbasetxn (server-provided coinbase) ---------- */
 
-/* Read a little-endian Bitcoin varint from buf[*off..len). Advances *off. */
+/* Read a little-endian Bitcoin varint from buf[*off..len). Advances *off.
+ *
+ * NOTE for every caller: the value returned is attacker-shaped, up to 2^64-1,
+ * and comes from whatever the block-template backend sent. Bounds-check it as
+ * `val > len - *off`, NEVER as `*off + val > len` — the latter wraps, passes,
+ * and hands a multi-exabyte length to the memcpy that follows. */
 static int rd_varint(const uint8_t *buf, size_t len, size_t *off, uint64_t *val) {
     if (*off >= len) return -1;
     uint8_t b = buf[(*off)++];
@@ -676,7 +693,7 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
     uint64_t ss_len = 0;
     if (rd_varint(tx, txlen, &off, &ss_len) < 0) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
     size_t ss_off = off;
-    if (off + ss_len > txlen) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    if (ss_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
     off += ss_len;
     uint32_t sequence;
     if (rd_u32(tx, txlen, &off, &sequence) < 0) { set_err(errbuf, errlen, "truncated sequence"); goto done; }
@@ -694,7 +711,7 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
         uint64_t val = 0, spk_len = 0;
         if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
         if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
-        if (off + spk_len > txlen) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        if (spk_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
         outs[i].value = val;
         outs[i].spk_off = off;
         outs[i].spk_len = (size_t)spk_len;
@@ -710,7 +727,7 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
         for (uint64_t i = 0; i < stack; i++) {
             uint64_t il = 0;
             if (rd_varint(tx, txlen, &off, &il) < 0) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
-            if (off + il > txlen) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
+            if (il > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
             off += il;
         }
     }
@@ -883,7 +900,7 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
     uint64_t ss_len = 0;
     if (rd_varint(tx, txlen, &off, &ss_len) < 0) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
     size_t ss_off = off;
-    if (off + ss_len > txlen) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    if (ss_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
     off += ss_len;
     uint32_t sequence;
     if (rd_u32(tx, txlen, &off, &sequence) < 0) { set_err(errbuf, errlen, "truncated sequence"); goto done; }
@@ -901,7 +918,7 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
         uint64_t val = 0, spk_len = 0;
         if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
         if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
-        if (off + spk_len > txlen) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        if (spk_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
         outs[i].value = val;
         outs[i].spk_off = off;
         outs[i].spk_len = (size_t)spk_len;
@@ -916,7 +933,7 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
         for (uint64_t i = 0; i < stack; i++) {
             uint64_t il = 0;
             if (rd_varint(tx, txlen, &off, &il) < 0) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
-            if (off + il > txlen) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
+            if (il > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated witness item"); goto done; }
             off += il;
         }
     }
@@ -1121,7 +1138,7 @@ int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
     off += 36;
     uint64_t ss_len = 0;
     if (rd_varint(tx, txlen, &off, &ss_len) < 0) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
-    if (off + ss_len > txlen) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
+    if (ss_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptSig"); goto done; }
     off += ss_len;
     uint32_t sequence;
     if (rd_u32(tx, txlen, &off, &sequence) < 0) { set_err(errbuf, errlen, "truncated sequence"); goto done; }
@@ -1136,7 +1153,7 @@ int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
         uint64_t val = 0, spk_len = 0;
         if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
         if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
-        if (off + spk_len > txlen) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
+        if (spk_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
         int op_return = (spk_len >= 1 && tx[off] == 0x6a);
         off += spk_len;
         if (!op_return) { spendable++; reward = val; }
@@ -1180,7 +1197,7 @@ int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
         off += 36;
         uint64_t ss = 0;
         if (rd_varint(tx, txlen, &off, &ss) < 0) goto done;
-        if (off + ss + 4 > txlen) goto done;
+        if (txlen - off < 4 || ss > (uint64_t)(txlen - off - 4)) goto done;
         off += (size_t)ss + 4;   /* scriptSig + sequence */
     }
 
@@ -1191,7 +1208,7 @@ int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
         uint64_t val = 0, spk_len = 0;
         if (rd_u64(tx, txlen, &off, &val) < 0) goto done;
         if (rd_varint(tx, txlen, &off, &spk_len) < 0) goto done;
-        if (off + spk_len > txlen) goto done;
+        if (spk_len > (uint64_t)(txlen - off)) goto done;
         if (spk_len >= 1 && tx[off] == 0x6a) op_returns++;   /* OP_RETURN */
         else spendable++;
         off += (size_t)spk_len;
