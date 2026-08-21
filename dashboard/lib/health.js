@@ -33,13 +33,28 @@ function one(d, sql, ...args) {
 }
 
 /* Run a check, converting a schema mismatch into "unavailable" rather than an
- * exception. A check that cannot run is not a check that passed. */
+ * exception. A check that cannot run is not a check that passed — and until
+ * this returned ok:false it literally did: `ok` is `failing.length === 0`, so a
+ * throwing check left /health answering 200 with ok:true. A human saw the
+ * amber banner; the uptime monitor watching the endpoint saw green. If the
+ * duplicate_shares query started throwing on a schema change, the pool would
+ * report healthy while shares were being credited twice.
+ *
+ * `unavailable` is kept as its own flag, because two different things set it:
+ *
+ *   - THIS path — the check blew up. Not a pass: ok:false, so /health is 503.
+ *   - A check returning {ok:true, unavailable:true} on purpose, meaning "not
+ *     applicable yet" (e.g. template_commitments before the first template).
+ *     That is a genuine pass and must not page anyone on a fresh deploy.
+ *
+ * So do NOT collapse this to "unavailable means failing" — the banner's
+ * two-tier display and the fresh-install case both depend on the distinction. */
 function guard(id, label, fn) {
     try {
         const r = fn();
         return r ? { id, label, ...r } : { id, label, ok: true };
     } catch (e) {
-        return { id, label, ok: true, unavailable: true, detail: e.message };
+        return { id, label, ok: false, unavailable: true, detail: e.message };
     }
 }
 

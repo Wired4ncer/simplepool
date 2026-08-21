@@ -439,3 +439,52 @@ test('pendingBatch groups by the newest txid and ignores unbroadcast rows', asyn
     assert.equal(p.txid, 'new');
     assert.equal(p.rows.length, 2);
 });
+
+/* ---- two batches in flight ---------------------------------------------
+ *
+ * Only one batch should ever be in flight, but an operator reconciling by hand
+ * can attach a txid to a stranded batch while another is already out. The loop
+ * has to drain them in order.
+ *
+ * pendingBatch used to take the txid from the NEWEST row and started_at from
+ * the OLDEST row overall — mixing two batches into one report. Two consequences:
+ * the stall timer measured against the wrong epoch, and the older batch was
+ * never selected at all. Since finalizeBatch only clears the rows it is handed,
+ * and listDue skips any worker holding an in-flight row, everyone in the
+ * skipped batch stopped being paid permanently and silently.
+ */
+test('two batches in flight: the older one is reported, with its own epoch', () => {
+    const db = makeDb({
+        inFlight: [
+            { worker_id: 1, sats: 100, txid: 'tx_old', started_at: 1000 },
+            { worker_id: 2, sats: 200, txid: 'tx_old', started_at: 1005 },
+            { worker_id: 3, sats: 300, txid: 'tx_new', started_at: 9000 },
+        ],
+    });
+
+    const p = pendingBatch(db);
+
+    /* Precondition: both batches really are present, so this is testing the
+     * selection and not an empty table. */
+    assert.equal(db.prepare('SELECT COUNT(*) n FROM payouts_in_flight').get().n, 3);
+
+    assert.equal(p.txid, 'tx_old', 'oldest batch settles first — nothing is stranded');
+    assert.equal(p.rows.length, 2, 'only the rows belonging to that txid');
+    assert.deepEqual(p.rows.map(r => r.worker_id), [1, 2]);
+    assert.equal(p.started_at, 1000, "epoch comes from this batch's own first row");
+    /* The newest batch's row must not leak into the older batch's report. */
+    assert.ok(!p.rows.some(r => r.worker_id === 3));
+});
+
+test('a single batch is unaffected by the ordering change', () => {
+    const db = makeDb({
+        inFlight: [
+            { worker_id: 1, sats: 100, txid: 'tx_a', started_at: 4242 },
+            { worker_id: 2, sats: 200, txid: 'tx_a', started_at: 4243 },
+        ],
+    });
+    const p = pendingBatch(db);
+    assert.equal(p.txid, 'tx_a');
+    assert.equal(p.rows.length, 2);
+    assert.equal(p.started_at, 4242);
+});

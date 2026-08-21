@@ -11,6 +11,7 @@
  */
 
 import { enforcerRpc } from './enforcer.js';
+import { validateThunderAddress } from './thunder-address.js';
 
 /* ---------- transaction attempt log ---------- */
 
@@ -210,8 +211,13 @@ export async function createDeposit({
     if (!Number.isInteger(sid) || sid < 0 || sid > 255) {
         return { ok: false, msg: 'invalid sidechain_id (expected 0..255)' };
     }
-    if (!address || typeof address !== 'string' || address.length < 8 || address.length > 128) {
-        return { ok: false, msg: 'invalid recipient address' };
+    /* Validate the recipient the same way the proxy validates a miner's
+     * address at authorize time. This form moves real BTC onto the sidechain
+     * and there is no second confirmation, so a typo here is unrecoverable —
+     * a length check was never enough. */
+    const addrCheck = validateThunderAddress(address);
+    if (!addrCheck.ok) {
+        return { ok: false, msg: 'invalid recipient address', detail: addrCheck.msg };
     }
     const val = BigInt(valueSats || 0);
     if (val <= 0n) return { ok: false, msg: 'value_sats must be > 0' };

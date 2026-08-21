@@ -179,6 +179,26 @@ test('a DB missing a table degrades to unavailable, not to healthy', () => {
     const h = health(db);
     assert.ok(h.unavailable.some(c => c.id === 'payout_ambiguous'));
     assert.equal(h.checks.length, 7, 'every check still reported');
+    /* The assertion this test was missing, and the reason the bug shipped:
+     * the comment above always said "must not read as a pass", but nothing
+     * checked it, so ok stayed true and /health answered 200. */
+    assert.equal(h.ok, false, 'a check that crashed must not leave ok true');
+    assert.ok(h.failing.some(c => c.id === 'payout_ambiguous'));
+});
+
+/* The other half of the distinction: "not applicable yet" IS a pass. A fresh
+ * deploy with no templates recorded must not page anyone. */
+test('a check that is merely not-applicable-yet stays healthy', () => {
+    const db = makeDb();
+    /* The fixture seeds a template, so clear it: this is the fresh-deploy
+     * state, where template_commitments has nothing to judge yet. */
+    db.exec('DELETE FROM templates');
+    const h = health(db);
+    const tc = h.checks.find(c => c.id === 'template_commitments');
+    assert.ok(tc.unavailable, 'no templates yet -> unavailable');
+    assert.equal(tc.ok, true, 'but still a pass, not a failure');
+    assert.equal(h.ok, true, 'a fresh deploy must not page anyone');
+    assert.equal(h.failing.length, 0);
 });
 
 test('no DB handle is not healthy', () => {

@@ -149,12 +149,27 @@ export function pendingBatch(db) {
         ORDER BY p.id ASC
     `).all();
     if (rows.length === 0) return null;
-    const txid = rows[rows.length - 1].txid;
+
+    /* Settle the OLDEST batch first, and take its epoch from its own first row.
+     *
+     * Two bugs lived here. The txid came from the newest row while started_at
+     * came from rows[0] — the oldest row OVERALL — so with two batches in
+     * flight the stall-nudge timer and the "broadcast Ns ago" log both measured
+     * against the wrong batch. And picking the newest txid stranded the older
+     * one permanently: finalizeBatch only clears the rows it was handed, and
+     * listDue excludes any worker with ANY in-flight row, so every worker in
+     * the skipped batch silently stopped being paid, forever.
+     *
+     * Rows are ordered by id, so rows[0] belongs to the oldest batch. In the
+     * normal single-batch case this is identical to what it did before; when an
+     * operator has hand-attached a second txid during reconciliation, batches
+     * now drain in order instead of one being abandoned. */
+    const txid = rows[0].txid;
+    const batch = rows.filter(r => r.txid === txid);
     return {
         txid,
-        started_at: rows[0].started_at,
-        rows: rows.filter(r => r.txid === txid)
-                  .map(r => ({ ...r, sats: BigInt(r.sats) })),
+        started_at: batch[0].started_at,
+        rows: batch.map(r => ({ ...r, sats: BigInt(r.sats) })),
     };
 }
 

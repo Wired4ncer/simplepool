@@ -19,6 +19,7 @@ import { startHealthMonitor, currentHealth } from './lib/health.js';
 import { versions } from './lib/versions.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT     = parseInt(process.env.PORT || '8081', 10);
@@ -120,6 +121,18 @@ const PAYOUT_ADMIN_URL     = process.env.PAYOUT_ADMIN_URL     || '';
 const ENFORCER_GRPC_ADDR   = process.env.ENFORCER_GRPC_ADDR   || '127.0.0.1:50051';
 const THUNDER_SIDECHAIN_ID = parseInt(process.env.THUNDER_SIDECHAIN_ID || '9', 10);
 
+/* Constant-time credential comparison.
+ *
+ * `===` on strings short-circuits at the first differing byte, so response
+ * timing leaks the length and a prefix of the password. Hashing both sides
+ * first means timingSafeEqual always gets equal-length buffers (it throws
+ * otherwise) and the length itself does not leak. This surface authorises
+ * real Thunder deposits and payouts. */
+function credEq(a, b) {
+    const h = v => createHash('sha256').update(String(v ?? '')).digest();
+    return timingSafeEqual(h(a), h(b));
+}
+
 function requireAdminAuth(req, res, next) {
     if (!ADMIN_USER || !ADMIN_PASS) {
         return res.status(503).send('admin disabled — set ADMIN_USER + ADMIN_PASSWORD or ADMIN_CREDENTIALS_FILE');
@@ -127,7 +140,7 @@ function requireAdminAuth(req, res, next) {
     const h = req.headers.authorization || '';
     if (h.startsWith('Basic ')) {
         const [u, p] = Buffer.from(h.slice(6), 'base64').toString('utf8').split(':');
-        if (u === ADMIN_USER && p === ADMIN_PASS) return next();
+        if (credEq(u, ADMIN_USER) && credEq(p, ADMIN_PASS)) return next();
     }
     res.setHeader('WWW-Authenticate', 'Basic realm="simplepool admin"');
     return res.status(401).send('unauthorised');
