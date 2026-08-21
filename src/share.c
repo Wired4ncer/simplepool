@@ -90,10 +90,27 @@ void worker_diff_to_target(double diff, uint8_t target_be[32]) {
     }
     u128 hi = be16_to_u128(DIFF1_TARGET);
     double scaled = (double)hi / diff;
-    /* Clamp to [0, 2^128 - 1]. */
     const double max_u128 = ldexp(1.0, 128); /* 2^128 */
+
+    /* Saturate BEFORE converting, and by returning — not by nudging `scaled`.
+     *
+     * The old clamp was `scaled = max_u128 - 1.0`, which is a no-op: at 2^128 a
+     * double has no precision left at 1.0 granularity, so max_u128 - 1.0 IS
+     * max_u128. The (u128) conversion then overflowed, which is undefined
+     * behaviour, and the compiler duly disagreed with itself — for a share
+     * difficulty of 1e-12 this produced an ALL-ZERO target at -O1 (no share can
+     * ever meet it; every miner is rejected as "low difficulty") and an ALL-FF
+     * target at -O2 (every share passes). Same source, opposite meanings.
+     *
+     * Any difficulty below ~2.3e-10 lands here, and initial_diff / vardiff_min
+     * are operator-configurable with no lower bound. All-FF is the correct
+     * saturation: an unmeetably small difficulty means the easiest possible
+     * target, matching the diff <= 0 branch above. */
+    if (scaled >= max_u128) {
+        memset(target_be, 0xff, 32);
+        return;
+    }
     if (scaled < 0.0) scaled = 0.0;
-    if (scaled >= max_u128) scaled = max_u128 - 1.0;
     u128 hi_scaled = (u128)scaled;
     u128_to_be16(hi_scaled, target_be);
 }

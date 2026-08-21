@@ -170,6 +170,15 @@ int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
  * tests. */
 int stratum_socket_setup_for_test(int fd, int idle_timeout_sec);
 
+/* Link `c` into the server's live-connection list with `fd`, so that
+ * stratum_server_set_job() will render and broadcast to it. Without this a
+ * test connection is invisible to the broadcast path (fd < 0 is skipped), and
+ * the concurrency between the tip watcher and a submitting connection — the
+ * whole reason c->state_lock exists — cannot be reached from a unit test.
+ * The caller keeps ownership of the fd. */
+void stratum_conn_register_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                    int fd);
+
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
  * messages to *out_buf (caller-owned, will be realloc'd). Returns 0 on
  * success, negative on protocol error (caller should disconnect). */

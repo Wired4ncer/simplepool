@@ -74,6 +74,33 @@ static void test_worker_diff(void) {
     /* invalid -> max */
     worker_diff_to_target(0.0, t2);
     for (int i = 0; i < 32; ++i) CHECK(t2[i] == 0xff);
+
+    /* A difficulty small enough to overflow the 128-bit conversion saturates
+     * to the easiest target, and does so IDENTICALLY at every optimisation
+     * level. The old clamp (`scaled = 2^128 - 1.0`, a no-op in double) left the
+     * conversion undefined: 1e-12 gave an all-zero target at -O1 — no share can
+     * ever meet it, so every miner is rejected — and an all-ff target at -O2.
+     * Anything below ~2.3e-10 is in that range, and initial_diff / vardiff_min
+     * are operator-set with no floor.
+     *
+     * Note this is also why the "tiny diff so any hash passes" idiom used in
+     * tests/test_stratum.c only worked at -O2: it was relying on the UB. */
+    worker_diff_to_target(1e-12, t2);
+    for (int i = 0; i < 32; ++i) CHECK(t2[i] == 0xff);
+    worker_diff_to_target(1e-30, t2);
+    for (int i = 0; i < 32; ++i) CHECK(t2[i] == 0xff);
+
+    /* Just above the overflow threshold the result is still a real target:
+     * neither saturated nor zero, and still easier than diff 1. */
+    uint8_t t3[32];
+    worker_diff_to_target(1e-9, t3);
+    CHECK(be32_cmp(t3, t1) > 0);           /* easier than diff 1 */
+    int all_ff = 1, all_00 = 1;
+    for (int i = 0; i < 32; ++i) {
+        if (t3[i] != 0xff) all_ff = 0;
+        if (t3[i] != 0x00) all_00 = 0;
+    }
+    CHECK(!all_ff && !all_00);
 }
 
 static void test_merkle(void) {

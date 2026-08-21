@@ -46,6 +46,8 @@
 #define SHARE_DEDUPE_RING 16384
 #define RECENT_JOBS    8
 #define RECENT_JOB_TTL_MS 60000
+/* Upper bound on a single blocking send to one miner. See conn_socket_setup. */
+#define SEND_TIMEOUT_SEC 10
 
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
  * mining.configure; only these block-header version bits may be rolled by a
@@ -92,7 +94,19 @@ struct stratum_job {
     size_t             n_payouts;
 
     uint64_t created_ms;    /* for retention ring */
+
+    /* Reference count. find_job() hands a job to a submit handler that then
+     * works with it for a long time — coinbase render, merkle fold, and on a
+     * solve a full block assembly that walks every template transaction —
+     * while the tip watcher is free to retire and free that same job (TTL
+     * sweep or ring wrap). Borrowing the pointer under a lock and using it
+     * after unlocking was a use-after-free during block assembly, i.e. at the
+     * exact moment a block is found. Owners: the current_job slot, each
+     * recent[] slot, and every outstanding find_job() caller. */
+    atomic_uint refs;
 };
+
+static void job_destroy(stratum_job_t *j);
 
 stratum_job_t *stratum_job_new(
     const char *job_id,
@@ -110,6 +124,7 @@ stratum_job_t *stratum_job_new(
 {
     stratum_job_t *j = calloc(1, sizeof(*j));
     if (!j) return NULL;
+    atomic_init(&j->refs, 1u);
     snprintf(j->job_id, sizeof(j->job_id), "%s", job_id ? job_id : "");
     j->version = version;
     if (prev_hash_le) memcpy(j->prev_hash_le, prev_hash_le, 32);
@@ -149,11 +164,12 @@ stratum_job_t *stratum_job_new(
     j->created_ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
     return j;
 fail:
-    stratum_job_free(j);
+    job_destroy(j);
     return NULL;
 }
 
-void stratum_job_free(stratum_job_t *j) {
+/* Actually deallocate. Only stratum_job_free(), at the last reference. */
+static void job_destroy(stratum_job_t *j) {
     if (!j) return;
     free(j->wc_hex);
     free(j->coinbasetxn_hex);
@@ -167,6 +183,13 @@ void stratum_job_free(stratum_job_t *j) {
         free(j->payouts);
     }
     free(j);
+}
+
+/* Drop one reference; deallocate at zero. Named "free" because that is what it
+ * is to every caller outside this file — a job handed back is a job released. */
+void stratum_job_free(stratum_job_t *j) {
+    if (!j) return;
+    if (atomic_fetch_sub(&j->refs, 1u) == 1u) job_destroy(j);
 }
 
 int stratum_job_set_payouts(stratum_job_t *j,
@@ -289,6 +312,21 @@ struct stratum_conn {
      * The conn thread checks this against cfg.idle_timeout_sec after each
      * SO_RCVTIMEO wake-up so silent connections are reaped. */
     uint64_t last_activity_ms;
+
+    /* Guards every mutable field of this connection that is touched by more
+     * than one thread: cb1/cb2/cb_for_job_id and the vardiff set
+     * (difficulty, prev_difficulty, diff_changed_ms, vd_window_*).
+     *
+     * Two threads reach them. The connection's own thread does, via
+     * handle_submit. The TIP WATCHER also does, because stratum_server_set_job
+     * walks every connection and calls conn_render_coinbase (which frees and
+     * replaces cb1/cb2) and vardiff_check_idle. Without this lock the watcher
+     * frees the coinbase buffers out from under a submit that is memcpy'ing
+     * them — a use-after-free that fires on any job switch racing a share.
+     *
+     * Distinct from write_lock, which serialises the socket only. Lock order
+     * is conns_lock -> state_lock -> job_lock; never the reverse. */
+    pthread_mutex_t state_lock;
 
     pthread_mutex_t write_lock;
 
@@ -460,6 +498,7 @@ static stratum_job_t *find_job(stratum_server_t *s, const char *job_id) {
     pthread_rwlock_rdlock(&s->job_lock);
     stratum_job_t *cur = s->current_job;
     if (cur && strcmp(cur->job_id, job_id) == 0) {
+        atomic_fetch_add(&cur->refs, 1u);   /* before unlocking, always */
         pthread_rwlock_unlock(&s->job_lock);
         return cur;
     }
@@ -469,6 +508,7 @@ static stratum_job_t *find_job(stratum_server_t *s, const char *job_id) {
     for (size_t i = 0; i < RECENT_JOBS; ++i) {
         if (s->recent[i] && strcmp(s->recent[i]->job_id, job_id) == 0) {
             stratum_job_t *r = s->recent[i];
+            atomic_fetch_add(&r->refs, 1u);
             pthread_mutex_unlock(&s->recent_lock);
             return r;
         }
@@ -536,6 +576,8 @@ static cJSON *make_notify_params(const stratum_job_t *j,
 /* Render a fresh coinbase for `c` against `job` using c->payout_address
  * and the server's operator_address / fee_bps / coinbase_tag. Caches into
  * c->cb1/cb2 keyed by job->job_id. Returns 0 ok, negative on error. */
+/* CALLER MUST HOLD c->state_lock: this frees and replaces c->cb1/c->cb2, and
+ * both the connection's own thread and the tip watcher get here. */
 static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                 const stratum_job_t *job) {
     if (!c->authorized || c->payout_address[0] == '\0') return -1;
@@ -648,41 +690,47 @@ static cJSON *make_error(int code, const char *msg) {
 
 /* ---- varint for block assembly ---- */
 
-static void varint_append(uint8_t **buf, size_t *cap, size_t *len, uint64_t n) {
+/* Return 0 on success, -1 on allocation failure. These used to return void and
+ * silently do nothing when realloc failed, which meant a block could be
+ * assembled SHORT and submitted — the node rejects it and the reward is gone,
+ * with nothing in the log to explain why. Callers must check. */
+static int varint_append(uint8_t **buf, size_t *cap, size_t *len, uint64_t n) {
     /* ensure 9 bytes */
     if (*len + 9 > *cap) {
         size_t nc = (*cap ? *cap * 2 : 64);
         while (nc < *len + 9) nc *= 2;
         uint8_t *nb = realloc(*buf, nc);
-        if (!nb) return;
+        if (!nb) return -1;
         *buf = nb; *cap = nc;
     }
     uint8_t *p = *buf + *len;
-    if (n < 0xfd) { p[0] = (uint8_t)n; *len += 1; return; }
+    if (n < 0xfd) { p[0] = (uint8_t)n; *len += 1; return 0; }
     if (n <= 0xffff) {
         p[0] = 0xfd; p[1] = (uint8_t)(n & 0xff); p[2] = (uint8_t)((n >> 8) & 0xff);
-        *len += 3; return;
+        *len += 3; return 0;
     }
     if (n <= 0xffffffffULL) {
         p[0] = 0xfe;
         for (int i = 0; i < 4; ++i) p[1 + i] = (uint8_t)((n >> (8 * i)) & 0xff);
-        *len += 5; return;
+        *len += 5; return 0;
     }
     p[0] = 0xff;
     for (int i = 0; i < 8; ++i) p[1 + i] = (uint8_t)((n >> (8 * i)) & 0xff);
     *len += 9;
+    return 0;
 }
 
-static void bytes_append(uint8_t **buf, size_t *cap, size_t *len, const uint8_t *src, size_t n) {
+static int bytes_append(uint8_t **buf, size_t *cap, size_t *len, const uint8_t *src, size_t n) {
     if (*len + n > *cap) {
         size_t nc = (*cap ? *cap * 2 : 64);
         while (nc < *len + n) nc *= 2;
         uint8_t *nb = realloc(*buf, nc);
-        if (!nb) return;
+        if (!nb) return -1;
         *buf = nb; *cap = nc;
     }
     memcpy(*buf + *len, src, n);
     *len += n;
+    return 0;
 }
 
 /* ---- core message handler --------------------------------------------- */
@@ -723,6 +771,7 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
  * client picks it up for the next job notify; we don't force a re-notify
  * because handle_submit keeps accepting shares at the old difficulty for
  * a grace period (diff_grace_ms). */
+/* CALLER MUST HOLD c->state_lock. */
 static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
                                    uint64_t now,
                                    char **buf, size_t *len)
@@ -983,6 +1032,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (s->cfg.on_difficulty_hint) {
         hint = s->cfg.on_difficulty_hint(s->cfg.ctx, c->worker_name);
     }
+    /* From here to the initial notify we are mutating the same fields the tip
+     * watcher touches on a job switch, so take the connection's state lock. */
+    pthread_mutex_lock(&c->state_lock);
     if (hint > 0.0) {
         c->difficulty = hint;
         LOG_INFO("stratum: %s resumed at difficulty %.0f from its own history",
@@ -1004,6 +1056,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * coinbase against the current job using its payout address). */
     send_set_difficulty(buf, len, c->difficulty);
     send_current_notify(s, c, buf, len, 1);
+    pthread_mutex_unlock(&c->state_lock);
     return 0;
 }
 
@@ -1054,8 +1107,9 @@ static char *assemble_block_hex(const stratum_job_t *j,
     size_t tx_count = j->tx_count + 1; /* +1 coinbase */
     uint8_t *block = NULL;
     size_t cap = 0, len = 0;
-    bytes_append(&block, &cap, &len, header, 80);
-    varint_append(&block, &cap, &len, tx_count);
+#define APPEND(call) do { if ((call) != 0) goto oom; } while (0)
+    APPEND(bytes_append(&block, &cap, &len, header, 80));
+    APPEND(varint_append(&block, &cap, &len, tx_count));
     if (j->coinbase_has_witness && cb_len >= 8) {
         /* coinbase_tx is the legacy serialization:
          *   version(4) | inputs | outputs | locktime(4)
@@ -1066,26 +1120,31 @@ static char *assemble_block_hex(const stratum_job_t *j,
          * backend computed) just before the locktime. */
         static const uint8_t marker_flag[2] = { 0x00, 0x01 };
         static const uint8_t witness[34]    = { 0x01, 0x20 }; /* 1 item, 32 bytes, all zero */
-        bytes_append(&block, &cap, &len, coinbase_tx, 4);                 /* version */
-        bytes_append(&block, &cap, &len, marker_flag, 2);
-        bytes_append(&block, &cap, &len, coinbase_tx + 4, cb_len - 8);    /* inputs + outputs */
-        bytes_append(&block, &cap, &len, witness, sizeof witness);
-        bytes_append(&block, &cap, &len, coinbase_tx + cb_len - 4, 4);    /* locktime */
+        APPEND(bytes_append(&block, &cap, &len, coinbase_tx, 4));                 /* version */
+        APPEND(bytes_append(&block, &cap, &len, marker_flag, 2));
+        APPEND(bytes_append(&block, &cap, &len, coinbase_tx + 4, cb_len - 8));    /* inputs + outputs */
+        APPEND(bytes_append(&block, &cap, &len, witness, sizeof witness));
+        APPEND(bytes_append(&block, &cap, &len, coinbase_tx + cb_len - 4, 4));    /* locktime */
     } else {
-        bytes_append(&block, &cap, &len, coinbase_tx, cb_len);
+        APPEND(bytes_append(&block, &cap, &len, coinbase_tx, cb_len));
     }
     for (size_t i = 0; i < j->tx_count; ++i) {
         size_t txn = 0;
         uint8_t *txb = hex_to_bytes_alloc(j->tx_hex_list[i], &txn);
         if (!txb) { free(block); return NULL; }
-        bytes_append(&block, &cap, &len, txb, txn);
+        int arc = bytes_append(&block, &cap, &len, txb, txn);
         free(txb);
+        if (arc != 0) goto oom;
     }
     char *out = malloc(len * 2 + 1);
     if (!out) { free(block); return NULL; }
     bytes_to_hex(block, len, out);
     free(block);
     return out;
+oom:
+    free(block);
+    return NULL;
+#undef APPEND
 }
 
 static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
@@ -1127,6 +1186,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         uint32_t rolled = 0;
         if (!cJSON_IsString(v) || parse_u32_hex(v->valuestring, &rolled) != 0) {
             cJSON *err = make_error(20, "bad version hex");
+            stratum_job_free(job);   /* release find_job's reference */
             return emit_response(buf, len, id, NULL, err);
         }
         uint32_t mask = c->version_mask ? c->version_mask : VERSION_ROLLING_MASK;
@@ -1141,12 +1201,14 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              "duplicate share");
         }
         cJSON *err = make_error(22, "duplicate share");
+        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
     uint32_t ntime_v, nonce_v;
     if (parse_u32_hex(ntime, &ntime_v) != 0 || parse_u32_hex(nonce, &nonce_v) != 0) {
         cJSON *err = make_error(20, "bad ntime/nonce hex");
+        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1154,31 +1216,74 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint8_t *en2_bytes = hex_to_bytes_alloc(en2, &en2_len);
     if (!en2_bytes) {
         cJSON *err = make_error(20, "bad extranonce2 hex");
+        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
-    /* Render this connection's coinbase for `job` if not cached. The
-     * cache is keyed on job_id; submits against an older job retired into
+    /* The extranonce2 must be exactly the width we advertised at subscribe
+     * and reserved in the coinbase scriptSig. Any other length still hashes
+     * and can still beat the target, but it produces a coinbase whose
+     * scriptSig length prefix disagrees with its contents — unserialisable.
+     * Crediting such a share is bad; submitting the block it solves is worse,
+     * because the node rejects the malformed transaction and the reward is
+     * simply lost. Reject at the door instead. */
+    if (en2_len != job->en2_size) {
+        free(en2_bytes);
+        LOG_INFO("stratum: reject from worker '%s' - Reason: extranonce2 is "
+                 "%zu bytes, expected %zu", c->worker_name, en2_len,
+                 job->en2_size);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "bad extranonce2 size");
+        }
+        cJSON *err = make_error(20, "bad extranonce2 size");
+        stratum_job_free(job);   /* release find_job's reference */
+        return emit_response(buf, len, id, NULL, err);
+    }
+
+    /* Render this connection's coinbase for `job` if not cached, and copy it
+     * out — both under state_lock, in ONE critical section.
+     *
+     * They cannot be split. The tip watcher renders against this same
+     * connection on every job switch, and rendering frees cb1/cb2; releasing
+     * the lock between the render and the memcpy would put the free and the
+     * read back in the same race this lock exists to close. Snapshot the
+     * vardiff fields here too, so the rest of the validation works off stable
+     * values instead of re-reading them as the watcher retargets.
+     *
+     * The cache is keyed on job_id; submits against an older job retired into
      * the recent ring will rebuild on demand. */
+    pthread_mutex_lock(&c->state_lock);
     if (conn_render_coinbase(s, c, job) < 0) {
+        pthread_mutex_unlock(&c->state_lock);
         free(en2_bytes);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "coinbase render failed");
         }
         cJSON *err = make_error(25, "coinbase render failed");
+        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
     /* coinbase = cb1 || ex1 || ex2 || cb2 */
     size_t cb_len = c->cb1_len + 4 + en2_len + c->cb2_len;
     uint8_t *cb = malloc(cb_len);
-    if (!cb) { free(en2_bytes); return -1; }
+    if (!cb) {
+        pthread_mutex_unlock(&c->state_lock);
+        free(en2_bytes);
+        stratum_job_free(job);   /* release find_job's reference */
+        return -1;
+    }
     size_t off = 0;
     memcpy(cb + off, c->cb1, c->cb1_len);   off += c->cb1_len;
     memcpy(cb + off, c->extranonce1, 4);    off += 4;
     memcpy(cb + off, en2_bytes, en2_len);   off += en2_len;
     memcpy(cb + off, c->cb2, c->cb2_len);   off += c->cb2_len;
+    const double cur_diff       = c->difficulty;
+    const double prev_diff      = c->prev_difficulty;
+    const uint64_t diff_changed = c->diff_changed_ms;
+    pthread_mutex_unlock(&c->state_lock);
     free(en2_bytes);
 
     uint8_t cb_txid_le[32];
@@ -1207,11 +1312,12 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              "duplicate share");
         }
         cJSON *err = make_error(22, "duplicate share");
+        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
     uint8_t worker_target[32];
-    worker_diff_to_target(c->difficulty, worker_target);
+    worker_diff_to_target(cur_diff, worker_target);
 
     char sent_hash_hex[65] = {0};
     char worker_target_hex[65] = {0};
@@ -1233,18 +1339,18 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint64_t ts_now   = now_ms();
     int is_block      = be32_cmp(hash_be, job->network_target_be) <= 0;
     int meets_worker  = be32_cmp(hash_be, worker_target) < 0;
-    double share_diff = c->difficulty;
+    double share_diff = cur_diff;
 
     /* Honor the pre-retarget difficulty for a grace period: the miner only
      * applies a set_difficulty on a later job, so shares mined against the
      * old difficulty keep arriving after a retarget. */
-    if (!meets_worker && c->prev_difficulty > 0.0 &&
-        ts_now - c->diff_changed_ms < diff_grace_ms(s)) {
+    if (!meets_worker && prev_diff > 0.0 &&
+        ts_now - diff_changed < diff_grace_ms(s)) {
         uint8_t prev_target[32];
-        worker_diff_to_target(c->prev_difficulty, prev_target);
+        worker_diff_to_target(prev_diff, prev_target);
         if (be32_cmp(hash_be, prev_target) < 0) {
             meets_worker = 1;
-            share_diff = c->prev_difficulty;
+            share_diff = prev_diff;
         }
     }
 
@@ -1260,6 +1366,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         free(cb);
         cJSON *err = make_error(23, "low difficulty");
+        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1299,8 +1406,10 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
     /* Tick vardiff: count this accepted share toward the window. May emit
      * a mining.set_difficulty notification if the window has elapsed. */
+    pthread_mutex_lock(&c->state_lock);
     c->vd_window_shares++;
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
+    pthread_mutex_unlock(&c->state_lock);
     /* ⛔ Gated on the NODE accepting the block, not on the pool solving it.
      *
      * Two miners can solve the same height milliseconds apart. submitblock
@@ -1331,6 +1440,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                               job->job_id, block_hash_hex,
                               reward_sats, fee_sats);
     }
+    stratum_job_free(job);   /* release find_job's reference */
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }
 
@@ -1373,6 +1483,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->server = s;
     c->fd = -1;
     c->difficulty = s ? s->cfg.initial_diff : 1.0;
+    pthread_mutex_init(&c->state_lock, NULL);
     pthread_mutex_init(&c->write_lock, NULL);
     return c;
 }
@@ -1380,6 +1491,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
 void stratum_conn_free_for_test(stratum_conn_t *c) {
     if (!c) return;
     conn_clear_coinbase(c);
+    pthread_mutex_destroy(&c->state_lock);
     pthread_mutex_destroy(&c->write_lock);
     free(c);
 }
@@ -1399,6 +1511,14 @@ int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
 
 /* ---- real connection thread ------------------------------------------ */
 
+/* Write the whole buffer or fail.
+ *
+ * The socket carries SO_SNDTIMEO (see conn_socket_setup), so a peer that has
+ * stopped reading makes this return -1 with EAGAIN after SEND_TIMEOUT_SEC
+ * rather than blocking forever. That bound is what keeps one stalled miner
+ * from freezing job broadcast for every other miner — see the comment in
+ * stratum_server_set_job. A timed-out write may have delivered a partial
+ * line, so the caller has to drop the connection, not retry it. */
 static int write_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -1449,11 +1569,32 @@ static int conn_socket_setup(int fd, int idle_timeout_sec) {
             return -1;
         }
     }
+
+    /* Bound every send. Without this a miner that simply stops reading fills
+     * its socket buffer, write_all() blocks forever, and because job broadcast
+     * writes to each connection in turn while holding conns_lock, NO miner
+     * gets a new job until the kernel's keepalive finally kills the dead peer
+     * (~3.5 min above). One connection could stall the whole pool on a stale
+     * template — worst exactly during a fast-rotating min-difficulty window.
+     * A miner with 10s of unread notify traffic is not mining for us anyway. */
+    struct timeval sndtv = { .tv_sec = SEND_TIMEOUT_SEC, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndtv, sizeof(sndtv)) < 0) {
+        return -1;
+    }
     return 0;
 }
 
 int stratum_socket_setup_for_test(int fd, int idle_timeout_sec) {
     return conn_socket_setup(fd, idle_timeout_sec);
+}
+
+static void conn_register(stratum_server_t *s, stratum_conn_t *c);
+
+void stratum_conn_register_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                    int fd) {
+    if (!s || !c) return;
+    c->fd = fd;
+    conn_register(s, c);
 }
 
 static void conn_register(stratum_server_t *s, stratum_conn_t *c) {
@@ -1532,8 +1673,17 @@ static void *conn_thread(void *arg) {
         }
     }
 done:
-    close(c->fd);
+    /* Unregister BEFORE closing, never after.
+     *
+     * conn_unregister takes conns_lock, which is the lock job broadcast holds
+     * while it writes to every linked connection. Closing first left this
+     * connection linked with a dead fd number, and accept() on the listener
+     * thread can hand that same number straight back out — so a mining.notify
+     * meant for the departing miner lands in whatever the process opened next.
+     * The listener's own error path below has always had this order right. */
     conn_unregister(s, c);
+    close(c->fd);
+    c->fd = -1;
     atomic_fetch_sub(&s->conn_count, 1);
     stratum_conn_free_for_test(c);
     return NULL;
@@ -1641,13 +1791,28 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
         if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
         char *out = NULL; size_t olen = 0;
+        pthread_mutex_lock(&c->state_lock);
         vardiff_check_idle(s, c, &out, &olen);
         send_current_notify(s, c, &out, &olen, 1);
+        pthread_mutex_unlock(&c->state_lock);
         if (out) {
             pthread_mutex_lock(&c->write_lock);
-            write_all(c->fd, out, olen);
+            int wrc = write_all(c->fd, out, olen);
             pthread_mutex_unlock(&c->write_lock);
             free(out);
+            /* A miner that has not drained its socket in SEND_TIMEOUT_SEC gets
+             * dropped rather than allowed to hold up the broadcast. We cannot
+             * close() the fd here — the connection thread owns it — but
+             * shutdown() is safe from another thread and wakes that thread's
+             * recv() so it runs its normal teardown. The partial line this may
+             * have left on the wire is exactly why the connection has to go. */
+            if (wrc < 0) {
+                LOG_WARN("stratum: dropping '%s' — notify write failed (%s); "
+                         "it was holding up the broadcast",
+                         c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                         strerror(errno));
+                shutdown(c->fd, SHUT_RDWR);
+            }
         }
     }
     pthread_mutex_unlock(&s->conns_lock);
@@ -1656,14 +1821,20 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
 void stratum_server_stop(stratum_server_t *s) {
     if (!s) return;
     atomic_store(&s->stop, 1);
-    if (s->listen_fd >= 0) {
-        shutdown(s->listen_fd, SHUT_RDWR);
-        close(s->listen_fd);
-        s->listen_fd = -1;
-    }
+    /* shutdown() to break the listener out of accept(), then JOIN, and only
+     * then close and clear the fd. Clearing it before the join raced the
+     * listener's own read of s->listen_fd (TSan flagged it 7x in the job
+     * rotation stress test) and could have closed the fd while accept() was
+     * still using it. After the join nothing else touches the field. */
+    int fd = s->listen_fd;
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
     if (s->listener_started) {
         pthread_join(s->listener_thr, NULL);
         s->listener_started = 0;
+    }
+    if (fd >= 0) {
+        close(fd);
+        s->listen_fd = -1;
     }
 }
 

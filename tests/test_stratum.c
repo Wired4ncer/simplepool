@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -28,21 +30,31 @@ typedef struct {
     char  last_reason[128];
 } obs_t;
 
+/* The callbacks are invoked from whichever thread handled the share, and
+ * test_job_rotation_races_submits drives several at once. Guard the observer
+ * so TSan reports races in the CODE UNDER TEST rather than in the harness
+ * watching it. Single-threaded tests pay one uncontended lock per callback. */
+static pthread_mutex_t obs_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void on_share(void *ctx, const char *w, const char *addr,
                      uint64_t ts, double d,
                      int is_block, const char *blk) {
     (void)ts; (void)d; (void)blk; (void)addr;
     obs_t *o = ctx;
+    pthread_mutex_lock(&obs_mu);
     o->shares++;
     o->last_is_block = is_block;
     if (is_block) o->blocks++;
     snprintf(o->last_worker, sizeof(o->last_worker), "%s", w ? w : "");
+    pthread_mutex_unlock(&obs_mu);
 }
 static void on_reject(void *ctx, const char *w, uint64_t ts, const char *r) {
     (void)ts; (void)w;
     obs_t *o = ctx;
+    pthread_mutex_lock(&obs_mu);
     o->rejects++;
     snprintf(o->last_reason, sizeof(o->last_reason), "%s", r ? r : "");
+    pthread_mutex_unlock(&obs_mu);
 }
 /* Returns 0 = the node accepted it, so the existing tests keep exercising
  * the on_block_found path. A test for the rejected case sets its own. */
@@ -244,6 +256,235 @@ static void test_submit_share_and_dedupe(void) {
 
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
+}
+
+/* An extranonce2 of any width other than the 4 bytes advertised at subscribe
+ * must be refused.
+ *
+ * The coinbase reserves exactly en1_size + en2_size bytes inside a scriptSig
+ * whose length prefix is already committed, so a different width produces a
+ * transaction that cannot be deserialised. Such a share still hashes and can
+ * still beat the target — it would be credited, and if it solved the network
+ * target the pool would submit a malformed block and lose the reward.
+ *
+ * The first assertion is the load-bearing one: it proves this fixture reaches
+ * the accept path at all, so the rejections below are the length check firing
+ * and not some earlier guard quietly eating every submit. */
+static void test_submit_rejects_wrong_extranonce2_size(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-12,   /* any hash passes */
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Precondition: the correct width (4 bytes) is accepted here. */
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"aabbccdd\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 1);
+    CHECK(obs.rejects == 0);
+    free(out); out=NULL; olen=0;
+
+    /* Too short: 3 bytes. */
+    rc = stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"aabbcc\",\"60000000\",\"00000002\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 1);                 /* not credited */
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "extranonce2") != NULL);
+    CHECK(strstr(out, "\"error\"") != NULL);
+    free(out); out=NULL; olen=0;
+
+    /* Too long: 6 bytes. */
+    rc = stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"aabbccddeeff\",\"60000000\",\"00000003\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 1);
+    CHECK(obs.rejects == 2);
+    CHECK(strstr(obs.last_reason, "extranonce2") != NULL);
+    free(out); out=NULL; olen=0;
+
+    /* Odd-length hex is still caught by the decoder, before the size check. */
+    rc = stratum_handle_message(s, c,
+        "{\"id\":6,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"aabbc\",\"60000000\",\"00000004\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+    CHECK(obs.shares == 1);
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* ---- concurrency: tip watcher vs. submitting connections ----------------
+ *
+ * The direct proof for the two use-after-frees this suite could not previously
+ * reach. One thread rotates the job (as the tip watcher does), which walks
+ * every registered connection and re-renders its coinbase — freeing cb1/cb2 —
+ * and retires the old job, which frees it once the ring wraps. Meanwhile N
+ * threads submit shares, each of which borrows a job pointer from find_job()
+ * and reads cb1/cb2 to assemble a coinbase.
+ *
+ * Before the fixes this reliably tripped ASan (heap-use-after-free in
+ * handle_submit's memcpy, or inside assemble_block_hex) and TSan (data race on
+ * cb1/cb1_len and on the vardiff fields). It is a stress test, not a
+ * deterministic one: run it under -fsanitize=address or =thread for it to mean
+ * anything. Without a sanitizer it still exercises the paths and must not
+ * crash. */
+#define RACE_CONNS   4
+#define RACE_SUBMITS 400
+#define RACE_JOBS    300
+
+typedef struct {
+    stratum_server_t *s;
+    stratum_conn_t   *c;
+    int               id;
+} race_arg_t;
+
+static atomic_int race_stop;
+
+static void *race_submit_thread(void *arg) {
+    race_arg_t *a = (race_arg_t *)arg;
+    char msg[256];
+    for (int i = 0; i < RACE_SUBMITS && !atomic_load(&race_stop); ++i) {
+        char *out = NULL; size_t olen = 0;
+        /* Alternate between the job most likely to be current and an older
+         * one, so both the current_job and recent-ring paths of find_job()
+         * get exercised against a concurrent retire. */
+        snprintf(msg, sizeof msg,
+                 "{\"id\":9,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J%d\",\"%08x\",\"60000000\",\"%08x\"]}",
+                 (i % 2) ? (i % RACE_JOBS) : ((i + 3) % RACE_JOBS),
+                 (unsigned)(a->id * 1000 + i), (unsigned)i);
+        stratum_handle_message(a->s, a->c, msg, &out, &olen);
+        free(out);
+    }
+    return NULL;
+}
+
+/* Drain the miner side of each socketpair. Without a reader the kernel buffer
+ * fills, the broadcast's write blocks, and the whole test wedges — which is
+ * precisely the head-of-line stall SO_SNDTIMEO now bounds in production. Here
+ * we want the race, not the stall, so we act like a miner that reads. */
+static void *race_drain_thread(void *arg) {
+    int fd = *(int *)arg;
+    char sink[4096];
+    while (!atomic_load(&race_stop)) {
+        ssize_t n = recv(fd, sink, sizeof sink, MSG_DONTWAIT);
+        if (n > 0) continue;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000L };
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void *race_job_thread(void *arg) {
+    stratum_server_t *s = (stratum_server_t *)arg;
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);   /* everything is a "block" -> assembles */
+    for (int i = 0; i < RACE_JOBS && !atomic_load(&race_stop); ++i) {
+        char jid[16];
+        snprintf(jid, sizeof jid, "J%d", i);
+        stratum_job_t *j = make_test_job(jid, net);
+        if (!j) break;
+        stratum_server_set_job(s, j);
+    }
+    return NULL;
+}
+
+static void test_job_rotation_races_submits(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = RACE_CONNS,
+                           .initial_diff = 1.0,
+                           .vardiff_enabled = 1, .vardiff_window_sec = 1,
+                           .vardiff_target_spm = 60, .vardiff_min = 0.001,
+                           .vardiff_max = 1e6,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    atomic_store(&race_stop, 0);
+
+    uint8_t net[32];
+    memset(net, 0xff, sizeof net);
+    stratum_server_set_job(s, make_test_job("J0", net));
+
+    /* Each connection needs a real fd and a place in the broadcast list, or
+     * set_job skips it and the race under test never happens. socketpair
+     * gives us a writable fd that nothing has to read. */
+    stratum_conn_t *conns[RACE_CONNS];
+    int             fds[RACE_CONNS][2];
+    race_arg_t      args[RACE_CONNS];
+    pthread_t       subs[RACE_CONNS], jobthr;
+
+    for (int i = 0; i < RACE_CONNS; ++i) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
+        conns[i] = stratum_conn_new_for_test(s);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, conns[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+            &out, &olen); free(out); out = NULL; olen = 0;
+        stratum_handle_message(s, conns[i],
+            "{\"id\":2,\"method\":\"mining.authorize\","
+             "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+            &out, &olen); free(out);
+        /* Precondition: without an authorized, subscribed conn the broadcast
+         * loop skips it and this test would prove nothing. */
+        CHECK(stratum_conn_authorized_for_test(conns[i]) == 1);
+        CHECK(stratum_conn_subscribed_for_test(conns[i]) == 1);
+        stratum_conn_register_for_test(s, conns[i], fds[i][0]);
+        args[i].s = s; args[i].c = conns[i]; args[i].id = i;
+    }
+
+    pthread_t drains[RACE_CONNS];
+    int       peer[RACE_CONNS];
+    for (int i = 0; i < RACE_CONNS; ++i) {
+        peer[i] = fds[i][1];
+        pthread_create(&drains[i], NULL, race_drain_thread, &peer[i]);
+    }
+
+    pthread_create(&jobthr, NULL, race_job_thread, s);
+    for (int i = 0; i < RACE_CONNS; ++i)
+        pthread_create(&subs[i], NULL, race_submit_thread, &args[i]);
+
+    for (int i = 0; i < RACE_CONNS; ++i) pthread_join(subs[i], NULL);
+    atomic_store(&race_stop, 1);
+    pthread_join(jobthr, NULL);
+    for (int i = 0; i < RACE_CONNS; ++i) pthread_join(drains[i], NULL);
+
+    /* Some work has to have landed, or the threads raced past each other
+     * without ever meeting and the test is vacuous. */
+    CHECK(obs.shares + obs.rejects > 0);
+
+    for (int i = 0; i < RACE_CONNS; ++i) {
+        close(fds[i][0]);
+        close(fds[i][1]);
+    }
+    stratum_server_free(s);   /* frees the registered conns' jobs; conns below */
+    for (int i = 0; i < RACE_CONNS; ++i) stratum_conn_free_for_test(conns[i]);
 }
 
 /* Invalid Bitcoin address as the username must be rejected outright. */
@@ -874,6 +1115,8 @@ int main(void) {
     test_authorize_triggers_setdiff_notify();
     test_submit_unknown_job();
     test_submit_share_and_dedupe();
+    test_submit_rejects_wrong_extranonce2_size();
+    test_job_rotation_races_submits();
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();

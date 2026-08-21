@@ -921,6 +921,10 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    /* Before ANY socket exists. stratum_server_start() spawns the listener,
+     * so setting this afterwards left a window where a miner that connected
+     * and vanished could kill the process with SIGPIPE on the first write. */
+    signal(SIGPIPE, SIG_IGN);
     const char *cfg_path = "./proxy.conf";
     if (argc > 1) {
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
@@ -1150,7 +1154,6 @@ int main(int argc, char **argv) {
     sa.sa_handler = on_signal;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
 
     /* Tip watcher thread. */
     pthread_t watcher;
