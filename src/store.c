@@ -1541,11 +1541,9 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
     return 0;
 }
 
-int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
-                            const char *block_hash,
-                            const pplns_payout_t *payouts, size_t n_payouts,
+int store_prop_settle_block(store_t *s, uint64_t ts_ms,
                             const pplns_claim_t *ledger, size_t n_ledger) {
-    if (!s || !block_hash) return -1;
+    if (!s) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
@@ -1591,31 +1589,13 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
         }
     }
 
-    /* Record the block. */
-    static const char *Q_BLOCK =
-        "INSERT INTO blocks_found (ts, height, hash, finder_id, finder_address,"
-        "  reward_sats, fee_sats) VALUES (?, ?, ?, NULL, ?, ?, ?)";
-    if (sqlite3_prepare_v2(s->db, Q_BLOCK, -1, &st, NULL) != SQLITE_OK) {
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        atomic_fetch_add(&s->pg_errors, 1);
-        return -1;
-    }
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)(ts_ms / 1000));
-    sqlite3_bind_int  (st, 2, height);
-    sqlite3_bind_text (st, 3, block_hash, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text (st, 4, n_payouts ? payouts[0].address : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 5, 0);
-    sqlite3_bind_int64(st, 6, 0);
-    rc = sqlite3_step(st);
-    sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) {
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        atomic_fetch_add(&s->pg_errors, 1);
-        return -1;
-    }
-
+    /* ⛔ This function does NOT write blocks_found. on_block_found_cb() calls
+     * store_record_block() for EVERY block, pooled or solo, and that row is the
+     * complete one — finder_id, finder_address, reward_sats, fee_sats. A second
+     * insert here (finder NULL, reward 0) duplicated every pooled block in the
+     * table and double-counted blocks_committed: 27 rows for 26 blocks, observed
+     * on regtest 2026-08-20. The settle path owns prop_ledger, nothing else. */
     sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
-    atomic_fetch_add(&s->blocks_committed, 1);
     return 0;
 }
 

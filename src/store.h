@@ -237,13 +237,14 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
                             pplns_addr_t **out, size_t *n);
 
 /* Apply the result of a found block: replace prop_ledger with the post-block
- * deferred claims and insert a row into blocks_found. payouts/n_payouts are the
- * coinbase outputs; ledger/n_ledger is the complete new ledger, which replaces
+ * deferred claims. ledger/n_ledger is the complete new ledger, which replaces
  * the stored one wholesale — a settled claim is absent from it rather than
- * zeroed. Returns 0 ok, negative on error. */
-int store_prop_settle_block(store_t *s, uint64_t ts_ms, int height,
-                            const char *block_hash,
-                            const pplns_payout_t *payouts, size_t n_payouts,
+ * zeroed.
+ *
+ * ⛔ Does NOT touch blocks_found. store_record_block() is the sole writer of
+ * that table and is called for every block; a second insert here duplicated
+ * every pooled block (see store.c). Returns 0 ok, negative on error. */
+int store_prop_settle_block(store_t *s, uint64_t ts_ms,
                             const pplns_claim_t *ledger, size_t n_ledger);
 
 #endif /* SIMPLEPOOL_STORE_H */

@@ -767,8 +767,7 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         pthread_mutex_unlock(&s->lock);
 
         if (found) {
-            if (store_prop_settle_block(s->store, ts_ms, (int)height, block_hash,
-                                        settled.payouts, settled.n_payouts,
+            if (store_prop_settle_block(s->store, ts_ms,
                                         settled.ledger, settled.n_ledger) < 0) {
                 LOG_ERROR("proportional: settling block %s (job %s) failed — "
                           "%zu payouts and %zu deferred claims are NOT recorded",

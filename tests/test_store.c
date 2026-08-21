@@ -855,14 +855,26 @@ static void test_proportional(void) {
     assert(n_ledger_out > 0);   /* somebody was deferred at this threshold */
 
     /* Settle the block and verify the ledger round-trips through SQLite. */
-    rc = store_prop_settle_block(s, base_ts + 200, 100, "blockhash1",
-                                 payouts, n_payouts, ledger_buf, n_ledger_out);
+    /* The real block row is written by store_record_block(), exactly as
+     * on_block_found_cb() does it for every block, pooled or solo. */
+    assert(store_record_block(s, (base_ts + 200) * 1000ULL, 100, "blockhash1",
+                              "worker1", addrs[0].address, reward, 0) == 0);
+
+    rc = store_prop_settle_block(s, base_ts + 200, ledger_buf, n_ledger_out);
     assert(rc == 0);
+    store_flush(s);
 
     sqlite3 *db = NULL;
     assert(sqlite3_open(path, &db) == SQLITE_OK);
+    /* REGRESSION: settling must not write a second blocks_found row. It used to,
+     * with finder NULL and reward 0, so every pooled block was counted twice —
+     * 27 rows for 26 blocks on regtest, 2026-08-20. store_record_block() is the
+     * sole writer; if this reads 2, the duplicate insert is back. */
     int64_t nblocks = scalar_i64(db, "SELECT count(*) FROM blocks_found");
     assert(nblocks == 1);
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found "
+                          "WHERE finder_id IS NULL OR reward_sats IS NULL "
+                          "   OR reward_sats = 0") == 0);
 
     pplns_claim_t *stored = NULL;
     size_t n_stored = 0;
@@ -890,8 +902,7 @@ static void test_proportional(void) {
                                ledger_buf, 16, n_ledger_out, &n_second,
                                300000LL, 12, payouts, &n_payouts);
     assert(rc == 0);
-    rc = store_prop_settle_block(s, base_ts + 300, 101, "blockhash2",
-                                 payouts, n_payouts, ledger_buf, n_second);
+    rc = store_prop_settle_block(s, base_ts + 300, ledger_buf, n_second);
     assert(rc == 0);
     free(stored);
     stored = NULL;
