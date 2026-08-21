@@ -54,6 +54,30 @@ over roughly that period, which is worth telling miners plainly.
 Whole seconds are indivisible: every share sharing the boundary timestamp
 is included, so the window never splits a second between two miners.
 
+### Block-shares are part of the window
+
+A share that also clears the network target is counted in the window like
+any other share. It is work the miner performed, and the finder receives no
+separate payment in this mode — the plan replaces the coinbase outputs
+wholesale — so counting it pays nobody twice.
+
+This is not a detail. `vardiff` clamps the share difficulty so it never
+exceeds the network difficulty, because a share target harder than the
+network target makes miners locally discard hashes that are valid blocks.
+Whenever that clamp binds — a fresh chain, a difficulty reset, the
+minimum-difficulty window after a fork — the share target *equals* the
+network target, and **every accepted share is also a block.**
+
+Excluding block-shares from the window therefore does not cost a rounding
+error in that regime; it empties the window completely, and every block
+falls through to the finder-pays fallback. The pool keeps reporting itself
+as `proportional` while paying out as solo, with no error and no warning.
+The same applies to any hashrate estimate built on the shares table: filter
+block-shares and every miner reads zero.
+
+Expect coarse accounting while the clamp binds, since each share is a
+lottery ticket for a whole block — but expect it to be *proportional*.
+
 ## Payout computation, per template
 
 1. Aggregate the window by **payout address** (not worker name — see
