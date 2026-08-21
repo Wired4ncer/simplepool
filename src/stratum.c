@@ -1264,6 +1264,10 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     char block_hash_hex[65] = {0};
+    /* Did the NODE take this block onto the best chain? Stays 0 unless
+     * on_block says so, which also covers the case where the block could not
+     * be assembled and was never submitted at all. */
+    int  block_accepted = 0;
     if (is_block) {
         bytes_to_hex(hash_be, 32, block_hash_hex);
         if (!meets_worker) {
@@ -1274,8 +1278,13 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         char *block_hex = assemble_block_hex(job, cb, cb_len, header);
         if (block_hex) {
-            if (s->cfg.on_block) s->cfg.on_block(s->cfg.ctx, block_hex);
+            if (s->cfg.on_block)
+                block_accepted = (s->cfg.on_block(s->cfg.ctx, block_hex) == 0);
             free(block_hex);
+        } else {
+            LOG_ERROR("stratum: could not assemble the block for '%s' at "
+                      "height %u — nothing was submitted", c->worker_name,
+                      job->height);
         }
     }
     free(cb);
@@ -1292,7 +1301,25 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * a mining.set_difficulty notification if the window has elapsed. */
     c->vd_window_shares++;
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
-    if (is_block && s->cfg.on_block_found) {
+    /* ⛔ Gated on the NODE accepting the block, not on the pool solving it.
+     *
+     * Two miners can solve the same height milliseconds apart. submitblock
+     * takes the first and answers the second "inconclusive": a valid block
+     * that is not in the chain. Recording that as found writes a second
+     * blocks_found row for one height and — far worse — settles the
+     * proportional plan against a reward nobody was ever paid, which breaks
+     * the zero-sum invariant the no-custody design rests on.
+     *
+     * This is rare at real difficulty and routine at minimum difficulty, which
+     * is exactly the window this pool exists to mine. Found by
+     * tests/test_burst_regtest.sh. */
+    if (is_block && !block_accepted) {
+        LOG_INFO("stratum: block %s from '%s' at height %u was NOT accepted by "
+                 "the node — not recording it as found, not settling payouts. "
+                 "The share itself still counts.",
+                 block_hash_hex, c->worker_name, job->height);
+    }
+    if (is_block && block_accepted && s->cfg.on_block_found) {
         int64_t fee_sats = 0;
         if (s->cfg.fee_bps > 0 && s->cfg.operator_address[0]) {
             fee_sats = (job->value_sats * (int64_t)s->cfg.fee_bps) / 10000;

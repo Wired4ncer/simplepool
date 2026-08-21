@@ -56,7 +56,15 @@ typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   int is_block, const char *block_hash_or_null);
 typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
                                    uint64_t ts_ms, const char *reason);
-typedef void (*block_submit_fn)(void *ctx, const char *block_hex);
+/* Submits a solved block to the node. Returns 0 only when the node ACCEPTED it
+ * onto the best chain; non-zero for every other outcome.
+ *
+ * ⚠️ Non-zero is not always an error in the usual sense. Core answers
+ * "inconclusive" for a block that is perfectly valid but lost the race for the
+ * tip to another block at the same height. That block is not in the chain, so
+ * it must not be recorded as found and must not settle payouts — see the
+ * on_block_found gate in submit_share(). */
+typedef int (*block_submit_fn)(void *ctx, const char *block_hex);
 /* Asked once per authorize for a starting share difficulty for this worker,
  * typically from its own recent history. Returns <= 0 when nothing is known,
  * and initial_diff is used instead.
@@ -66,8 +74,11 @@ typedef void (*block_submit_fn)(void *ctx, const char *block_hex);
  * multi-TH/s ASIC starting at difficulty 1 floods the pool for minutes and
  * sheds shares at each step of the climb. */
 typedef double (*difficulty_hint_fn)(void *ctx, const char *worker_name);
-/* Fires once per solved block, after the share has been recorded. Used by
- * main.c to insert into blocks_found with reward/fee/finder address. */
+/* Fires once per solved block, after the share has been recorded, and ONLY
+ * when on_block submitted it and the node accepted it. Used by main.c to
+ * insert into blocks_found with reward/fee/finder address, and to settle the
+ * proportional payout plan. Both of those describe a block that is in the
+ * chain, so neither may run for one that is not. */
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,

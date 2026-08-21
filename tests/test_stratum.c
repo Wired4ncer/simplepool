@@ -44,7 +44,9 @@ static void on_reject(void *ctx, const char *w, uint64_t ts, const char *r) {
     o->rejects++;
     snprintf(o->last_reason, sizeof(o->last_reason), "%s", r ? r : "");
 }
-static void on_block(void *ctx, const char *hex) { (void)ctx; (void)hex; }
+/* Returns 0 = the node accepted it, so the existing tests keep exercising
+ * the on_block_found path. A test for the rejected case sets its own. */
+static int on_block(void *ctx, const char *hex) { (void)ctx; (void)hex; return 0; }
 
 /* Helper: parse the first line of an output buffer. Mutates buf (NUL terminator). */
 static cJSON *parse_first_line(char *buf) {

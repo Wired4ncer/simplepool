@@ -714,16 +714,20 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
     }
 }
 
-static void on_block_cb(void *ctx, const char *block_hex) {
+static int on_block_cb(void *ctx, const char *block_hex) {
     server_ctx_t *s = (server_ctx_t *)ctx;
-    if (!s || !s->btc) return;
+    if (!s || !s->btc) return -1;
     char err[512] = {0};
     int rc = bitcoind_submit_block(s->btc, block_hex, err, sizeof err);
     if (rc == 0) {
         LOG_INFO("submitted block to bitcoind successfully");
     } else {
+        /* Carries "rejected: inconclusive" for a valid block that lost the
+         * race for the tip. The caller uses this to decide whether the block
+         * is recorded at all — it is not merely logged. */
         LOG_ERROR("submitblock failed: %s", err);
     }
+    return rc;
 }
 
 static void on_block_found_cb(void *ctx, const char *worker_name,
