@@ -117,8 +117,9 @@ include tests/test_coinbase.mk
 include tests/test_broadcast.mk
 include tests/test_thunder.mk
 include tests/test_pplns.mk
+include tests/test_config.mk
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_pplns
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_pplns build/test_config
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
@@ -127,6 +128,7 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_broadcast
 	./build/test_thunder
 	./build/test_pplns
+	./build/test_config
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \

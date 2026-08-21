@@ -74,6 +74,27 @@ static char *strtrim(char *s) {
     return s;
 }
 
+/* Truncate the line at a comment introducer.
+ *
+ * `#` only starts a comment at the start of the line or after whitespace, and
+ * never inside double quotes. The old rule was "the first # anywhere", applied
+ * before the key/value split and before unquote() — so a password of p#ssw0rd
+ * silently became p, quoting did not help, and the pool then failed RPC auth
+ * with nothing in the log to say why. coinbase_tag and the address fields had
+ * the same exposure. Inline comments (` # like this`) still work, which is
+ * what proxy.conf.example documents. */
+static void strip_comment(char *line) {
+    int in_quotes = 0;
+    for (char *p = line; *p; ++p) {
+        if (*p == '"') { in_quotes = !in_quotes; continue; }
+        if (*p == '#' && !in_quotes &&
+            (p == line || p[-1] == ' ' || p[-1] == '\t')) {
+            *p = '\0';
+            return;
+        }
+    }
+}
+
 static void unquote(char *s) {
     size_t n = strlen(s);
     if (n >= 2 && s[0] == '"' && s[n - 1] == '"') {
@@ -112,9 +133,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
     int lineno = 0;
     while (fgets(line, sizeof line, f)) {
         lineno++;
-        /* Strip comment. */
-        char *hash = strchr(line, '#');
-        if (hash) *hash = '\0';
+        strip_comment(line);
 
         char *trimmed = strtrim(line);
         if (*trimmed == '\0') continue;
