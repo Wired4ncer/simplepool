@@ -364,6 +364,19 @@ struct store {
     sqlite3_stmt *st_upsert_credit;
     pthread_mutex_t node_tip_mu;   /* serialise binds on st_upsert_node_tip */
 
+    /* Serialises TRANSACTION SCOPES on `db`.
+     *
+     * SQLITE_OPEN_FULLMUTEX makes individual API calls thread-safe, but a
+     * transaction is not one call — and BEGIN..COMMIT is per-connection, not
+     * per-thread. The writer thread and store_prop_settle_block (which runs on
+     * the caller's thread, off the block-found callback) both open one on this
+     * same handle, so whichever lost the race got "cannot start a transaction
+     * within a transaction". That was silent: settle ignored its BEGIN result,
+     * ran its statements inside the WRITER's transaction, and then committed
+     * it early — tearing a share batch in half. Reproduced at ~6/25 runs of
+     * test_store before this lock existed. */
+    pthread_mutex_t tx_mu;
+
     /* Ring buffer */
     event_t  *ring;
     size_t    ring_cap;
@@ -604,6 +617,7 @@ static void process_event(store_t *s, const event_t *ev) {
  * on the attempt that actually commits, so a retried batch is counted once.
  * Returns 0 committed, -1 out of attempts. */
 static int commit_batch(store_t *s, event_t *batch, size_t take) {
+    pthread_mutex_lock(&s->tx_mu);
     for (int attempt = 1; attempt <= STORE_COMMIT_ATTEMPTS; ++attempt) {
         char *err = NULL;
         if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, &err) != SQLITE_OK) {
@@ -619,6 +633,7 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
 
         if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
             atomic_fetch_add(&s->batches, 1);
+            pthread_mutex_unlock(&s->tx_mu);
             return 0;
         }
         LOG_WARN("store: COMMIT failed (attempt %d/%d): %s",
@@ -631,6 +646,7 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
         atomic_fetch_add(&s->pg_errors, 1);
         backoff_sleep(attempt);
     }
+    pthread_mutex_unlock(&s->tx_mu);
     return -1;
 }
 
@@ -821,6 +837,7 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  last_updated = excluded.last_updated";
 
     pthread_mutex_init(&s->node_tip_mu, NULL);
+    pthread_mutex_init(&s->tx_mu, NULL);
 
     if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &s->st_upsert_worker, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_SHARE, -1, &s->st_insert_share, NULL) != SQLITE_OK ||
@@ -865,6 +882,7 @@ void store_close(store_t *s) {
     if (s->st_upsert_credit) sqlite3_finalize(s->st_upsert_credit);
     if (s->db) sqlite3_close(s->db);
     pthread_mutex_destroy(&s->node_tip_mu);
+    pthread_mutex_destroy(&s->tx_mu);
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv_not_empty);
     pthread_cond_destroy(&s->cv_drained);
@@ -1560,21 +1578,43 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
         "    last_settled_ts = excluded.last_settled_ts";
     static const char *Q_CLEAR = "DELETE FROM prop_ledger";
 
-    sqlite3_exec(s->db, "BEGIN TRANSACTION", NULL, NULL, NULL);
+    /* IMMEDIATE, not deferred. A deferred transaction takes its write lock
+     * lazily, and in WAL mode an upgrade after another writer has committed
+     * fails with SQLITE_BUSY_SNAPSHOT — which busy_timeout does NOT retry.
+     * The store's own writer thread commits concurrently with this, so that
+     * is a live possibility, not a theoretical one. */
+    pthread_mutex_lock(&s->tx_mu);
+    if (sqlite3_exec(s->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        LOG_ERROR("store: settle could not open a transaction: %s",
+                  sqlite3_errmsg(s->db));
+        atomic_fetch_add(&s->pg_errors, 1);
+        pthread_mutex_unlock(&s->tx_mu);
+        return -1;
+    }
 
     if (sqlite3_prepare_v2(s->db, Q_CLEAR, -1, &st, NULL) != SQLITE_OK) {
         sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
         atomic_fetch_add(&s->pg_errors, 1);
+        pthread_mutex_unlock(&s->tx_mu);
         return -1;
     }
-    sqlite3_step(st);
+    rc = sqlite3_step(st);
     sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        LOG_ERROR("store: settle could not clear prop_ledger: %s",
+                  sqlite3_errmsg(s->db));
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        pthread_mutex_unlock(&s->tx_mu);
+        return -1;
+    }
 
     for (size_t i = 0; i < n_ledger; i++) {
         if (ledger[i].claim_fraction == 0.0) continue;
         if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &st, NULL) != SQLITE_OK) {
             sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
             atomic_fetch_add(&s->pg_errors, 1);
+            pthread_mutex_unlock(&s->tx_mu);
             return -1;
         }
         sqlite3_bind_text  (st, 1, ledger[i].address, -1, SQLITE_TRANSIENT);
@@ -1585,6 +1625,7 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
         if (rc != SQLITE_DONE) {
             sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
             atomic_fetch_add(&s->pg_errors, 1);
+            pthread_mutex_unlock(&s->tx_mu);
             return -1;
         }
     }
@@ -1595,7 +1636,22 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
      * insert here (finder NULL, reward 0) duplicated every pooled block in the
      * table and double-counted blocks_committed: 27 rows for 26 blocks, observed
      * on regtest 2026-08-20. The settle path owns prop_ledger, nothing else. */
-    sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL);
+    /* The COMMIT return value is the whole ballgame. on_block_found_cb has
+     * ALREADY consumed the plan (memset, so it can never settle twice) by the
+     * time it calls us, so reporting success on a failed commit means: the
+     * plan is gone, prop_ledger still holds the pre-block state, and the
+     * claims this block just paid out in its coinbase stay on the books to be
+     * paid again in the next window. Silently. */
+    if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        LOG_ERROR("store: settle COMMIT failed: %s — prop_ledger is unchanged, "
+                  "so the claims this block paid are still recorded as owed",
+                  sqlite3_errmsg(s->db));
+        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        atomic_fetch_add(&s->pg_errors, 1);
+        pthread_mutex_unlock(&s->tx_mu);
+        return -1;
+    }
+    pthread_mutex_unlock(&s->tx_mu);
     return 0;
 }
 
