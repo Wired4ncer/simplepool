@@ -31,10 +31,14 @@
 # and asserts the invariants that must hold for EVERY one of them.
 #
 # THE INVARIANTS (see PROPORTIONAL_PAYOUTS.md):
-#   1. chain advanced by exactly N
-#   2. exactly N blocks_found rows — no duplicates. Regression guard for
-#      40845c7 "Stop settling a block from writing a second blocks_found row";
-#      a burst is the only thing that makes that class of bug likely.
+#   1. chain advanced by AT LEAST N. Not "exactly": three miners at difficulty
+#      ~0 routinely solve two heights before the round loop can kill them, and
+#      that overshoot is the harness losing a race, not a pool defect.
+#   2. exactly as many blocks_found rows as the CHAIN GAINED — no duplicates,
+#      and nothing extra. Regression guard for 40845c7 "Stop settling a block
+#      from writing a second blocks_found row" and for 9212fac "Only record and
+#      settle a block the node actually accepted"; a burst is the only thing
+#      that makes that class of bug likely.
 #   3. no (height,hash) recorded twice
 #   4. every coinbase pays out EXACTLY subsidy+fees. Under and the difference
 #      is never minted; over and the block is invalid. Checked per block
@@ -201,13 +205,22 @@ POOL_PID=$!
 for _ in $(seq 1 20); do nc -z 127.0.0.1 "$POOL_PORT" 2>/dev/null && break; sleep 1; done
 kill -0 "$POOL_PID" 2>/dev/null || fail "simplepool died on startup"
 
-stage "mine $BURST_BLOCKS blocks BACK-TO-BACK through the real stratum path"
+stage "mine at least $BURST_BLOCKS blocks BACK-TO-BACK through the real stratum path"
 TIP_BEFORE=$(cli getblockcount)
-echo "  tip before: $TIP_BEFORE"
+TARGET=$((TIP_BEFORE + BURST_BLOCKS))
+echo "  tip before: $TIP_BEFORE   target: $TARGET"
 BURST_START=$(date +%s)
 LAST_TS=$BURST_START
 GAPS=""
-for n in $(seq 1 "$BURST_BLOCKS"); do
+SEEN=$TIP_BEFORE
+ROUND=0
+# A round can yield more than one block, so rounds are not blocks. Bound the
+# loop anyway: without this a pool that stops finding blocks spins forever.
+MAX_ROUNDS=$((BURST_BLOCKS * 3 + 6))
+while [ "$SEEN" -lt "$TARGET" ]; do
+    ROUND=$((ROUND + 1))
+    [ "$ROUND" -le "$MAX_ROUNDS" ] \
+        || fail "gave up after $MAX_ROUNDS rounds at height $SEEN (target $TARGET)"
     # Miners run CONCURRENTLY: several claimants in one PPLNS window is the
     # case a single-miner test can never produce. The first to find the block
     # ends the round; the rest are killed and reconnect on the next iteration.
@@ -235,22 +248,43 @@ for n in $(seq 1 "$BURST_BLOCKS"); do
         sleep 0.5
     done
     for p in $pids; do kill "$p" 2>/dev/null || true; done
-    wait 2>/dev/null || true
-    [ "$found" -eq 1 ] || fail "round $n: chain did not advance past $height_before"
+    # Wait ONLY on the miner pids. A bare `wait` waits on EVERY background job
+    # of this script, and simplepool is one of them ($POOL_PID, started with &
+    # above) — it never exits, so the harness parked here forever at the end of
+    # round 1, in do_wait, with the blocks already found and the miners already
+    # reaped. The symptom looked like a pool stall and was not one.
+    for p in $pids; do wait "$p" 2>/dev/null || true; done
+    [ "$found" -eq 1 ] || fail "round $ROUND: chain did not advance past $height_before"
 
     now=$(date +%s)
-    GAPS="$GAPS $((now - LAST_TS))"
+    h=$(cli getblockcount)
+    # A round routinely yields MORE than one block: at difficulty ~0 several
+    # miners solve within milliseconds of each other and keep right on mining
+    # while the kill is still in flight. Book one gap per block actually
+    # gained so the throughput figure stays per-block, not per-round.
+    gained=$((h - SEEN))
+    for _ in $(seq 1 "$gained"); do
+        GAPS="$GAPS $(( (now - LAST_TS) / gained ))"
+    done
     LAST_TS=$now
-    printf "  block %2d/%d found (tip=%s, +%ss)\n" \
-        "$n" "$BURST_BLOCKS" "$(cli getblockcount)" "$((now - BURST_START))"
+    SEEN=$h
+    printf "  round %2d: +%d block(s) -> tip=%s (%d/%d, +%ss)\n" \
+        "$ROUND" "$gained" "$h" "$((SEEN - TIP_BEFORE))" "$BURST_BLOCKS" \
+        "$((now - BURST_START))"
 done
 BURST_END=$(date +%s)
 TIP_AFTER=$(cli getblockcount)
+BLOCKS_MINED=$((TIP_AFTER - TIP_BEFORE))
 
-stage "INVARIANT 1 — chain advanced by exactly $BURST_BLOCKS"
-echo "  height: $TIP_BEFORE -> $TIP_AFTER"
-[ "$((TIP_AFTER - TIP_BEFORE))" -eq "$BURST_BLOCKS" ] \
-    || fail "expected +$BURST_BLOCKS blocks, got +$((TIP_AFTER - TIP_BEFORE))"
+stage "INVARIANT 1 — chain advanced by at least $BURST_BLOCKS"
+# "At least", not "exactly". Overshoot is a property of the HARNESS losing the
+# race to kill three miners, not of the pool, and asserting an exact count
+# failed the run for the one reason the burst is supposed to produce. What the
+# pool must get right is that it records exactly as many blocks as the chain
+# actually gained — that is INVARIANT 2, against $BLOCKS_MINED.
+echo "  height: $TIP_BEFORE -> $TIP_AFTER  (+$BLOCKS_MINED, asked for $BURST_BLOCKS)"
+[ "$BLOCKS_MINED" -ge "$BURST_BLOCKS" ] \
+    || fail "expected at least +$BURST_BLOCKS blocks, got +$BLOCKS_MINED"
 
 stage "INVARIANT 4 — every coinbase pays EXACTLY subsidy+fees"
 # Per block, not just the tip. This is the invariant that cannot be relaxed:
@@ -267,20 +301,32 @@ print(sum(round(o["value"]*1e8) for o in cb["vout"]))')
     [ "$paid" = "$expected" ] \
         || fail "height $h: coinbase pays $paid sats, expected exactly $expected"
 done
-echo "  ✓ all $BURST_BLOCKS coinbases pay the reward exactly"
+echo "  ✓ all $BLOCKS_MINED coinbases pay the reward exactly"
 
 stage "stop the pool cleanly to flush the batched writer"
+# Patience must exceed the GBT long poll. main.c does pthread_join(watcher)
+# as the FIRST step of shutdown, and the watcher sits in a blocking long-polled
+# getblocktemplate that parks up to 30 s. Nothing interrupts it, so SIGINT-to-
+# exit is bounded by however much of that park is left. During mining every
+# poll returns instantly (the chain keeps advancing), so the park only appears
+# once the miners are dead — i.e. exactly here. 10 s was not enough and failed
+# a run whose mining had been perfect.
 sleep 1
 kill -INT "$POOL_PID" 2>/dev/null || true
-for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$POOL_PID" 2>/dev/null || break; sleep 1; done
-kill -0 "$POOL_PID" 2>/dev/null && fail "pool did not exit on SIGINT"
+for _ in $(seq 1 45); do kill -0 "$POOL_PID" 2>/dev/null || break; sleep 1; done
+kill -0 "$POOL_PID" 2>/dev/null \
+    && fail "pool did not exit on SIGINT within 45 s (longer than one long-poll park)"
 POOL_PID=""
 
-stage "INVARIANT 2 — exactly $BURST_BLOCKS blocks_found rows, no duplicates"
+stage "INVARIANT 2 — exactly $BLOCKS_MINED blocks_found rows, no duplicates"
+# Counted against what the CHAIN gained, not against BURST_BLOCKS: every block
+# the pool mined must be recorded once, and nothing else may be. A block that
+# lost a submitblock race ("inconclusive") is not one the chain gained and must
+# not appear here — cf. 9212fac.
 ROWS=$(sqlite3 "$POOL_DB" "SELECT count(*) FROM blocks_found")
-echo "  blocks_found rows: $ROWS"
-[ "$ROWS" -eq "$BURST_BLOCKS" ] \
-    || fail "expected exactly $BURST_BLOCKS blocks_found rows, got $ROWS (duplicate settle? cf. 40845c7)"
+echo "  blocks_found rows: $ROWS (chain gained $BLOCKS_MINED)"
+[ "$ROWS" -eq "$BLOCKS_MINED" ] \
+    || fail "expected exactly $BLOCKS_MINED blocks_found rows, got $ROWS (duplicate settle? cf. 40845c7 / 9212fac)"
 
 stage "INVARIANT 3 — no (height,hash) recorded twice"
 DUPES=$(sqlite3 "$POOL_DB" \
