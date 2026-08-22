@@ -406,11 +406,16 @@ test('the batch fee sums to exactly one transaction fee', async () => {
     assert.equal(db.prepare('SELECT SUM(fee_sats) f FROM payouts').get().f, 100);
 });
 
-test('a failed batch credits nobody and strands nobody', async () => {
+test('a rejected batch credits nobody and strands nobody', async () => {
     const db = makeDb({ owed: { rig1: 5_000_000, rig2: 6_000_000, rig3: 7_000_000 } });
     const thunder = thunderStub();
+    /* The node answered and declined — a mempool rejection is the everyday
+     * shape of this. Nothing was broadcast, so the rows must be released and
+     * the batch retried; parking it for a human here would turn the most
+     * common transient failure into an outage. The unanswered case is the
+     * opposite and is covered below. */
     thunder.transferBatchDetailed = async () => {
-        const e = new Error('boom'); e.stage = 'submit'; throw e;
+        const e = new Error('boom'); e.stage = 'submit'; e.rpcRejected = true; throw e;
     };
     const r = await runOnce({ db, thunder, cfg }, quietLog);
     assert.equal(r.paid, 0);
@@ -487,4 +492,126 @@ test('a single batch is unaffected by the ordering change', () => {
     assert.equal(p.txid, 'tx_a');
     assert.equal(p.rows.length, 2);
     assert.equal(p.started_at, 4242);
+});
+
+/* ---------- a failed broadcast must not become a second broadcast --------- */
+
+/* The three stages are not equivalent, and treating them as one was a
+ * double-pay. create and sign are local calls that cannot have reached the
+ * network; submit can have been accepted and then lost its reply, and on
+ * thunder >= 0.17.1 create_transfer signs and broadcasts internally, so the
+ * funds are definitely out. Releasing the in-flight rows on submit hands the
+ * same batch to the next tick, which rebroadcasts as soon as the first
+ * transaction confirms and frees its inputs — paying twice, every tick, until
+ * the reserve is gone. */
+
+function failingThunder(stage, { message = 'boom', txid = null,
+                                 rpcRejected = false } = {}) {
+    const t = thunderStub();
+    t.transferBatchDetailed = async () => {
+        t.calls.transfers++;
+        const e = new Error(message);
+        e.stage = stage;
+        if (txid) e.txid = txid;
+        if (rpcRejected) e.rpcRejected = true;
+        throw e;
+    };
+    return t;
+}
+
+/* sign is local on every thunder that reaches it, and an ANSWERED create is
+ * the node declining to act. Both are clean aborts. */
+for (const [stage, opts] of [['sign', {}], ['create', { rpcRejected: true }]]) {
+    test(`a ${stage}-stage failure is a clean abort and retries`, async () => {
+        const db = makeDb({ owed: { rig1: 5_000_000 } });
+        const r = await runOnce({ db, thunder: failingThunder(stage, opts), cfg }, quietLog);
+
+        assert.equal(r.ambiguous, false, `${stage} cannot have reached the network`);
+        assert.equal(inFlightRows(db), 0, 'rows are released so the next tick retries');
+        assert.equal(credited(db), 0);
+
+        /* The retry is the point: with the rows gone the worker is due again. */
+        const again = await runOnce({ db, thunder: thunderStub(), cfg }, quietLog);
+        assert.equal(again.broadcast, 1);
+    });
+}
+
+test('an UNANSWERED create keeps the rows — 0.17.1 broadcasts inside create', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const r = await runOnce({ db, thunder: failingThunder('create'), cfg }, quietLog);
+
+    assert.equal(r.ambiguous, true,
+        'create_transfer signs and broadcasts internally on thunder >= 0.17.1, ' +
+        'so an unanswered call may already be on the network');
+    assert.equal(credited(db), 0, 'nothing is credited — it may never have landed');
+    assert.equal(inFlightRows(db), 1, 'the row STAYS: this may already be on the network');
+
+    const next = thunderStub();
+    await runOnce({ db, thunder: next, cfg }, quietLog);
+    assert.equal(next.calls.transfers, 0, 'a second broadcast here is a double payment');
+
+    assert.equal(listStuck(db, 0, nowSec() + 1).length, 1, 'reported for an operator');
+});
+
+test('a rejected submit is a clean abort and retries', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = failingThunder('submit', { rpcRejected: true });
+    const r = await runOnce({ db, thunder, cfg }, quietLog);
+
+    assert.equal(r.ambiguous, false, 'the node answered: nothing went out');
+    assert.equal(inFlightRows(db), 0);
+
+    const next = thunderStub();
+    assert.equal((await runOnce({ db, thunder: next, cfg }, quietLog)).broadcast, 1);
+});
+
+test('an UNANSWERED submit keeps the rows so the batch cannot go out twice', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const r = await runOnce({ db, thunder: failingThunder('submit'), cfg }, quietLog);
+
+    assert.equal(r.ambiguous, true);
+    assert.equal(credited(db), 0, 'nothing is credited — it may never have landed');
+    assert.equal(inFlightRows(db), 1, 'the row STAYS: this may already be on the network');
+    assert.equal(pendingBatch(db), null, 'no txid, so it is not a settleable batch');
+
+    /* The next tick must not rebroadcast: listDue skips workers holding an
+     * in-flight row, which is what makes the at-most-once guarantee hold. */
+    const next = thunderStub();
+    const again = await runOnce({ db, thunder: next, cfg }, quietLog);
+    assert.equal(next.calls.transfers, 0, 'a second broadcast here is a double payment');
+    assert.equal(again.attempted, 0);
+
+    /* And it is reported for the operator rather than left silent. */
+    assert.equal(listStuck(db, 0, nowSec() + 1).length, 1);
+});
+
+test('an unknown stage is treated as possibly-broadcast', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const t = thunderStub();
+    t.transferBatchDetailed = async () => { throw new Error('no stage attached'); };
+
+    const r = await runOnce({ db, thunder: t, cfg }, quietLog);
+
+    assert.equal(r.ambiguous, true, '"where did it fail" unknown means "it may have gone out"');
+    assert.equal(inFlightRows(db), 1);
+});
+
+test('a txid known at failure time is recorded for reconciliation', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const thunder = failingThunder('submit', {
+        message: 'thunder already broadcast abc123 paying the full total to addr1',
+        txid: 'abc123',
+    });
+
+    await runOnce({ db, thunder, cfg }, quietLog);
+
+    const att = db.prepare(
+        `SELECT status, stage, txid FROM tx_attempts ORDER BY id DESC LIMIT 1`).get();
+    assert.equal(att.status, 'failed');
+    assert.equal(att.stage, 'submit');
+    assert.equal(att.txid, 'abc123',
+        'the operator cannot reconcile a broadcast whose txid was thrown away');
+    /* Still not stamped onto the in-flight row: that would let a later tick
+     * settle it and credit workers this transaction did not actually pay. */
+    assert.equal(pendingBatch(db), null);
 });

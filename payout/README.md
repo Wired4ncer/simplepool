@@ -167,8 +167,16 @@ Two situations need an operator. Neither is auto-resolved, because both turn
 on a question only a human can answer: *did this transaction make it onto the
 sidechain?*
 
-**A row with no txid.** The worker died around the broadcast, so it is unknown
-whether anything went out. Check the Thunder node, then:
+**A row with no txid.** It is unknown whether anything went out. Two things
+produce this: the worker died around the broadcast, or the broadcast itself
+failed without the node answering — a timeout, a dropped connection, or any
+error that is not a JSON-RPC rejection. A rejection *is* an answer ("nothing
+was broadcast"), so those rows are released automatically and the batch simply
+retries; only the genuinely unanswered case is left here, because a broadcast
+that happened cannot be told apart from one that did not, and guessing wrong
+pays the batch twice.
+
+Check the Thunder node, then:
 
 ```sh
 # the tx is live or mined — adopt it, and the normal settle path takes over

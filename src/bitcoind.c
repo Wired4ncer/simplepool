@@ -343,6 +343,20 @@ int bitcoind_parse_template(void *result_json,
 
     if (has_value) {
         t->coinbase_value_sats = (int64_t)jc->valuedouble;
+        /* BIP22 allows a server to send both. We keep using coinbasevalue and
+         * build our own coinbase, which silently drops whatever the server put
+         * in coinbasetxn — for the CUSF enforcer that is the mandatory
+         * BIP300/301 commitments, so the blocks stop being able to carry a
+         * sidechain, and pool_mode=proportional loses the shared coinbase it
+         * needs and pays every block to its finder instead. Nothing else
+         * reports that, so say it here. Changing which one wins is a
+         * behavioural change and is deliberately NOT made silently. */
+        if (has_cbtxn) {
+            LOG_WARN("getblocktemplate returned BOTH coinbasevalue and "
+                     "coinbasetxn; using coinbasevalue and building our own "
+                     "coinbase, which drops any commitments the server put in "
+                     "coinbasetxn (proportional mode needs coinbasetxn)");
+        }
     } else {
         /* coinbasetxn: keep the raw coinbase hex; the value is reported as a
          * negative "fee" (fee = -sum(coinbase outputs)), so negate it. */

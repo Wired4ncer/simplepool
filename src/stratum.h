@@ -175,6 +175,11 @@ const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
 
+/* Live connection threads. Zero after stratum_server_stop() returns is the
+ * observable form of "no connection thread can touch this server again",
+ * which is what makes tearing the server down afterwards safe. */
+int         stratum_server_conn_count_for_test(const stratum_server_t *s);
+
 /* Apply the same socket options the listener applies to every accepted
  * connection: TCP_NODELAY, SO_KEEPALIVE + TCP_KEEP{IDLE,INTVL,CNT}, and
  * SO_RCVTIMEO (poll interval derived from idle_timeout_sec). Exposed for

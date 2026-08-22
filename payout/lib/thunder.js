@@ -49,7 +49,17 @@ export class ThunderClient {
         const body = await res.json();
         if (body.error) {
             const e = body.error;
-            throw new Error(`thunder rpc ${method}: ${e.code} ${e.message}`);
+            const err = new Error(`thunder rpc ${method}: ${e.code} ${e.message}`);
+            /* The node ran the method and answered with an error. For
+             * submit_transaction that is a definitive "not broadcast" — the
+             * ordinary case being a mempool rejection — which lets the payout
+             * loop release the batch and retry instead of parking it for a
+             * human. Everything else that can throw here (transport failure,
+             * abort/timeout, a non-JSON or non-200 reply) means we never got an
+             * answer, carries no such flag, and must be treated as "it may have
+             * gone out". See runOnce in payout.js. */
+            err.rpcRejected = true;
+            throw err;
         }
         return body.result;
     }
@@ -150,11 +160,17 @@ export class ThunderClient {
         if (nodeTxid !== null) {
             const distinct = new Set(recipients.map(r => r.address));
             if (distinct.size !== 1) {
-                throw fail('submit', new Error(
+                const err = fail('submit', new Error(
                     `transferBatch: thunder already broadcast ${nodeTxid} paying the ` +
                     `full ${total} sats to ${recipients[0].address}, but this batch has ` +
                     `${distinct.size} distinct addresses. Funds are on the network -- ` +
                     `reconcile by hand (payout/README.md).`));
+                /* The txid is known here even though this is an error path, and it
+                 * is the one thing reconciliation cannot proceed without. Carry it
+                 * so the caller records it in tx_attempts rather than leaving the
+                 * operator to find the transaction themselves. */
+                err.txid = nodeTxid;
+                throw err;
             }
             return { txid: nodeTxid, unsigned: null, signed: null,
                      recipients: recipients.length, total, broadcastByNode: true };
