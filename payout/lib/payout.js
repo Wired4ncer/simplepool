@@ -291,19 +291,61 @@ export async function runOnce(ctx, log) {
         res = await thunder.transferBatchDetailed(
             batch.map(b => ({ address: b.address, sats: b.sats })), TX_FEE_SATS);
     } catch (e) {
-        /* The whole batch fails together, which is the point: no worker is
-         * credited for a transaction that did not go out. */
-        abortBatch(db, rowIds);
+        /* Whether these rows may be released depends on WHERE it failed.
+         *
+         * create and sign are local: nothing reached the network, so this is a
+         * clean abort and the next tick retries with paid_sats untouched.
+         *
+         * submit splits in two, and the split is the whole point.
+         *
+         * If the node ANSWERED with an error (e.rpcRejected — a mempool
+         * rejection being the everyday case) it ran the method and declined:
+         * nothing was broadcast, so this is a clean abort too and the next tick
+         * retries normally. That is the common path and it must stay cheap.
+         *
+         * If we never got an answer, it is not. The node may have accepted the
+         * transaction and lost the reply, and on thunder >= 0.17.1 it has
+         * DEFINITELY broadcast — create_transfer signs and sends internally,
+         * paying the whole total to one address (see transferBatchDetailed).
+         * Deleting the in-flight rows there hands the same batch back to the
+         * next tick, which rebroadcasts the moment the first transaction
+         * confirms and frees its inputs. That pays twice, and repeats every
+         * tick until the reserve is empty.
+         *
+         * So on an unanswered submit the rows STAY, with txid='' — listDue
+         * keeps skipping these workers and listStuck reports them. That is
+         * exactly the ambiguous state the crash-semantics contract at the top
+         * of this file already defines, and the only honest one: a broadcast
+         * that happened cannot be told apart from one that did not.
+         *
+         * An unknown stage is treated as an unanswered submit. The safe
+         * reading of "we do not know where it failed" is "it may have gone
+         * out". */
+        const clean = e.stage === 'create' || e.stage === 'sign' ||
+                      (e.stage === 'submit' && e.rpcRejected === true);
+        if (clean) abortBatch(db, rowIds);
         recordTxAttempt(db, {
             kind: 'payout', status: 'failed', stage: e.stage || 'unknown',
+            txid: e.txid ?? null,
             rawTx: asRawTx(e.signed || e.unsigned),
             amountSats: totalOwed, feeSats: TX_FEE_SATS,
             destination: batch.length === 1 ? batch[0].address : `${batch.length} recipients`,
             workerId: batch.length === 1 ? batch[0].worker_id : null,
             error: e.message || String(e),
         });
-        log.warn(`payout: batch of ${batch.length} ${e.stage || 'transfer'} failed: ${e.message}`);
-        return { attempted: due.length, paid: 0, failed: due.length, settled };
+        if (clean) {
+            log.warn(`payout: batch of ${batch.length} failed at ${e.stage} — nothing was ` +
+                     `broadcast, retrying next tick: ${e.message}`);
+        } else {
+            log.error(
+                `payout: batch of ${batch.length} failed at ${e.stage || 'an unknown stage'} ` +
+                `and MAY have been broadcast: ${e.message}. Leaving ${batch.length} ` +
+                'in-flight row(s) with no txid so nobody can be paid twice — these ' +
+                'workers stay skipped until an operator reconciles ' +
+                '(payout/README.md -> Reconciling by hand).');
+        }
+        return { attempted: due.length, paid: 0, failed: due.length, settled,
+                 ambiguous: !clean };
     }
 
     recordTxAttempt(db, {

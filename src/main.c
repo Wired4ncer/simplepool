@@ -10,6 +10,7 @@
 #include "stratum.h"
 #include "version.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -573,8 +574,18 @@ static stratum_job_t *build_job_from_template(server_ctx_t *sctx,
         nbits_to_target(t->bits, target_be);
     }
 
+    /* Millisecond clock plus a counter. The clock alone is not unique: two
+     * templates built inside the same millisecond — a long-poll return landing
+     * next to the periodic rebuild, or the initial job next to the watcher's
+     * first — get the same id, and then find_job() hands a submit the wrong
+     * job and the proportional settle path credits the wrong window. The
+     * counter makes the id unique within a run regardless of clock resolution
+     * or a clock that steps backwards. */
+    static _Atomic unsigned long job_seq;
     char job_id[32];
-    snprintf(job_id, sizeof job_id, "%llx", (unsigned long long)now_ms());
+    snprintf(job_id, sizeof job_id, "%llx-%lx",
+             (unsigned long long)now_ms(),
+             atomic_fetch_add(&job_seq, 1ul));
 
     /* A server-provided coinbase (BIP22 "coinbasetxn") is segwit-serialized
      * when its version (4 bytes = 8 hex chars) is followed by the segwit
@@ -1258,9 +1269,22 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* Tip watcher thread. */
+    /* Tip watcher thread. Without it nothing ever fetches a new template, so
+     * the pool would hand every miner the same initial job forever while
+     * looking perfectly healthy — fail loudly instead. */
     pthread_t watcher;
-    pthread_create(&watcher, NULL, tip_watcher, &sctx);
+    if (pthread_create(&watcher, NULL, tip_watcher, &sctx) != 0) {
+        fprintf(stderr, "fatal: could not start the tip watcher: %s\n",
+                strerror(errno));
+        LOG_ERROR("fatal: could not start the tip watcher: %s", strerror(errno));
+        stratum_server_stop(srv);
+        stratum_server_free(srv);
+        store_close(store);
+        if (bcast) broadcast_close(bcast);
+        bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
+        return 8;
+    }
 
     /* Main loop: wait for shutdown. */
     while (!g_shutdown) {

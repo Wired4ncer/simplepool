@@ -9,6 +9,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -776,6 +778,52 @@ static void test_extranonce1_unique_across_connections(void) {
     stratum_server_free(s);
 }
 
+/* stratum_server_stop() must not return while a connection thread is alive.
+ *
+ * Connection threads are detached and park in recv() for a whole SO_RCVTIMEO,
+ * so without the drain in stratum_server_stop they outlive the server: main.c
+ * goes straight on to free the server, close the store and destroy the server
+ * context, while a thread is still able to unregister itself through a
+ * destroyed conns_lock and hand a share to a closed store. Shutting each
+ * socket down wakes those threads, and conn_count reaching zero is the proof
+ * they are finished. */
+static void test_stop_waits_for_connection_threads(void) {
+    enum { PORT = 39337 };
+    stratum_cfg_t cfg = { .bind_port = PORT, .max_conns = 8,
+                          .initial_diff = 1.0, .idle_timeout_sec = 30 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0 || !s) {
+        /* Fixed port busy on this machine: nothing to assert, and failing the
+         * run for someone else's listener would be noise. */
+        printf("skip: stop drains connection threads (port %d unavailable)\n", PORT);
+        return;
+    }
+
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(cfd >= 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(PORT);
+    CHECK(inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) == 1);
+    CHECK(connect(cfd, (struct sockaddr *)&a, sizeof a) == 0);
+
+    /* Wait for accept() so a connection thread really is running. */
+    for (int i = 0; i < 500 && stratum_server_conn_count_for_test(s) == 0; ++i)
+        sleep_ms(2);
+    CHECK(stratum_server_conn_count_for_test(s) == 1);
+
+    /* The client sends nothing, so that thread is parked in recv() with 30s of
+     * timeout ahead of it. stop() has to wake it and wait, not walk away. */
+    stratum_server_stop(s);
+    CHECK(stratum_server_conn_count_for_test(s) == 0);
+
+    close(cfd);
+    stratum_server_free(s);
+    printf("ok: stop drains connection threads before returning\n");
+}
+
 /* The per-connection ring keys on (job_id|en2|ntime|nonce|version), so the
  * same solution resubmitted under a *different* job id slips past it. When
  * both jobs carry the same template the header — and therefore the hash — is
@@ -1125,6 +1173,7 @@ int main(void) {
     test_socket_setup_applies_rcvtimeo();
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
+    test_stop_waits_for_connection_threads();
     test_dedupe_same_hash_across_job_ids();
     test_authorize_resumes_difficulty_from_hint();
     test_authorize_without_hint_uses_initial();

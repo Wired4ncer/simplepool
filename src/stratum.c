@@ -1303,21 +1303,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint8_t hash_be[32];
     hash_header(header, hash_be);
 
-    /* Reject before any crediting: this hash is one solution regardless of
-     * which connection produced it or how the submission was framed. */
-    if (share_dedupe_check_and_add(s, hash_be)) {
-        free(cb);
-        LOG_INFO("stratum: reject from worker '%s' - Reason: duplicate share "
-                 "(hash already credited)", c->worker_name);
-        if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "duplicate share");
-        }
-        cJSON *err = make_error(22, "duplicate share");
-        stratum_job_free(job);   /* release find_job's reference */
-        return emit_response(buf, len, id, NULL, err);
-    }
-
     uint8_t worker_target[32];
     worker_diff_to_target(cur_diff, worker_target);
 
@@ -1368,6 +1353,29 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         free(cb);
         cJSON *err = make_error(23, "low difficulty");
+        stratum_job_free(job);   /* release find_job's reference */
+        return emit_response(buf, len, id, NULL, err);
+    }
+
+    /* Only NOW record the hash, once this share is known to be worth
+     * something. The ring is server-wide and finite (SHARE_DEDUPE_RING), and
+     * recording every submission put rejects in it too — a miner sending
+     * garbage, or one whose difficulty is badly mismatched, could evict the
+     * genuine recent hashes it exists to protect. Nothing below this point
+     * rejects on difficulty, so a hash that reaches here is one that will be
+     * credited, submitted, or both, which is exactly what must be deduplicated.
+     *
+     * Still before any crediting: the same hash is one solution however it was
+     * framed, and paying it twice is the thing this prevents. */
+    if (share_dedupe_check_and_add(s, hash_be)) {
+        free(cb);
+        LOG_INFO("stratum: reject from worker '%s' - Reason: duplicate share "
+                 "(hash already credited)", c->worker_name);
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "duplicate share");
+        }
+        cJSON *err = make_error(22, "duplicate share");
         stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
@@ -1509,6 +1517,9 @@ int stratum_conn_authorized_for_test(const stratum_conn_t *c) {
 }
 int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
     return c ? c->subscribed : 0;
+}
+int stratum_server_conn_count_for_test(const stratum_server_t *s) {
+    return s ? atomic_load(&s->conn_count) : 0;
 }
 
 /* ---- real connection thread ------------------------------------------ */
@@ -1686,8 +1697,14 @@ done:
     conn_unregister(s, c);
     close(c->fd);
     c->fd = -1;
-    atomic_fetch_sub(&s->conn_count, 1);
     stratum_conn_free_for_test(c);
+    /* Decrement LAST, after this thread has finished touching both the server
+     * and its own connection. stratum_server_stop waits for this counter to
+     * reach zero before the server is torn down, so it has to mean "no
+     * connection thread will read any of this again" — not "the socket is
+     * closed". Decrementing before the free left the counter at zero while
+     * this thread was still inside stratum_conn_free_for_test. */
+    atomic_fetch_sub(&s->conn_count, 1);
     return NULL;
 }
 
@@ -1837,6 +1854,42 @@ void stratum_server_stop(stratum_server_t *s) {
     if (fd >= 0) {
         close(fd);
         s->listen_fd = -1;
+    }
+
+    /* Then drain the connection threads, and do NOT return until they are gone.
+     *
+     * They are detached and can be parked in recv() for a full SO_RCVTIMEO
+     * (up to 30s), so simply returning here left them running while main.c went
+     * on to free this server, close the store and destroy the server context.
+     * A share arriving in that window was processed against freed memory:
+     * conn_unregister takes a destroyed conns_lock, and on_share/on_reject call
+     * into a closed store. Shutting each socket down wakes its thread
+     * immediately, and conn_count reaching zero is the proof they are finished.
+     *
+     * conns_lock is released before waiting — the threads need it themselves to
+     * unregister, so holding it here would deadlock the very exit we want. */
+    pthread_mutex_lock(&s->conns_lock);
+    for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
+        int cfd = c->fd;
+        if (cfd >= 0) shutdown(cfd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&s->conns_lock);
+
+    /* Bounded so a wedged thread cannot hang the process forever; the timeout
+     * is reported rather than passed over, because continuing past it is the
+     * use-after-free above and the operator needs to know it happened. */
+    const int drain_ms = 5000, step_ms = 2;
+    int waited_ms = 0;
+    while (atomic_load(&s->conn_count) > 0 && waited_ms < drain_ms) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = step_ms * 1000000L };
+        nanosleep(&ts, NULL);
+        waited_ms += step_ms;
+    }
+    int left = atomic_load(&s->conn_count);
+    if (left > 0) {
+        LOG_ERROR("stratum: %d connection thread(s) still running after %dms — "
+                  "continuing shutdown anyway; they may touch freed state",
+                  left, drain_ms);
     }
 }
 
