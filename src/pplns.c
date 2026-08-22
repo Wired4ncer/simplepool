@@ -46,18 +46,38 @@ static int cmp_claim_desc(const void *a, const void *b) {
 }
 
 int pplns_compute_payouts(int64_t reward_after_fee,
-                          double window_difficulty,
                           const pplns_addr_t *addrs, size_t n_addrs,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
                           pplns_payout_t *payouts, size_t *n_payouts_out) {
     if (!addrs || n_addrs == 0 || !payouts || !n_payouts_out ||
-        !ledger || !n_ledger_out || window_difficulty <= 0.0 ||
+        !ledger || !n_ledger_out ||
         reward_after_fee <= 0 || min_payout_sats < COINBASE_DUST_SATS ||
         max_outputs == 0 || ledger_cap < n_addrs + n_ledger_in) {
         return -1;
     }
+
+    /* The denominator is the difficulty ACTUALLY SUPPLIED here, summed, not a
+     * window total measured by a separate query.
+     *
+     * This used to be a caller-provided window_difficulty, and the two can
+     * disagree: store_prop_compute_window() walks the window with its own
+     * cursor while store_prop_window_addrs() aggregates it with a second query,
+     * and a share committed between them — or a share the walk dropped at a
+     * page boundary — lands in one and not the other. Every fraction is then
+     * measured against a total that is not the total, the fractions no longer
+     * sum to 1.0, and the zero-sum ledger update below silently mis-assigns the
+     * difference to the largest claimant. Deriving the denominator here makes
+     * "the fractions sum to one" structural rather than a caller's promise. */
+    double denom = 0.0;
+    for (size_t i = 0; i < n_addrs; i++) {
+        if (addrs[i].address[0] == '\0') continue;
+        if (!isfinite(addrs[i].total_difficulty) ||
+            addrs[i].total_difficulty < 0.0) return -1;
+        denom += addrs[i].total_difficulty;
+    }
+    if (!(denom > 0.0)) return -1;
 
     /* The working set is every address in the window, plus every address that
      * still holds a claim from an earlier block — a miner who has gone away is
@@ -76,7 +96,7 @@ int pplns_compute_payouts(int64_t reward_after_fee,
         }
         /* Duplicate rows are summed rather than overwritten — the store groups
          * by address, but nothing in the type says it must. */
-        e->window_fraction += addrs[i].total_difficulty / window_difficulty;
+        e->window_fraction += addrs[i].total_difficulty / denom;
     }
     for (size_t i = 0; i < n_ledger_in; i++) {
         if (ledger[i].address[0] == '\0') continue;
@@ -92,6 +112,31 @@ int pplns_compute_payouts(int64_t reward_after_fee,
     for (size_t i = 0; i < nw; i++) {
         w[i].claim = w[i].window_fraction + w[i].old_claim;
         if (!isfinite(w[i].claim)) { free(w); return -1; }
+    }
+
+    /* The ledger update at the bottom gives the largest emitted claim whatever
+     * residual keeps the ledger summing to zero. That IS its honest residual —
+     * but only while the working set's claims sum to exactly one block reward.
+     * Off that, the forced value is wrong by the imbalance, and can even invert
+     * the sign: an address that over-received gets recorded as owed, and is
+     * paid again on the next block.
+     *
+     * Window fractions sum to 1.0 by construction now, so the only way to miss
+     * is a stored ledger that is not itself zero-sum.
+     *
+     * The tolerance is relative and deliberately loose, because this is a
+     * corruption backstop and not a noise policeman. Legitimate drift comes
+     * from pruning claims worth under one satoshi, which is a few parts in
+     * 10^7 of a reward at any realistic participant count — and it cannot be
+     * expressed in satoshis here anyway, since a claim is a fraction of the
+     * block that MINTED it and rewards differ block to block. What this must
+     * catch is the failure above, where the imbalance is a whole miner's share:
+     * the sign-flip case is 0.4 of a reward, four thousand times this bound. */
+    double claim_sum = 0.0;
+    for (size_t i = 0; i < nw; i++) claim_sum += w[i].claim;
+    if (fabs(claim_sum - 1.0) > 1e-4) {
+        free(w);
+        return -1;
     }
 
     /* Rank by claim so both the threshold and the output cap fall on the
@@ -122,10 +167,45 @@ int pplns_compute_payouts(int64_t reward_after_fee,
 
     /* Renormalise over the emitted set, so the coinbase pays out the reward
      * exactly. Whoever is deferred this block keeps their claim; whoever is
-     * paid absorbs the deferred share as an advance and goes claim-negative. */
+     * paid absorbs the deferred share as an advance and goes claim-negative.
+     *
+     * ⚠️ The threshold above was applied to the PRE-renormalisation cut, and the
+     * two are not the same number. The scale is reward/emit_claim, and
+     * emit_claim exceeds 1.0 whenever a negative claim sits OUTSIDE the emitted
+     * set — which is the state after any block that advanced someone, i.e. the
+     * normal one. Every emitted address is then paid strictly less than the cut
+     * that admitted it.
+     *
+     * That gap can carry an admitted address below the dust limit, and
+     * coinbase_build_from_template_multi refuses the WHOLE build if any output
+     * is under it. Since one coinbase is shared by every connection in this
+     * mode, that is not a lost payout — it is every miner getting "coinbase
+     * render failed" and the pool serving no work for that template.
+     *
+     * So re-check against what will actually be paid and drop the smallest
+     * offender until the set is stable. Dropping only ever RAISES what the
+     * remaining addresses are paid — emit_claim falls, so the scale rises — so
+     * this terminates and can never re-break an address it has already cleared.
+     * The dropped address is deferred, not robbed: its claim rolls forward in
+     * the ledger exactly as a below-threshold one does. */
     double emit_claim = 0.0;
-    for (size_t i = 0; i < nw; i++) if (w[i].emit) emit_claim += w[i].claim;
-    if (!(emit_claim > 0.0)) { free(rank); free(w); return -1; }
+    for (;;) {
+        emit_claim = 0.0;
+        for (size_t i = 0; i < nw; i++) if (w[i].emit) emit_claim += w[i].claim;
+        if (!(emit_claim > 0.0)) { free(rank); free(w); return -1; }
+        if (n_emit <= 1) break;          /* a block must pay someone */
+
+        work_t *worst = NULL;
+        for (size_t i = 0; i < nw; i++) {
+            if (!w[i].emit) continue;
+            double d = (double)reward_after_fee * (w[i].claim / emit_claim);
+            if (d >= (double)min_payout_sats) continue;
+            if (!worst || w[i].claim < worst->claim) worst = &w[i];
+        }
+        if (!worst) break;
+        worst->emit = 0;
+        n_emit--;
+    }
 
     int64_t distributed = 0;
     for (size_t i = 0; i < nw; i++) {

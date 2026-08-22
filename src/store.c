@@ -14,6 +14,7 @@
 #include <sqlite3.h>
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1489,11 +1490,22 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
 
     double cum = 0.0;
     uint64_t boundary_s = 0;
-    int any = 0, done = 0, exhausted = 0;
+    int any = 0, done = 0, exhausted = 0, boundary_closed = 0;
     sqlite3_int64 cur_ts = before_s + 1, cur_id = 0;   /* exclusive cursor */
     sqlite3_int64 rows_read = 0;
 
-    while (!done && !exhausted && rows_read < g_window_max_rows) {
+    /* Loop on boundary_closed, NOT on done.
+     *
+     * `done` means the work target and the time floor are both met; the walk
+     * must then keep taking rows until it has SEEN a row older than
+     * boundary_s, because shares sharing the boundary second are taken
+     * together or not at all. Exiting on `done` alone drops the rest of that
+     * second whenever the deciding row happens to be the last of a page — and
+     * store_prop_window_addrs() still counts those rows, because it selects on
+     * `ts >= start_s` with no id cursor. The window total then disagrees with
+     * the addresses in it, which is exactly the disagreement pplns.c now
+     * refuses to be handed. */
+    while (!boundary_closed && !exhausted && rows_read < g_window_max_rows) {
         sqlite3_stmt *st = NULL;
         if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
             atomic_fetch_add(&s->pg_errors, 1);
@@ -1514,7 +1526,7 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
             /* Stop only once BOTH the work target and the time floor are met,
              * and only on a second boundary — shares sharing a timestamp are
              * taken together or not at all. */
-            if (done && (uint64_t)ts != boundary_s) break;
+            if (done && (uint64_t)ts != boundary_s) { boundary_closed = 1; break; }
             cum += diff;
             boundary_s = (uint64_t)ts;
             cur_ts = ts; cur_id = id;
@@ -1525,6 +1537,9 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
     }
 
     if (!any) return -1;
+    /* Truncation is still about the WORK target, not the boundary sweep: a walk
+     * that met the target and then ran out of rows closing the second read the
+     * whole window it asked for. */
     if (!done && !exhausted && out_truncated) *out_truncated = 1;
 
     *out_start_ms = boundary_s * 1000ULL;
@@ -1580,17 +1595,40 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
     return 0;
 }
 
+/* Accumulate `delta` against `addr` in a working ledger, appending a row if the
+ * address is not there yet. Returns 0 ok, -1 if the array is full. */
+static int ledger_acc(pplns_claim_t *w, size_t cap, size_t *n,
+                      const char *addr, double delta) {
+    for (size_t i = 0; i < *n; i++) {
+        if (strcmp(w[i].address, addr) != 0) continue;
+        w[i].claim_fraction += delta;
+        return 0;
+    }
+    if (*n >= cap) return -1;
+    snprintf(w[*n].address, sizeof w[*n].address, "%s", addr);
+    w[*n].claim_fraction = delta;
+    (*n)++;
+    return 0;
+}
+
 int store_prop_settle_block(store_t *s, uint64_t ts_ms,
-                            const pplns_claim_t *ledger, size_t n_ledger) {
+                            const pplns_claim_t *ledger_in, size_t n_ledger_in,
+                            const pplns_claim_t *ledger_out, size_t n_ledger_out) {
     if (!s) return -1;
+    if ((n_ledger_in && !ledger_in) || (n_ledger_out && !ledger_out)) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
+    pplns_claim_t *merged = NULL;
+    size_t n_merged = 0, merged_cap = 0;
 
-    /* Replace the ledger wholesale: pplns_compute_payouts returns the complete
-     * post-block state, and a claim that has settled to zero is simply absent
-     * from it. Merging row by row would leave stale rows behind and break the
-     * sums-to-zero invariant. */
+    /* Read the CURRENT ledger inside the write transaction, apply this block's
+     * delta to it, and write the result. The plan's own post-block ledger is
+     * not the answer on its own: it was computed against whatever the table
+     * held when the template was fetched, and another block may have settled
+     * since. See the contract in store.h. */
+    static const char *Q_CURRENT =
+        "SELECT address, claim_fraction FROM prop_ledger";
     static const char *Q_UPSERT =
         "INSERT INTO prop_ledger (address, claim_fraction, last_settled_ts)"
         "  VALUES (?, ?, ?)"
@@ -1613,42 +1651,78 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
         return -1;
     }
 
-    if (sqlite3_prepare_v2(s->db, Q_CLEAR, -1, &st, NULL) != SQLITE_OK) {
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        atomic_fetch_add(&s->pg_errors, 1);
-        pthread_mutex_unlock(&s->tx_mu);
-        return -1;
+    if (sqlite3_prepare_v2(s->db, Q_CURRENT, -1, &st, NULL) != SQLITE_OK) {
+        LOG_ERROR("store: settle could not read prop_ledger: %s",
+                  sqlite3_errmsg(s->db));
+        goto fail;
     }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (n_merged >= merged_cap) {
+            size_t ncap = merged_cap ? merged_cap * 2 : 64;
+            pplns_claim_t *nb = (pplns_claim_t *)realloc(merged, ncap * sizeof(*nb));
+            if (!nb) { sqlite3_finalize(st); st = NULL; goto fail; }
+            merged = nb; merged_cap = ncap;
+        }
+        const char *a = (const char *)sqlite3_column_text(st, 0);
+        snprintf(merged[n_merged].address, sizeof merged[n_merged].address,
+                 "%s", a ? a : "");
+        merged[n_merged].claim_fraction = sqlite3_column_double(st, 1);
+        n_merged++;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (rc != SQLITE_DONE) {
+        LOG_ERROR("store: settle could not read prop_ledger: %s",
+                  sqlite3_errmsg(s->db));
+        goto fail;
+    }
+
+    /* Room for every address the delta can introduce on top of what is stored. */
+    {
+        size_t need = n_merged + n_ledger_in + n_ledger_out;
+        if (need > merged_cap) {
+            pplns_claim_t *nb = (pplns_claim_t *)realloc(merged, need * sizeof(*nb));
+            if (!nb) goto fail;
+            merged = nb; merged_cap = need;
+        }
+    }
+    for (size_t i = 0; i < n_ledger_in; i++) {
+        if (ledger_in[i].address[0] == '\0') continue;
+        if (ledger_acc(merged, merged_cap, &n_merged,
+                       ledger_in[i].address, -ledger_in[i].claim_fraction) < 0)
+            goto fail;
+    }
+    for (size_t i = 0; i < n_ledger_out; i++) {
+        if (ledger_out[i].address[0] == '\0') continue;
+        if (ledger_acc(merged, merged_cap, &n_merged,
+                       ledger_out[i].address, ledger_out[i].claim_fraction) < 0)
+            goto fail;
+    }
+
+    if (sqlite3_prepare_v2(s->db, Q_CLEAR, -1, &st, NULL) != SQLITE_OK) goto fail;
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
+    st = NULL;
     if (rc != SQLITE_DONE) {
         LOG_ERROR("store: settle could not clear prop_ledger: %s",
                   sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        atomic_fetch_add(&s->pg_errors, 1);
-        pthread_mutex_unlock(&s->tx_mu);
-        return -1;
+        goto fail;
     }
 
-    for (size_t i = 0; i < n_ledger; i++) {
-        if (ledger[i].claim_fraction == 0.0) continue;
-        if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &st, NULL) != SQLITE_OK) {
-            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-            atomic_fetch_add(&s->pg_errors, 1);
-            pthread_mutex_unlock(&s->tx_mu);
-            return -1;
-        }
-        sqlite3_bind_text  (st, 1, ledger[i].address, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_double(st, 2, ledger[i].claim_fraction);
+    for (size_t i = 0; i < n_merged; i++) {
+        /* A claim that cancelled out is absent from the table, not stored as a
+         * zero. The bound here is floating-point noise only — pruning a claim
+         * that is merely SMALL is pplns_compute_payouts's job, because only it
+         * knows the reward that says what a satoshi is worth. */
+        if (fabs(merged[i].claim_fraction) < 1e-12) continue;
+        if (sqlite3_prepare_v2(s->db, Q_UPSERT, -1, &st, NULL) != SQLITE_OK) goto fail;
+        sqlite3_bind_text  (st, 1, merged[i].address, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(st, 2, merged[i].claim_fraction);
         sqlite3_bind_int64 (st, 3, (sqlite3_int64)(ts_ms / 1000));
         rc = sqlite3_step(st);
         sqlite3_finalize(st);
-        if (rc != SQLITE_DONE) {
-            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-            atomic_fetch_add(&s->pg_errors, 1);
-            pthread_mutex_unlock(&s->tx_mu);
-            return -1;
-        }
+        st = NULL;
+        if (rc != SQLITE_DONE) goto fail;
     }
 
     /* ⛔ This function does NOT write blocks_found. on_block_found_cb() calls
@@ -1667,13 +1741,19 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
         LOG_ERROR("store: settle COMMIT failed: %s — prop_ledger is unchanged, "
                   "so the claims this block paid are still recorded as owed",
                   sqlite3_errmsg(s->db));
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
-        atomic_fetch_add(&s->pg_errors, 1);
-        pthread_mutex_unlock(&s->tx_mu);
-        return -1;
+        goto fail;
     }
     pthread_mutex_unlock(&s->tx_mu);
+    free(merged);
     return 0;
+
+fail:
+    if (st) sqlite3_finalize(st);
+    sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+    atomic_fetch_add(&s->pg_errors, 1);
+    pthread_mutex_unlock(&s->tx_mu);
+    free(merged);
+    return -1;
 }
 
 void store_get_stats(store_t *s, store_stats_t *out) {

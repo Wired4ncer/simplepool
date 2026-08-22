@@ -236,15 +236,31 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
 int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
                             pplns_addr_t **out, size_t *n);
 
-/* Apply the result of a found block: replace prop_ledger with the post-block
- * deferred claims. ledger/n_ledger is the complete new ledger, which replaces
- * the stored one wholesale — a settled claim is absent from it rather than
- * zeroed.
+/* Apply the result of a found block to prop_ledger, as a DELTA.
+ *
+ * ledger_in is the ledger the payout plan was computed from; ledger_out is the
+ * ledger pplns_compute_payouts() produced from it. What lands in the table is
+ * (current + ledger_out - ledger_in), per address, computed inside the same
+ * transaction that writes it.
+ *
+ * ⚠️ It takes both halves, and not just the post-block state, because the plan
+ * is built when the TEMPLATE is fetched and settled when a block is found —
+ * different threads, an unbounded gap apart, with no ordering between one
+ * block's settle and the next template's read of the ledger. Writing
+ * ledger_out wholesale therefore published a snapshot that could already be
+ * stale, and a second block settling from an overlapping snapshot silently
+ * dropped the first block's claims. The delta is immune to that: two plans
+ * built from the same snapshot compose instead of overwriting, and since both
+ * halves are zero-sum the delta is too, so the stored ledger stays zero-sum.
+ *
+ * An address in the table that appears in neither half is left alone — that is
+ * the whole point. An address whose result lands on zero is removed.
  *
  * ⛔ Does NOT touch blocks_found. store_record_block() is the sole writer of
  * that table and is called for every block; a second insert here duplicated
  * every pooled block (see store.c). Returns 0 ok, negative on error. */
 int store_prop_settle_block(store_t *s, uint64_t ts_ms,
-                            const pplns_claim_t *ledger, size_t n_ledger);
+                            const pplns_claim_t *ledger_in, size_t n_ledger_in,
+                            const pplns_claim_t *ledger_out, size_t n_ledger_out);
 
 #endif /* SIMPLEPOOL_STORE_H */

@@ -49,8 +49,12 @@ typedef struct {
  * reward_after_fee: sats available to miners (block reward minus operator fee).
  *                   The payouts ALWAYS sum to exactly this. That is the
  *                   property the whole design turns on.
- * window_difficulty: sum of share difficulty in the window; must be > 0.
- * addrs / n_addrs: window shares aggregated by payout address.
+ * addrs / n_addrs: window shares aggregated by payout address. Their summed
+ *         difficulty IS the denominator — there is deliberately no separate
+ *         window_difficulty parameter, because a caller that measured the
+ *         window with a second query can supply a total that disagrees with
+ *         these rows, and fractions that do not sum to 1.0 corrupt the ledger
+ *         update below rather than merely rounding it.
  * ledger: in/out. On input, the stored claims. On output, the claims after this
  *         block, including addresses that appear only in the window. Needs
  *         capacity for n_addrs + n_ledger_in entries.
@@ -58,12 +62,24 @@ typedef struct {
  *         than paid, and its claim rolls forward. If that would leave nobody to
  *         pay, the single largest claim is paid anyway — a block must pay
  *         someone, and the threshold is a convenience, not a rule.
+ *         Applied to the amount ACTUALLY PAID, after renormalisation over the
+ *         emitted set — never to the pre-renormalisation cut, which is larger
+ *         whenever the ledger holds a negative claim. No emitted payout is ever
+ *         below this value, and since it is itself floored at the dust limit,
+ *         no emitted payout is ever dust. The direction is one-sided on
+ *         purpose: someone whose cut just cleared the threshold may still be
+ *         deferred, which the ledger remembers and pays later, whereas emitting
+ *         a dust output fails the whole coinbase build.
  * max_outputs: cap on payout outputs (block weight, see the plan note §2). The
  *         smallest cuts are deferred until the list fits.
  *
- * Returns 0 on success, -1 on invalid input. */
+ * Returns 0 on success, -1 on invalid input — which now includes a stored
+ * ledger that is materially not zero-sum. That is unrepresentable rather than
+ * merely unusual: every block pays exactly one reward, so a ledger summing to
+ * anything else describes claims no coinbase can settle. Refusing hands the
+ * caller its documented fallback (pay the finder directly) instead of quietly
+ * assigning the imbalance to whoever happens to be largest. */
 int pplns_compute_payouts(int64_t reward_after_fee,
-                          double window_difficulty,
                           const pplns_addr_t *addrs, size_t n_addrs,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,

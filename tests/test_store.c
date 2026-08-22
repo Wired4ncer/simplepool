@@ -16,10 +16,15 @@
 #include <time.h>
 #include <unistd.h>
 
-static char g_db_paths[16][256];
+/* Grow this when you add a test. It used to be 16 with no bound check, so the
+ * seventeenth test scribbled past the end of the table and the failure landed
+ * on an innocent store_open() several tests later. */
+#define MAX_TEST_DBS 32
+static char g_db_paths[MAX_TEST_DBS][256];
 static int  g_db_count = 0;
 
 static const char *fresh_db_path(void) {
+    assert(g_db_count < MAX_TEST_DBS);
     char *p = g_db_paths[g_db_count++];
     snprintf(p, 256, "/tmp/store_test_%d_%d.db", (int)getpid(), g_db_count);
     unlink(p);
@@ -895,6 +900,146 @@ static void test_proportional_window_pages(void) {
     printf("  ok test_proportional_window_pages\n");
 }
 
+/* The walk and the address aggregate must agree on the SAME window, including
+ * when the second that closes the window straddles a page break.
+ *
+ * Regression: the walk stopped as soon as the work target and the time floor
+ * were met, and it only swept up the rest of the boundary second if more rows
+ * of that second happened to sit in the page it was already reading. When the
+ * deciding row was the LAST row of a page, the loop exited on `done` and the
+ * remaining shares of that second were never added -- while
+ * store_prop_window_addrs() counted them anyway, because it selects on
+ * `ts >= start_s` with no id cursor. The window difficulty came out under the
+ * difficulty of the addresses in it, so the fractions summed to more than 1.0
+ * and the largest claimant silently absorbed the difference. */
+static void test_proportional_window_boundary_spans_a_page(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 500;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Three shares in the newest second, then ten in each of the two below it,
+     * all difficulty 1. Walking newest-first with a 7-row page, the target of 7
+     * is met on the 7th row -- the last of page one -- while six more shares of
+     * that same second wait in page two. */
+    uint64_t now_s = 1700200000ULL;
+    const char *addr = "bcrt1qbound";
+    for (int i = 0; i < 3; i++)
+        assert(store_record_share_addr(s, "w.b", addr,
+                                       (now_s - 1) * 1000ULL, 1.0, 0, NULL, 0, 0.0) == 0);
+    for (int i = 0; i < 10; i++)
+        assert(store_record_share_addr(s, "w.b", addr,
+                                       (now_s - 2) * 1000ULL, 1.0, 0, NULL, 0, 0.0) == 0);
+    for (int i = 0; i < 10; i++)
+        assert(store_record_share_addr(s, "w.b", addr,
+                                       (now_s - 3) * 1000ULL, 1.0, 0, NULL, 0, 0.0) == 0);
+    assert(store_flush(s) == 0);
+    uint64_t before_ms = now_s * 1000ULL;
+
+    store_test_set_window_limits(7, 5000000);
+    uint64_t start_ms = 0; double walked = 0.0; int trunc = -1;
+    assert(store_prop_compute_window(s, 7.0, before_ms, 0,
+                                     &start_ms, &walked, &trunc) == 0);
+    store_test_set_window_limits(0, 0);
+    assert(trunc == 0);
+
+    /* The whole boundary second is in: 3 + 10, not the 7 the target asked for. */
+    pplns_addr_t *addrs = NULL; size_t n = 0;
+    assert(store_prop_window_addrs(s, start_ms, before_ms, &addrs, &n) == 0);
+    double aggregated = 0.0;
+    for (size_t i = 0; i < n; i++) aggregated += addrs[i].total_difficulty;
+    free(addrs);
+
+    if (walked != aggregated) {
+        fprintf(stderr, "window walk %.1f != address aggregate %.1f over the "
+                        "same window -- fractions will not sum to 1.0\n",
+                walked, aggregated);
+        abort();
+    }
+    assert(walked == 13.0);
+
+    store_close(s);
+    printf("  ok test_proportional_window_boundary_spans_a_page\n");
+}
+
+/* Two blocks whose payout plans were built from the SAME ledger snapshot must
+ * both land. This is the settlement race, in the small.
+ *
+ * Plans are built when a template is fetched and settled when a block is found
+ * — different threads, no ordering between one block's settle and the next
+ * template's read of the ledger. So two plans can legitimately hold the same
+ * `ledger_in`, and the second one to settle used to DELETE the table and write
+ * its own post-block snapshot over the top, erasing everything the first block
+ * had just recorded. Post-fork, at minimum difficulty, blocks arrive fast
+ * enough for that to be the normal case rather than the rare one.
+ *
+ * Settling the delta composes instead: each block moves the ledger by what it
+ * actually changed, so both are still there afterwards. */
+static void test_proportional_settles_compose(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* The shared starting point: empty, as at the pool's first block. */
+    pplns_claim_t snapshot[8] = {0};
+    size_t n_snapshot = 0;
+
+    /* Block 1's plan defers "b" and advances "a" by the same fraction. */
+    pplns_claim_t out1[] = { { "a", -0.25 }, { "b", +0.25 } };
+    /* Block 2's plan was computed from the same snapshot, and touches a
+     * different pair — so nothing about it justifies discarding block 1. */
+    pplns_claim_t out2[] = { { "c", -0.40 }, { "d", +0.40 } };
+
+    assert(store_prop_settle_block(s, 1000, snapshot, n_snapshot, out1, 2) == 0);
+    assert(store_prop_settle_block(s, 2000, snapshot, n_snapshot, out2, 2) == 0);
+
+    pplns_claim_t *stored = NULL; size_t n_stored = 0;
+    assert(store_prop_get_ledger(s, &stored, &n_stored) == 0);
+
+    double a = 0, b = 0, c = 0, d = 0, sum = 0;
+    for (size_t i = 0; i < n_stored; i++) {
+        if (strcmp(stored[i].address, "a") == 0) a = stored[i].claim_fraction;
+        if (strcmp(stored[i].address, "b") == 0) b = stored[i].claim_fraction;
+        if (strcmp(stored[i].address, "c") == 0) c = stored[i].claim_fraction;
+        if (strcmp(stored[i].address, "d") == 0) d = stored[i].claim_fraction;
+        sum += stored[i].claim_fraction;
+    }
+    free(stored);
+
+    if (n_stored != 4) {
+        fprintf(stderr, "settling two plans from one snapshot left %zu ledger "
+                        "rows, expected 4 -- the second settle overwrote the "
+                        "first block's claims\n", n_stored);
+        abort();
+    }
+    assert(fabs(a + 0.25) < 1e-12 && fabs(b - 0.25) < 1e-12);
+    assert(fabs(c + 0.40) < 1e-12 && fabs(d - 0.40) < 1e-12);
+    /* Both deltas are zero-sum, so the ledger still is. */
+    assert(fabs(sum) < 1e-12);
+
+    /* And a claim that settles back to zero leaves no row behind: block 3 pays
+     * "b" what it was owed, backing out the claim block 1 created. */
+    pplns_claim_t in3[]  = { { "a", -0.25 }, { "b", +0.25 } };
+    pplns_claim_t out3[] = { { "a", 0.0 },   { "b", 0.0 } };
+    assert(store_prop_settle_block(s, 3000, in3, 2, out3, 2) == 0);
+    assert(store_prop_get_ledger(s, &stored, &n_stored) == 0);
+    for (size_t i = 0; i < n_stored; i++)
+        assert(strcmp(stored[i].address, "a") != 0 &&
+               strcmp(stored[i].address, "b") != 0);
+    assert(n_stored == 2);   /* c and d, untouched by a plan that never saw them */
+    free(stored);
+
+    store_close(s);
+    printf("  ok test_proportional_settles_compose\n");
+}
+
 static void test_proportional(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -946,7 +1091,7 @@ static void test_proportional(void) {
     pplns_claim_t ledger_buf[16] = {0};
     size_t n_ledger_out = 0;
     int64_t reward = 1000000LL;
-    int rc = pplns_compute_payouts(reward, actual_diff, addrs, n_addrs,
+    int rc = pplns_compute_payouts(reward, addrs, n_addrs,
                                    ledger_buf, 16, 0, &n_ledger_out,
                                    300000LL, 12, payouts, &n_payouts);
     assert(rc == 0);
@@ -969,7 +1114,8 @@ static void test_proportional(void) {
     assert(store_record_block(s, (base_ts + 200) * 1000ULL, 100, "blockhash1",
                               "worker1", addrs[0].address, reward, 0) == 0);
 
-    rc = store_prop_settle_block(s, base_ts + 200, ledger_buf, n_ledger_out);
+    rc = store_prop_settle_block(s, base_ts + 200, NULL, 0,
+                                 ledger_buf, n_ledger_out);
     assert(rc == 0);
     store_flush(s);
 
@@ -1004,14 +1150,21 @@ static void test_proportional(void) {
         assert(seen);
     }
 
-    /* Settling a second block must REPLACE the ledger, not accumulate stale
-     * rows — the ledger is whole-state, not a delta. */
+    /* Settling a second block must leave the ledger holding the second block's
+     * claims, not those of both blocks stacked on top of each other. The plan's
+     * own starting snapshot is what makes that work: the delta it applies is
+     * (out - in), so the claims the first block left behind are backed out as
+     * the second block's are added. */
+    pplns_claim_t snapshot[16] = {0};
+    memcpy(snapshot, ledger_buf, n_ledger_out * sizeof(*snapshot));
+    size_t n_snapshot = n_ledger_out;
     size_t n_second = 0;
-    rc = pplns_compute_payouts(reward, actual_diff, addrs, n_addrs,
+    rc = pplns_compute_payouts(reward, addrs, n_addrs,
                                ledger_buf, 16, n_ledger_out, &n_second,
                                300000LL, 12, payouts, &n_payouts);
     assert(rc == 0);
-    rc = store_prop_settle_block(s, base_ts + 300, ledger_buf, n_second);
+    rc = store_prop_settle_block(s, base_ts + 300, snapshot, n_snapshot,
+                                 ledger_buf, n_second);
     assert(rc == 0);
     free(stored);
     stored = NULL;
@@ -1039,7 +1192,9 @@ int main(void) {
     test_commit_survives_a_locked_db();
     test_worker_recent_difficulty();
     test_proportional_window_pages();
+    test_proportional_window_boundary_spans_a_page();
     test_proportional();
+    test_proportional_settles_compose();
     test_proportional_window_floor();
     test_proportional_window_when_every_share_is_a_block();
     cleanup_dbs();

@@ -83,13 +83,27 @@ lottery ticket for a whole block — but expect it to be *proportional*.
 1. Aggregate the window by **payout address** (not worker name — see
    [Addresses, not workers](#addresses-not-workers)).
 2. Each address's claim = its share of the window + whatever the ledger
-   says it is owed.
+   says it is owed. "Its share of the window" is measured against the
+   summed difficulty of **those same aggregated rows** — not against a
+   window total from a separate query. The two can disagree (a share
+   committed between the two reads, or one the walk dropped at a page
+   boundary), and fractions that do not sum to 1.0 corrupt step 5 rather
+   than merely rounding it.
 3. Anything below `prop_min_payout_sats`, or outside the number of
    outputs the block's spare weight allows, is **deferred** rather than
    dropped.
 4. The payouts are **renormalised over the addresses actually being
    paid**, so the outputs sum to exactly `reward − fee`.
-5. The ledger records what each address was owed minus what it received.
+5. The threshold from step 3 is re-applied to what step 4 actually pays,
+   and anyone now below it is deferred too. These are different numbers:
+   the renormalisation scale is `reward / emit_claim`, and `emit_claim`
+   exceeds 1.0 whenever a negative claim sits outside the paid set — the
+   ordinary state after any block that advanced someone. Checking only
+   the pre-renormalisation cut could emit an output below the dust limit,
+   which makes the builder refuse the **whole** coinbase; since one
+   coinbase serves every connection in this mode, that is the pool
+   serving no work for the template rather than one lost payout.
+6. The ledger records what each address was owed minus what it received.
 
 ### The invariant everything rests on
 
@@ -119,6 +133,17 @@ address:
 - **The ledger sums to zero**, always. Every block pays exactly one
   reward, so an advance to one miner is a deferral by another.
 
+The largest paid claim takes the rounding residual, which keeps the sum
+at exactly zero in floating point instead of drifting. ⚠️ That is the
+right value for it **only because the working set's claims sum to one
+reward** — which is why the denominator is derived from the window rows
+in step 2 rather than taken on trust. Off that assumption the forced
+value is wrong by the imbalance and can invert the sign, recording an
+address that over-received as owed and paying it again. A stored ledger
+that is materially not zero-sum is therefore **refused** rather than
+balanced by force: the pool falls back to paying the finder directly and
+logs what is wrong and how to clear it.
+
 Two rejected alternatives, both of which look simpler and are wrong:
 
 **Carrying satoshis** cannot be settled inside one coinbase. Holding back
@@ -137,6 +162,24 @@ A claim worth less than one satoshi of the block that produced it is
 dropped rather than carried — it can never be paid, so carrying it is
 noise. The ledger is therefore zero-sum to within a satoshi per
 participant. What stays exact is the payout total.
+
+### Settlement applies a delta, not a snapshot
+
+The payout plan is built when the **template** is fetched and settled
+when a **block** is found — different threads, an unbounded gap apart,
+and nothing orders one block's settle against the next template's read
+of the ledger. So two plans can legitimately hold the same starting
+snapshot.
+
+Settlement therefore writes `current + (plan_out − plan_in)`, computed
+inside the transaction that writes it, rather than overwriting the table
+with the plan's own post-block state. Two plans built from one snapshot
+compose instead of the second erasing the first, and an address the plan
+never saw is left alone. Both halves are zero-sum, so the delta is too.
+
+⚠️ This matters most in exactly the regime the pool is built for: at the
+post-fork minimum difficulty, blocks arriving faster than templates are
+the normal case, not the rare one.
 
 ## The output cap is derived, not configured
 
@@ -191,7 +234,9 @@ prop_window_min_sec  = 600
 
 # Below this, an address is deferred rather than paid. Must be >= the
 # 546-sat dust limit. Higher values mean small miners appear in fewer
-# coinbases, which is what trips miner-firmware warnings.
+# coinbases, which is what trips miner-firmware warnings. The floor is
+# applied to the amount actually paid, after renormalisation, so setting
+# it AT the dust limit is safe -- no emitted output can land under it.
 prop_min_payout_sats = 1000000
 
 # Upper bound on payout outputs. The effective cap is derived per

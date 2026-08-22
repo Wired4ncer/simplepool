@@ -44,7 +44,9 @@
 /* Server-wide ring, so it has to cover every live connection's recent
  * submissions rather than just one's. */
 #define SHARE_DEDUPE_RING 16384
-#define RECENT_JOBS    8
+/* The retention ring is sized in stratum.h, because main.c's payout-plan ring
+ * must be able to cover every job that is still solvable. */
+#define RECENT_JOBS    STRATUM_RECENT_JOBS
 #define RECENT_JOB_TTL_MS 60000
 /* Upper bound on a single blocking send to one miner. See conn_socket_setup. */
 #define SEND_TIMEOUT_SEC 10

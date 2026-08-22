@@ -366,6 +366,29 @@ if abs(v) > 1e-9:
 " || exit 1
 echo "  ✓ zero-sum"
 
+# ...but an EMPTY table sums to zero trivially, so say whether that check meant
+# anything. The deferred path has to have been entered and carried ACROSS
+# blocks for a burst to have tested the thing a burst is for; a run where every
+# block paid everyone in full proves conservation and nothing about carry.
+SETTLES=$(grep -c "proportional: settled block" "$POOL_LOG" || true)
+CARRIED=$(grep "proportional: settled block" "$POOL_LOG" \
+          | grep -cvE "0 deferred claims" || true)
+NOPLAN=$(grep -c "which had no payout plan" "$POOL_LOG" || true)
+echo "  settles=$SETTLES with-carry=$CARRIED no-plan=$NOPLAN"
+if [ "$CARRIED" -eq 0 ]; then
+    echo "  ⚠️  VACUOUS: no block carried a deferred claim, so the zero-sum"
+    echo "      assertion above cannot tell 'exercised and correct' from"
+    echo "      'never happened'. Lower prop_min_payout_sats or add a miner"
+    echo "      small enough to be deferred, and run it again."
+fi
+# A pooled block settling with no plan means the plan ring did not cover a job
+# stratum still accepted a submit for -- the coinbase paid its finder solo
+# instead of the window. PROP_PLAN_RING is sized off STRATUM_RECENT_JOBS to
+# make this impossible; if it shows up, that sizing is wrong again.
+if [ "$NOPLAN" -gt 0 ]; then
+    fail "$NOPLAN block(s) settled with no payout plan -- PROP_PLAN_RING is not covering every solvable job"
+fi
+
 stage "INVARIANT 6 — pool survived the burst"
 grep -iE "panic|segfault|assertion failed" "$POOL_LOG" && fail "pool log contains a crash signature"
 echo "  ✓ no crash signature in the pool log"

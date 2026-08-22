@@ -114,7 +114,15 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 /* One PPLNS settle plan: the coinbase payouts that went into a job, plus the
  * deferred-claim ledger that becomes authoritative if (and only if) that job's
  * block is accepted. Held until the job can no longer be solved. */
-#define PROP_PLAN_RING     8
+/* One plan per job that can still be solved: everything stratum retains
+ * (STRATUM_RECENT_JOBS) plus the current job, doubled for headroom.
+ *
+ * ⚠️ It was a bare 8 against a retention ring of 8 + the current job — so the
+ * OLDEST solvable job never had a plan, and a block found on it fell back to
+ * paying its finder directly instead of the PPLNS window. Safe, in that no
+ * invalid block or custody is possible either way, but wrong: the window's
+ * miners lose a block they earned, and nothing logs it as a defect. */
+#define PROP_PLAN_RING     ((STRATUM_RECENT_JOBS + 1) * 2)
 #define PROP_PLAN_MAX_PAY  64
 
 typedef struct {
@@ -123,7 +131,13 @@ typedef struct {
     int64_t         reward_after_fee;
     pplns_payout_t  payouts[PROP_PLAN_MAX_PAY];
     size_t          n_payouts;
-    pplns_claim_t  *ledger;     /* owned */
+    /* Both halves of the ledger change this plan represents: the snapshot it
+     * was computed FROM, and the state it computed. Settlement applies the
+     * difference to whatever the table holds at the time, so a plan built
+     * before another block settled no longer erases it. Both owned. */
+    pplns_claim_t  *ledger_in;
+    size_t          n_ledger_in;
+    pplns_claim_t  *ledger;
     size_t          n_ledger;
 } prop_plan_t;
 
@@ -149,8 +163,8 @@ typedef struct {
      * job the miner actually solved, not the newest one — several templates can
      * exist for the same height (mempool churn), each with its own window, and
      * crediting the wrong one would mis-pay carry-forward. Guarded by `lock`.
-     * Eight is generous: a plan older than the last handful of templates cannot
-     * still be solvable, because stratum has already dropped the job. */
+     * Sized off STRATUM_RECENT_JOBS so it always covers every job stratum will
+     * still accept a submit for — see PROP_PLAN_RING. */
     prop_plan_t     prop_plans[PROP_PLAN_RING];
     size_t          prop_plan_next;
 
@@ -177,6 +191,7 @@ static double effective_pps_rate(const proxy_config_t *cfg,
 
 static void prop_plan_clear(prop_plan_t *p) {
     if (!p) return;
+    free(p->ledger_in);
     free(p->ledger);
     memset(p, 0, sizeof *p);
 }
@@ -318,27 +333,73 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
         return 1;
     }
 
+    /* pplns_compute_payouts refuses a ledger that is not zero-sum, because
+     * forcing it to balance is what silently inverts the largest claimant's
+     * sign. Refusal falls back to paying the finder — correct and safe, but if
+     * the STORED ledger is the broken one it will happen on every template from
+     * now on, and "payout computation produced nothing" is not a diagnosis.
+     * Say what is wrong and what fixes it, once per template, before the fact.
+     *
+     * The remedy is deliberately not automatic: the rows record who the pool
+     * believes it owes a turn, and deleting them is a payout decision. */
+    {
+        double stored_sum = 0.0;
+        for (size_t i = 0; i < n_ledger_in; i++)
+            stored_sum += ledger_in[i].claim_fraction;
+        if (n_ledger_in > 0 && fabs(stored_sum) > 1e-4) {
+            LOG_ERROR("proportional: the stored claim ledger sums to %+.6f of a "
+                      "block reward across %zu rows, not zero — every block pays "
+                      "exactly one reward, so this describes claims no coinbase "
+                      "can settle. Payouts will fall back to paying the finder "
+                      "directly until it is fixed. Inspect prop_ledger and, once "
+                      "you have decided what it should say, clear it: "
+                      "DELETE FROM prop_ledger;",
+                      stored_sum, n_ledger_in);
+        }
+    }
+
     /* pplns_compute_payouts rewrites the ledger in place, so the array needs
      * room for every window address on top of what is already there. */
     size_t ledger_cap = n_addrs + n_ledger_in + 1;
     pplns_claim_t *ledger = (pplns_claim_t *)calloc(ledger_cap, sizeof(*ledger));
     if (!ledger) { free(addrs); free(ledger_in); return -1; }
     if (n_ledger_in) memcpy(ledger, ledger_in, n_ledger_in * sizeof(*ledger));
-    free(ledger_in);
+    /* ledger_in is NOT freed here — pplns_compute_payouts rewrites `ledger` in
+     * place, so this is the only remaining record of what the plan started
+     * from, and settlement needs it to compute its delta. */
 
     int64_t headroom_wu = -1;
     size_t max_out = prop_max_outputs_for_template(t, s->cfg, fee_sats > 0,
                                                    &headroom_wu);
 
+    /* The split is denominated in the difficulty these rows actually carry;
+     * `actual_diff` is the walk's own measure of the same window and is used
+     * for reporting only. They are two queries against a table the writer
+     * thread is still committing into, so a small disagreement is expected and
+     * harmless. A LARGE one is a defect in the window walk — the fractions the
+     * payout would have used were measured against the wrong total — so say so
+     * rather than let it pass as a plausible number in a log line. */
+    double addr_diff = 0.0;
+    for (size_t i = 0; i < n_addrs; i++) addr_diff += addrs[i].total_difficulty;
+    if (addr_diff > 0.0 && actual_diff > 0.0 &&
+        fabs(addr_diff - actual_diff) / addr_diff > 0.01) {
+        LOG_WARN("proportional: window walk and address aggregate disagree by "
+                 "%.2f%% (walk %.2f, addresses %.2f over %zu rows) — paying on "
+                 "the address total, which is the one the payouts are measured "
+                 "against, but the walk should not be this far out",
+                 100.0 * fabs(addr_diff - actual_diff) / addr_diff,
+                 actual_diff, addr_diff, n_addrs);
+    }
+
     size_t n_payouts = 0, n_ledger_out = 0;
-    int rc = pplns_compute_payouts(reward_after_fee, actual_diff,
+    int rc = pplns_compute_payouts(reward_after_fee,
                                    addrs, n_addrs,
                                    ledger, ledger_cap, n_ledger_in, &n_ledger_out,
                                    s->cfg->prop_min_payout_sats, max_out,
                                    plan->payouts, &n_payouts);
     free(addrs);
     if (rc < 0 || n_payouts == 0) {
-        free(ledger);
+        free(ledger); free(ledger_in);
         LOG_WARN("proportional: payout computation produced nothing "
                  "(rc=%d, %zu addresses, window difficulty %.2f); falling back",
                  rc, n_addrs, actual_diff);
@@ -363,14 +424,55 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                   "coinbase for this template.",
                   (long long)total, (long long)reward_after_fee,
                   n_payouts, (long long)(total - reward_after_fee));
-        free(ledger);
+        free(ledger); free(ledger_in);
         return 1;
+    }
+
+    /* Build the coinbase once, here, before this plan is ever attached to a
+     * job. The render path has no fallback in this mode — one coinbase is
+     * shared by every connection, so a builder refusal there is not a lost
+     * payout, it is every miner getting "coinbase render failed" and the pool
+     * serving no work until the next template. The fallback that DOES exist is
+     * this one: return 1, hand out per-miner coinbases, keep mining.
+     *
+     * So the question "will the builder accept this payout set?" has to be
+     * asked while the answer can still change something. The builder is the
+     * authority on its own rules (dust floors, output count against the
+     * scriptSig and weight budget, commitment preservation) and asking it
+     * directly is cheaper than keeping a second copy of them in sync here. */
+    {
+        coinbase_payout_t cb[PROP_PLAN_MAX_PAY];
+        for (size_t i = 0; i < n_payouts && i < PROP_PLAN_MAX_PAY; i++) {
+            cb[i].address = plan->payouts[i].address;
+            cb[i].sats    = plan->payouts[i].sats;
+        }
+        coinbase_parts_t probe = {0};
+        char berr[256] = {0};
+        if (n_payouts > PROP_PLAN_MAX_PAY ||
+            coinbase_build_from_template_multi(t->coinbasetxn_hex, cb, n_payouts,
+                                               s->cfg->operator_address,
+                                               s->cfg->fee_bps,
+                                               s->cfg->coinbase_tag,
+                                               /*en1*/ 4, /*en2*/ 4,
+                                               &probe, NULL, NULL, NULL,
+                                               berr, sizeof berr) < 0) {
+            LOG_WARN("proportional: the builder refuses this payout set (%s) — "
+                     "falling back to per-miner coinbases for this template "
+                     "rather than serving no work. %zu outputs over %.2f window "
+                     "difficulty.", berr, n_payouts, actual_diff);
+            free(probe.cb1); free(probe.cb2);
+            free(ledger); free(ledger_in);
+            return 1;
+        }
+        free(probe.cb1); free(probe.cb2);
     }
 
     snprintf(plan->job_id, sizeof plan->job_id, "%s", job_id ? job_id : "");
     plan->height           = (uint32_t)t->height;
     plan->reward_after_fee = reward_after_fee;
     plan->n_payouts        = n_payouts;
+    plan->ledger_in        = ledger_in;
+    plan->n_ledger_in      = n_ledger_in;
     plan->ledger           = ledger;
     plan->n_ledger         = n_ledger_out;
 
@@ -772,6 +874,7 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
 
         if (found) {
             if (store_prop_settle_block(s->store, ts_ms,
+                                        settled.ledger_in, settled.n_ledger_in,
                                         settled.ledger, settled.n_ledger) < 0) {
                 LOG_ERROR("proportional: settling block %s (job %s) failed — "
                           "%zu payouts and %zu deferred claims are NOT recorded",

@@ -10,6 +10,17 @@
 
 typedef struct stratum_job stratum_job_t;
 
+/* How many retired jobs the server keeps solvable, on top of the current one.
+ * A submit naming a job older than `current + STRATUM_RECENT_JOBS` is rejected
+ * as unknown.
+ *
+ * Public because anything holding per-job state alongside the server has to
+ * retain at least as much of it: pool_mode=proportional keeps a payout plan
+ * per job, and a plan ring shorter than this made the oldest still-solvable
+ * job settle with no plan — silently paying its finder solo instead of the
+ * window. Size against this constant, never against a hand-picked number. */
+#define STRATUM_RECENT_JOBS 8
+
 /* Create a job from template fields. The coinbase is *not* baked into the
  * job — each connection renders its own coinbase paying its miner address
  * (minus the configured operator fee). The job carries everything else
