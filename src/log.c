@@ -24,6 +24,10 @@ static const char *level_tag(int level) {
     }
 }
 
+int log_enabled(int level) {
+    return level >= g_level;
+}
+
 void log_msg(int level, const char *fmt, ...) {
     if (level < g_level) {
         return;

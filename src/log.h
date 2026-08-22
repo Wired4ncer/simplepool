@@ -11,6 +11,10 @@ enum {
 };
 
 void log_init(int level);
+/* True when a message at `level` would actually be emitted. Lets a caller skip
+ * work it only needs for the log line itself — at minimum difficulty the submit
+ * path runs tens of thousands of times a second. */
+int  log_enabled(int level);
 void log_msg(int level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 

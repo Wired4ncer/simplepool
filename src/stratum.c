@@ -1310,18 +1310,26 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     char worker_target_hex[65] = {0};
     char network_target_hex[65] = {0};
 
-    // Convert the 32-byte big-endian fields into readable strings
+    // sent_hash_hex is needed by the share record below, so it is always built.
     bytes_to_hex(hash_be, 32, sent_hash_hex);
-    bytes_to_hex(worker_target, 32, worker_target_hex);
-    bytes_to_hex(job->network_target_be, 32, network_target_hex);
 
-    LOG_INFO("stratum: [SUBMIT CHECK] Worker: %s\n"
-             "  -> Sent Hash:     %s\n"
-             "  -> Worker Target: %s\n"
-             "  -> Network Tgt:   %s\n"
-             "  -> Version:       job=%08x rolled=%08x mask=%08x",
-             c->worker_name, sent_hash_hex, worker_target_hex, network_target_hex,
-             (uint32_t)job->version, (uint32_t)submit_version, c->version_mask);
+    /* DEBUG, not INFO. Vardiff clamps the share target to the network target, so at
+     * difficulty 1 every miner submits at its full hash rate and this fires tens of
+     * thousands of times a second. At INFO that buries journald's rate limit (10k/30s
+     * by default) and takes the pool's own WARN/ERROR lines down with it — the fault
+     * signal is lost in the noise about ordinary shares. The two extra hex conversions
+     * exist only for this line, so they are skipped with it. */
+    if (log_enabled(LOG_LVL_DEBUG)) {
+        bytes_to_hex(worker_target, 32, worker_target_hex);
+        bytes_to_hex(job->network_target_be, 32, network_target_hex);
+        LOG_DEBUG("stratum: [SUBMIT CHECK] Worker: %s\n"
+                  "  -> Sent Hash:     %s\n"
+                  "  -> Worker Target: %s\n"
+                  "  -> Network Tgt:   %s\n"
+                  "  -> Version:       job=%08x rolled=%08x mask=%08x",
+                  c->worker_name, sent_hash_hex, worker_target_hex, network_target_hex,
+                  (uint32_t)job->version, (uint32_t)submit_version, c->version_mask);
+    }
 
     uint64_t ts_now   = now_ms();
     int is_block      = be32_cmp(hash_be, job->network_target_be) <= 0;
