@@ -321,8 +321,20 @@ export async function runOnce(ctx, log) {
          * An unknown stage is treated as an unanswered submit. The safe
          * reading of "we do not know where it failed" is "it may have gone
          * out". */
-        const clean = e.stage === 'create' || e.stage === 'sign' ||
-                      (e.stage === 'submit' && e.rpcRejected === true);
+        /* create is NOT unconditionally safe. On thunder >= 0.17.1
+         * create_transfer signs and broadcasts internally (see
+         * transferBatchDetailed), so an unanswered create — timeout, transport
+         * failure — may already be on the network, exactly like an unanswered
+         * submit. Releasing its rows there is the double-payment this whole
+         * branch exists to prevent, just one stage earlier. An ANSWERED create
+         * (rpcRejected) is a clean abort: the node ran the method and declined.
+         *
+         * sign stays unconditional. It only runs on thunder < 0.17.1, where
+         * create_transfer merely builds and signing is local — nothing can have
+         * reached the network by then. */
+        const clean = e.stage === 'sign' ||
+                      ((e.stage === 'create' || e.stage === 'submit') &&
+                       e.rpcRejected === true);
         if (clean) abortBatch(db, rowIds);
         recordTxAttempt(db, {
             kind: 'payout', status: 'failed', stage: e.stage || 'unknown',

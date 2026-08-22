@@ -519,10 +519,12 @@ function failingThunder(stage, { message = 'boom', txid = null,
     return t;
 }
 
-for (const stage of ['create', 'sign']) {
+/* sign is local on every thunder that reaches it, and an ANSWERED create is
+ * the node declining to act. Both are clean aborts. */
+for (const [stage, opts] of [['sign', {}], ['create', { rpcRejected: true }]]) {
     test(`a ${stage}-stage failure is a clean abort and retries`, async () => {
         const db = makeDb({ owed: { rig1: 5_000_000 } });
-        const r = await runOnce({ db, thunder: failingThunder(stage), cfg }, quietLog);
+        const r = await runOnce({ db, thunder: failingThunder(stage, opts), cfg }, quietLog);
 
         assert.equal(r.ambiguous, false, `${stage} cannot have reached the network`);
         assert.equal(inFlightRows(db), 0, 'rows are released so the next tick retries');
@@ -533,6 +535,23 @@ for (const stage of ['create', 'sign']) {
         assert.equal(again.broadcast, 1);
     });
 }
+
+test('an UNANSWERED create keeps the rows — 0.17.1 broadcasts inside create', async () => {
+    const db = makeDb({ owed: { rig1: 5_000_000 } });
+    const r = await runOnce({ db, thunder: failingThunder('create'), cfg }, quietLog);
+
+    assert.equal(r.ambiguous, true,
+        'create_transfer signs and broadcasts internally on thunder >= 0.17.1, ' +
+        'so an unanswered call may already be on the network');
+    assert.equal(credited(db), 0, 'nothing is credited — it may never have landed');
+    assert.equal(inFlightRows(db), 1, 'the row STAYS: this may already be on the network');
+
+    const next = thunderStub();
+    await runOnce({ db, thunder: next, cfg }, quietLog);
+    assert.equal(next.calls.transfers, 0, 'a second broadcast here is a double payment');
+
+    assert.equal(listStuck(db, 0, nowSec() + 1).length, 1, 'reported for an operator');
+});
 
 test('a rejected submit is a clean abort and retries', async () => {
     const db = makeDb({ owed: { rig1: 5_000_000 } });

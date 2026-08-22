@@ -1273,10 +1273,15 @@ int main(int argc, char **argv) {
      * the pool would hand every miner the same initial job forever while
      * looking perfectly healthy — fail loudly instead. */
     pthread_t watcher;
-    if (pthread_create(&watcher, NULL, tip_watcher, &sctx) != 0) {
+    /* pthread_create RETURNS the error number and does not set errno, so
+     * strerror(errno) here would print an unrelated stale error on the one
+     * path where the message is all the operator gets. */
+    int watcher_rc = pthread_create(&watcher, NULL, tip_watcher, &sctx);
+    if (watcher_rc != 0) {
         fprintf(stderr, "fatal: could not start the tip watcher: %s\n",
-                strerror(errno));
-        LOG_ERROR("fatal: could not start the tip watcher: %s", strerror(errno));
+                strerror(watcher_rc));
+        LOG_ERROR("fatal: could not start the tip watcher: %s",
+                  strerror(watcher_rc));
         stratum_server_stop(srv);
         stratum_server_free(srv);
         store_close(store);
