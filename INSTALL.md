@@ -178,7 +178,9 @@ What it does (idempotent — re-run after every code change):
    right `USER` / `ROOT` substitutions, install to
    `/etc/systemd/system/`, `enable --now` each.
 7. Drop the nginx vhost from `deploy/nginx/` into `sites-available`
-   and enable it, open ports 80 / 443 / 3334 via `ufw` if active.
+   and enable it, open ports 80 / 443 / 3334 via `ufw` if active. If
+   `rental_listen_port` is configured (see RENTED_HASHRATE.md), open that
+   port too — it is a second listener, not a redirect of the first.
 
 After that runs cleanly, jump to **Part D** (configuring `proxy.conf`
 for your chosen mode) — everything else is already up.
@@ -365,6 +367,16 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30
 
+# Optional second stratum listener for hashrate marketplaces (Braiins
+# Hashpower, NiceHash), serving a fixed high share difficulty. Off unless
+# rental_listen_port is set. Shares from both ports feed the same PPLNS
+# window and the same coinbase. See RENTED_HASHRATE.md — in particular the
+# note that a minimum-difficulty window (a fork) clamps this port below the
+# marketplace floor and orders will reject-flood until difficulty ramps back.
+# rental_listen_port = 3335
+# rental_min_diff    = 500000     # clears Braiins (>=1024) and NiceHash (500000)
+# rental_max_conns   = 0          # 0 = inherit max_conns
+
 db_path = /home/simplepool/data/shares.db
 log_level = info
 ```
@@ -521,6 +533,11 @@ Then check:
 1. **Pool is listening**:
    ```sh
    ss -tlnp | grep :3334
+   # with a rental port configured, BOTH must be present:
+   ss -tlnp | grep -E ':3334|:3335'
+   # and the advertised extranonce2 width must be >= 7 on each:
+   (echo '{"id":1,"method":"mining.subscribe","params":[]}'; sleep 1) \
+     | nc 127.0.0.1 3334 | head -1 | jq -r '.result[2]'
    ```
 2. **Pool talks to bitcoind / enforcer**:
    ```sh

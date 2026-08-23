@@ -130,7 +130,7 @@ sequenceDiagram
     Note over M,P: per-connection setup
     M->>P: TCP connect :3334
     M->>P: mining.subscribe
-    P-->>M: extranonce1 (4B, per-conn), en2_size
+    P-->>M: extranonce1 (4B, per-conn), en2_size (8B)
     M->>P: mining.authorize "<bc1q…>[.rig_label]"
     P->>P: validate bech32/base58 → cache payout_address<br/>arm vardiff window
     P-->>M: result: true
@@ -179,7 +179,15 @@ Key invariants the diagram glosses over but the code enforces:
 - **Per-connection coinbase.** Each miner's `cb1`/`cb2` pay *that*
   miner's address; the operator fee output is identical across miners.
   Two ASICs on the same address but different `.rig_label` get
-  distinct `extranonce1` values, so their work never overlaps.
+  distinct `extranonce1` values, so their work never overlaps. That
+  uniqueness is process-wide, not per-listener — see
+  [NONCE_AND_SHARES.md](NONCE_AND_SHARES.md), and the rental port below.
+- **Optional rental port.** A second stratum listener
+  (`rental_listen_port`) serving a fixed high share difficulty, for
+  hashrate marketplaces that require one. Off by default. Shares from
+  both ports feed the same PPLNS window and the same coinbase; the
+  ports differ only in the difficulty they serve. See
+  [RENTED_HASHRATE.md](RENTED_HASHRATE.md).
 - **WAL writes are batched.** `store_record_share` enqueues into a
   lock-free ring; the writer thread commits batches every
   `commit_window_ms` (default 100) or every `commit_max_shares`
