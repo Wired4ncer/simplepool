@@ -33,6 +33,34 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30       # how often to retarget
 
+# ---------------------------------------------------------------------------
+# Rental port — a SECOND stratum listener for hashrate marketplaces
+# (Braiins Hashpower, NiceHash). 0 or unset = off, and the pool behaves
+# exactly as it did before this existed.
+#
+# Rented hashrate does not arrive as many small miners. It arrives as one
+# aggregated worker behind a proxy, with a hard minimum share difficulty:
+# Braiins floors at 1024 and recommends 65536, NiceHash requires 500000.
+# Serving those on the public port would price out every home miner, so they
+# get their own listener. Shares from both ports feed the SAME PPLNS window
+# and the same coinbase — the ports differ only in the difficulty they serve.
+#
+# 500000 clears both marketplaces with one port.
+#
+# rental_min_diff is used as BOTH the starting difficulty and the vardiff
+# floor. Do NOT try to reach the floor by letting vardiff ramp: that starts a
+# connection below the marketplace minimum, and orders get cancelled for
+# invalid shares before the ramp finishes.
+#
+# NOTE: the network-difficulty clamp still wins over this floor. During a
+# minimum-difficulty window (a fork resets difficulty to powLimit) the chain
+# cannot support the floor and marketplace orders will reject-flood until
+# difficulty ramps back. Known and time-bounded, not a misconfiguration.
+#
+# rental_listen_port = 3335
+# rental_min_diff    = 500000
+# rental_max_conns   = 0        # 0 = inherit max_conns
+
 db_path = ./data/shares.db
 commit_window_ms = 100
 commit_max_shares = 100

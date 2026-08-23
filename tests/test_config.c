@@ -93,12 +93,50 @@ static void test_rejects_bad_operator_address(void) {
     CHECK(strcmp(cfg.operator_address, "not-an-address") == 0);
 }
 
+/* The rental port defaults to OFF, so an existing config file keeps behaving
+ * exactly as it did. The floor defaults to a value that clears both
+ * marketplaces (Braiins >= 1024/recommends 65536, NiceHash 500000) but is
+ * inert until a port is actually set. */
+static void test_rental_port_defaults_off(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.rental_listen_port == 0);
+    CHECK(cfg.rental_min_diff == 500000.0);
+    CHECK(cfg.rental_max_conns == 0);
+}
+
+static void test_rental_port_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "rental_listen_port = 3335\n"
+             "rental_min_diff = 65536\n"
+             "rental_max_conns = 32\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.rental_listen_port == 3335);
+    CHECK(cfg.rental_min_diff == 65536.0);
+    CHECK(cfg.rental_max_conns == 32);
+    /* The public port is untouched by any of it. */
+    CHECK(cfg.listen_port == 3334);
+    CHECK(cfg.initial_diff == 1.0);
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
     test_quoted_value_keeps_hash();
     test_inline_comment_still_strips();
     test_rejects_bad_operator_address();
+    test_rental_port_defaults_off();
+    test_rental_port_parses();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;

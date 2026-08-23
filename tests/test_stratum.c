@@ -91,13 +91,22 @@ static int count_lines(const char *buf, size_t len) {
 /* Build a tiny job for tests. The coinbase is rendered per-connection at
  * notify/submit time using the miner's address, so the job only carries
  * template-level data. */
+/* extranonce2 for submits, sized to the advertised width. The static assert
+ * is the point: widen STRATUM_EXTRANONCE2_SIZE without updating this and the
+ * tests fail to COMPILE, rather than a wrong-width coinbase reaching a real
+ * block and being rejected by the network. */
+#define TEST_EN2 "deadbeefdeadbeef"
+_Static_assert(sizeof(TEST_EN2) - 1 == STRATUM_EXTRANONCE2_SIZE * 2,
+               "TEST_EN2 must be STRATUM_EXTRANONCE2_SIZE bytes of hex");
+
 static stratum_job_t *make_test_job(const char *job_id,
                                     const uint8_t *network_target_be) {
     uint8_t prev[32] = {0};
     return stratum_job_new(job_id, 1, prev,
                            /*value_sats*/ 5000000000LL,
                            /*wc_hex*/ NULL,
-                           /*en1*/ 4, /*en2*/ 4,
+                           /*en1*/ STRATUM_EXTRANONCE1_SIZE,
+                           /*en2*/ STRATUM_EXTRANONCE2_SIZE,
                            NULL, 0, 0x1d00ffffu, 0x60000000u,
                            network_target_be, 800000, NULL, 0,
                            /*coinbasetxn_hex*/ NULL,
@@ -131,9 +140,14 @@ static void test_subscribe(void) {
         cJSON *subs = cJSON_GetArrayItem(result, 0);
         CHECK(cJSON_IsArray(subs) && cJSON_GetArraySize(subs) == 2);
         cJSON *ex1 = cJSON_GetArrayItem(result, 1);
-        CHECK(cJSON_IsString(ex1) && strlen(ex1->valuestring) == 8);
+        CHECK(cJSON_IsString(ex1) &&
+              strlen(ex1->valuestring) == STRATUM_EXTRANONCE1_SIZE * 2);
         cJSON *ex2sz = cJSON_GetArrayItem(result, 2);
-        CHECK(cJSON_IsNumber(ex2sz) && ex2sz->valueint == 4);
+        /* The width marketplaces gate on. Braiins Hashpower rejects a pool
+         * URL advertising < 7 outright, before a share is ever submitted. */
+        CHECK(cJSON_IsNumber(ex2sz) &&
+              ex2sz->valueint == STRATUM_EXTRANONCE2_SIZE);
+        CHECK(ex2sz->valueint >= 7);
         cJSON_Delete(resp);
     }
     free(out);
@@ -237,7 +251,7 @@ static void test_submit_share_and_dedupe(void) {
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);
@@ -248,7 +262,7 @@ static void test_submit_share_and_dedupe(void) {
     /* Duplicate: same parameters again. */
     rc = stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);  /* not incremented */
@@ -294,20 +308,24 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
          "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
         &out, &olen); free(out); out=NULL; olen=0;
 
-    /* Precondition: the correct width (4 bytes) is accepted here. */
+    /* Precondition, and it has to hold for the rejections below to mean
+     * anything: the ADVERTISED width is accepted. Sized off the constant, so
+     * this stays a real precondition if the width changes again. */
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"aabbccdd\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);
     CHECK(obs.rejects == 0);
     free(out); out=NULL; olen=0;
 
-    /* Too short: 3 bytes. */
+    /* One byte too short (7 bytes). Deliberately just under the width
+     * rather than wildly wrong: 7 is what the marketplaces floor at, so it is
+     * the width a miscalibrated proxy is most likely to send. */
     rc = stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"aabbcc\",\"60000000\",\"00000002\"]}",
+        "\"params\":[\"w\",\"J1\",\"aabbccddeeff00\",\"60000000\",\"00000002\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);                 /* not credited */
@@ -316,10 +334,10 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
     CHECK(strstr(out, "\"error\"") != NULL);
     free(out); out=NULL; olen=0;
 
-    /* Too long: 6 bytes. */
+    /* One byte too long (9 bytes). */
     rc = stratum_handle_message(s, c,
         "{\"id\":5,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"aabbccddeeff\",\"60000000\",\"00000003\"]}",
+        "\"params\":[\"w\",\"J1\",\"aabbccddeeff001122\",\"60000000\",\"00000003\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.shares == 1);
@@ -567,7 +585,7 @@ static void test_block_wins_over_low_difficulty(void) {
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(rc == 0);
     CHECK(obs.rejects == 0);
@@ -618,7 +636,7 @@ static void test_vardiff_clamped_to_network_diff(void) {
     sleep_ms(1100);
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(out != NULL);
     CHECK(strstr(out, "mining.set_difficulty") != NULL);
@@ -665,7 +683,7 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
     sleep_ms(1100);
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(strstr(out, "mining.set_difficulty") != NULL);
     CHECK(obs.shares == 1);
@@ -675,7 +693,7 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
      * grace window must accept it. */
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000002\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000002\"]}",
         &out, &olen);
     CHECK(obs.shares == 2);
     CHECK(obs.rejects == 0);
@@ -853,7 +871,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
 
     stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J1\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(obs.shares == 1);
     free(out); out=NULL; olen=0;
@@ -862,7 +880,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_set_job(s, make_test_job("J2", net));
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
-        "\"params\":[\"w\",\"J2\",\"deadbeef\",\"60000000\",\"00000001\"]}",
+        "\"params\":[\"w\",\"J2\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
     CHECK(obs.shares == 1);  /* still one */
     CHECK(obs.rejects >= 1);
@@ -973,7 +991,8 @@ static stratum_job_t *make_prop_job(const char *job_id,
     return stratum_job_new(job_id, 1, prev,
                            /*value_sats*/ 5000000000LL,
                            /*wc_hex*/ NULL,
-                           /*en1*/ 4, /*en2*/ 4,
+                           /*en1*/ STRATUM_EXTRANONCE1_SIZE,
+                           /*en2*/ STRATUM_EXTRANONCE2_SIZE,
                            NULL, 0, 0x1d00ffffu, 0x60000000u,
                            network_target_be, 800000, NULL, 0,
                            PROP_COINBASE_HEX,
@@ -1097,7 +1116,7 @@ static void test_proportional_shared_coinbase(void) {
         char sub[256];
         snprintf(sub, sizeof sub,
             "{\"id\":3,\"method\":\"mining.submit\","
-            "\"params\":[\"w%d\",\"P1\",\"deadbeef\",\"60000000\",\"0000000%d\"]}",
+            "\"params\":[\"w%d\",\"P1\",\"" TEST_EN2 "\",\"60000000\",\"0000000%d\"]}",
             i, i + 1);
         CHECK(stratum_handle_message(s, c[i], sub, &out, &olen) == 0);
         free(out);
@@ -1158,6 +1177,200 @@ static void test_proportional_falls_back_without_window(void) {
     printf("ok: proportional falls back to per-miner without a window\n");
 }
 
+/* Helper: subscribe one fresh connection and return its extranonce1 as an
+ * unsigned int. Returns 0 on any failure, which no real allocation produces
+ * often enough to mask a bug (the counter is clock-seeded). */
+static unsigned subscribe_get_en1(stratum_server_t *s, stratum_conn_t **out_c) {
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    *out_c = c;
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}", &out, &olen);
+    unsigned v = 0;
+    if (out) {
+        cJSON *resp = parse_first_line(out);
+        if (resp) {
+            cJSON *ex1 = cJSON_GetArrayItem(cJSON_GetObjectItem(resp, "result"), 1);
+            if (cJSON_IsString(ex1)) v = (unsigned)strtoul(ex1->valuestring, NULL, 16);
+            cJSON_Delete(resp);
+        }
+        free(out);
+    }
+    return v;
+}
+
+/* Two servers sharing a stratum_shared_t must draw extranonce1 from ONE
+ * sequence.
+ *
+ * This is the invariant the rental port rests on. Two connections handed the
+ * same extranonce1 render identical coinbases, mine identical headers, and
+ * find the same hash from the same nonce — the share is credited twice and
+ * half the hashrate is wasted. Each server left to allocate its own counter
+ * seeds it from the clock at startup, so two started in the same process seed
+ * within a millisecond of each other and their sequences overlap almost
+ * entirely.
+ *
+ * Asserting only "the values differ" would pass by luck whenever the two
+ * clock seeds happened to differ, so this asserts the stronger and fully
+ * deterministic property: consecutive subscribes across the two servers are
+ * CONSECUTIVE, which can only hold if one counter is feeding both. */
+static void test_shared_extranonce1_sequence_across_servers(void) {
+    stratum_shared_t *shared = stratum_shared_new();
+    CHECK(shared != NULL);
+    if (!shared) return;
+
+    stratum_cfg_t cfg_a = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                            .shared = shared };
+    stratum_cfg_t cfg_b = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                            .shared = shared };
+    snprintf(cfg_a.bind_addr, sizeof(cfg_a.bind_addr), "127.0.0.1");
+    snprintf(cfg_b.bind_addr, sizeof(cfg_b.bind_addr), "127.0.0.1");
+
+    stratum_server_t *a = NULL, *b = NULL;
+    CHECK(stratum_server_start(&cfg_a, &a) == 0);
+    CHECK(stratum_server_start(&cfg_b, &b) == 0);
+    if (!a || !b) { stratum_shared_free(shared); return; }
+
+    stratum_conn_t *c1, *c2, *c3, *c4;
+    unsigned e1 = subscribe_get_en1(a, &c1);   /* public port  */
+    unsigned e2 = subscribe_get_en1(b, &c2);   /* rental port  */
+    unsigned e3 = subscribe_get_en1(a, &c3);
+    unsigned e4 = subscribe_get_en1(b, &c4);
+
+    /* One counter, so the four are strictly consecutive regardless of which
+     * server each subscribe landed on. */
+    CHECK(e2 == e1 + 1);
+    CHECK(e3 == e1 + 2);
+    CHECK(e4 == e1 + 3);
+
+    /* The property all of that exists to guarantee. */
+    CHECK(e1 != e2 && e1 != e3 && e1 != e4);
+    CHECK(e2 != e3 && e2 != e4 && e3 != e4);
+
+    stratum_conn_free_for_test(c1); stratum_conn_free_for_test(c2);
+    stratum_conn_free_for_test(c3); stratum_conn_free_for_test(c4);
+    stratum_server_free(a);
+    stratum_server_free(b);
+    /* Freeing the servers must not have freed state they only borrowed. */
+    stratum_shared_free(shared);
+    printf("ok: extranonce1 is one sequence across both servers\n");
+}
+
+/* A server given no shared state allocates its own, so the single-server
+ * case and every other test keep working unchanged. */
+static void test_server_without_shared_still_allocates_one(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    stratum_conn_t *c1, *c2;
+    unsigned e1 = subscribe_get_en1(s, &c1);
+    unsigned e2 = subscribe_get_en1(s, &c2);
+    CHECK(e2 == e1 + 1);
+    stratum_conn_free_for_test(c1);
+    stratum_conn_free_for_test(c2);
+    stratum_server_free(s);   /* must free the counter it owns */
+    printf("ok: a lone server allocates its own shared state\n");
+}
+
+static double hint_low(void *ctx, const char *worker) {
+    (void)ctx; (void)worker; return 7.0;
+}
+
+/* The rental port's floor has to survive a returning worker.
+ *
+ * The difficulty hint replays whatever this worker name converged to before,
+ * and it knows nothing about which port earned it. A miner that mined the
+ * public port at difficulty 7 and then points a rented fleet at the rental
+ * port would otherwise be seeded at 7 — under the marketplace minimum, which
+ * fails the order for invalid shares rather than merely mis-sizing shares. */
+static void test_hint_below_vardiff_min_is_floored(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 500000.0,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 500000.0,
+                           .vardiff_max = 1e12,
+                           .vardiff_window_sec = 30,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_difficulty_hint = hint_low,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+
+    /* A HIGH-difficulty network target (~16.7M: the difficulty-1 target
+     * shifted three bytes right). The network clamp deliberately wins over
+     * the floor, so an easy target here would pull the difficulty back under
+     * vardiff_min and the test would report the clamp's work as the floor's.
+     * → feedback_tests-that-pass-for-the-wrong-reason */
+    uint8_t net[32] = {0};
+    net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+
+    /* Floored to vardiff_min, not seeded at the hint's 7. */
+    CHECK(out != NULL);
+    CHECK(strstr(out, "\"params\":[500000]") != NULL);
+    CHECK(strstr(out, "\"params\":[7]") == NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a hint below vardiff_min is raised to the floor\n");
+}
+
+/* ...but the floor is deliberately NOT applied to initial_diff. A server
+ * whose initial_diff sits below its vardiff_min is a valid configuration —
+ * it starts easy and lets the first retarget lift it — and that is what
+ * test_vardiff_grace_accepts_old_diff_shares relies on. Pinning this so the
+ * hint floor above never quietly widens into initial_diff. */
+static void test_initial_diff_below_vardiff_min_is_not_floored(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1.0,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 500000.0,
+                           .vardiff_max = 1e12,
+                           .vardiff_window_sec = 30,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    /* Same high-difficulty target, same reason. */
+    uint8_t net[32] = {0};
+    net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "\"params\":[1]") != NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: initial_diff below vardiff_min is left alone\n");
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -1179,6 +1392,10 @@ int main(void) {
     test_authorize_without_hint_uses_initial();
     test_proportional_shared_coinbase();
     test_proportional_falls_back_without_window();
+    test_shared_extranonce1_sequence_across_servers();
+    test_server_without_shared_still_allocates_one();
+    test_hint_below_vardiff_min_is_floored();
+    test_initial_diff_below_vardiff_min_is_not_floored();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

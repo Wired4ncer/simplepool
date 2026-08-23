@@ -41,8 +41,8 @@
 
 #define MAX_LINE_BYTES 16384
 #define DEDUPE_RING    1024
-/* Server-wide ring, so it has to cover every live connection's recent
- * submissions rather than just one's. */
+/* Process-wide ring, so it has to cover every live connection's recent
+ * submissions across every server rather than just one's. */
 #define SHARE_DEDUPE_RING 16384
 /* The retention ring is sized in stratum.h, because main.c's payout-plan ring
  * must be able to cover every job that is still solvable. */
@@ -56,6 +56,46 @@
  * miner, and a per-connection mask (this ANDed with the client's request) is
  * applied to every submitted version. */
 #define VERSION_ROLLING_MASK 0x1fffe000u
+
+/* ========================================================== shared ====== */
+
+static uint64_t now_ms(void);   /* defined below; used to seed the counter */
+
+/* State every stratum server in the process must draw from in common. The
+ * rationale for each field — and why a per-server copy is a double-credit bug
+ * once a second port exists — is on stratum_shared_t in stratum.h. */
+struct stratum_shared {
+    /* Seeded from the clock at construction (so values differ across
+     * restarts) and incremented per subscribe, which is what makes each
+     * connection's extranonce1 distinct. Do not mix it with the clock again
+     * at use. */
+    atomic_uint extranonce1_seq;
+
+    /* Share dedupe, keyed on the resulting block-header hash. The
+     * per-connection ring in stratum_conn cannot catch a duplicate that
+     * arrives on a *different* connection, and two connections handed the
+     * same extranonce1 render identical coinbases — so the same nonce yields
+     * the same hash on both, and it would be credited twice. Keying on the
+     * final hash makes the check independent of how the submission was framed
+     * (job id, extranonce2, version rolling). */
+    pthread_mutex_t dedupe_lock;
+    uint64_t        dedupe[SHARE_DEDUPE_RING];
+    size_t          dedupe_head;
+};
+
+stratum_shared_t *stratum_shared_new(void) {
+    stratum_shared_t *sh = calloc(1, sizeof(*sh));
+    if (!sh) return NULL;
+    pthread_mutex_init(&sh->dedupe_lock, NULL);
+    atomic_init(&sh->extranonce1_seq, (unsigned)now_ms());
+    return sh;
+}
+
+void stratum_shared_free(stratum_shared_t *sh) {
+    if (!sh) return;
+    pthread_mutex_destroy(&sh->dedupe_lock);
+    free(sh);
+}
 
 /* ============================================================== job ===== */
 
@@ -187,6 +227,13 @@ static void job_destroy(stratum_job_t *j) {
     free(j);
 }
 
+/* Take one reference. See the header: set_job consumes one, so publishing the
+ * same job to a second server needs one taken first. */
+stratum_job_t *stratum_job_ref(stratum_job_t *j) {
+    if (j) atomic_fetch_add(&j->refs, 1u);
+    return j;
+}
+
 /* Drop one reference; deallocate at zero. Named "free" because that is what it
  * is to every caller outside this file — a job handed back is a job released. */
 void stratum_job_free(stratum_job_t *j) {
@@ -237,21 +284,13 @@ struct stratum_server {
     int  listen_fd;
     atomic_int  stop;
     atomic_int  conn_count;
-    /* Seeded from the clock at startup (so values differ across restarts)
-     * and incremented per subscribe, which is what makes each connection's
-     * extranonce1 distinct. Do not mix it with the clock again at use. */
-    atomic_uint extranonce1_seq;
-
-    /* Server-wide share dedupe, keyed on the resulting block-header hash.
-     * The per-connection ring in stratum_conn cannot catch a duplicate that
-     * arrives on a *different* connection, and two connections handed the
-     * same extranonce1 render identical coinbases — so the same nonce
-     * yields the same hash on both, and PPS would credit it twice. Keying
-     * on the final hash makes the check independent of how the submission
-     * was framed (job id, extranonce2, version rolling). */
-    pthread_mutex_t share_dedupe_lock;
-    uint64_t        share_dedupe[SHARE_DEDUPE_RING];
-    size_t          share_dedupe_head;
+    /* Extranonce1 counter and share dedupe, shared with every other server in
+     * the process (see stratum_shared_t in stratum.h). Never per-server: two
+     * servers each with their own would hand out colliding extranonce1 values
+     * and be unable to detect the duplicate shares that result. `shared_owned`
+     * records whether this server allocated it and must free it. */
+    stratum_shared_t *shared;
+    int               shared_owned;
 
     pthread_t   listener_thr;
     int         listener_started;
@@ -273,7 +312,7 @@ struct stratum_conn {
     pthread_t thr;
     int thr_started;
 
-    uint8_t  extranonce1[4];
+    uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
     int      subscribed;
     int      authorized;
@@ -873,7 +912,12 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * counter, e.g. an even seq at an even millisecond and the next seq one
      * millisecond later both yield the same value. A miner opening several
      * connections at once hits that case routinely. */
-    unsigned seq = atomic_fetch_add(&s->extranonce1_seq, 1);
+    /* The packing below writes exactly four bytes out of a uint32_t. Widening
+     * extranonce1 means rewriting it, so fail the build rather than silently
+     * leaving the high bytes of a wider field uninitialised. */
+    _Static_assert(STRATUM_EXTRANONCE1_SIZE == 4,
+                   "extranonce1 packing below assumes a 4-byte field");
+    unsigned seq = atomic_fetch_add(&s->shared->extranonce1_seq, 1);
     uint32_t mix = (uint32_t)seq;
     c->extranonce1[0] = (uint8_t)(mix >> 24);
     c->extranonce1[1] = (uint8_t)(mix >> 16);
@@ -881,8 +925,8 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->extranonce1[3] = (uint8_t)mix;
     c->subscribed = 1;
 
-    char ex1_hex[9];
-    bytes_to_hex(c->extranonce1, 4, ex1_hex);
+    char ex1_hex[STRATUM_EXTRANONCE1_SIZE * 2 + 1];
+    bytes_to_hex(c->extranonce1, STRATUM_EXTRANONCE1_SIZE, ex1_hex);
 
     cJSON *result = cJSON_CreateArray();
     cJSON *subs = cJSON_CreateArray();
@@ -896,7 +940,7 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     cJSON_AddItemToArray(subs, sn);
     cJSON_AddItemToArray(result, subs);
     cJSON_AddItemToArray(result, cJSON_CreateString(ex1_hex));
-    cJSON_AddItemToArray(result, cJSON_CreateNumber(4));
+    cJSON_AddItemToArray(result, cJSON_CreateNumber(STRATUM_EXTRANONCE2_SIZE));
 
     return emit_response(buf, len, id, result, NULL);
 }
@@ -1033,6 +1077,24 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     double hint = 0.0;
     if (s->cfg.on_difficulty_hint) {
         hint = s->cfg.on_difficulty_hint(s->cfg.ctx, c->worker_name);
+        /* Floor the REPLAYED difficulty at vardiff_min. The hint comes from
+         * this worker's own history, which is keyed on worker name and knows
+         * nothing about which port it was earned on — so a miner that mined
+         * the public port at difficulty 1 and then points a rented fleet at
+         * the rental port would be seeded at 1 there, under the marketplace's
+         * hard minimum, and the order fails for invalid shares.
+         *
+         * Deliberately NOT applied to cfg.initial_diff: a server whose
+         * initial_diff sits below its vardiff_min is a valid configuration
+         * (it starts easy and lets the first retarget lift it), and the
+         * rental port sets initial_diff to the floor explicitly anyway. */
+        if (hint > 0.0 && s->cfg.vardiff_min > 0.0 &&
+            hint < s->cfg.vardiff_min) {
+            LOG_INFO("stratum: %s hint %.0f is below the vardiff floor %.0f — "
+                     "starting at the floor",
+                     c->worker_name, hint, s->cfg.vardiff_min);
+            hint = s->cfg.vardiff_min;
+        }
     }
     /* From here to the initial notify we are mutating the same fields the tip
      * watcher touches on a job switch, so take the connection's state lock. */
@@ -1044,8 +1106,11 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     } else if (c->difficulty <= 0) {
         c->difficulty = s->cfg.initial_diff;
     }
-    /* Same clamp as vardiff: a starting difficulty above the network
-     * difficulty would make the miner discard valid blocks locally. */
+    /* Same clamp as vardiff, and it deliberately wins over the hint floor
+     * above: a starting difficulty above the network difficulty would make the
+     * miner discard valid blocks locally. When the two disagree the chain
+     * wins — see the minimum-difficulty-window note in the rental port's
+     * config. */
     double net_diff = current_net_diff(s);
     if (net_diff > 0.0 && c->difficulty > net_diff) c->difficulty = net_diff;
     /* Arm vardiff window for this connection. */
@@ -1086,17 +1151,18 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
  * id. Two identical hashes represent one solution and must be paid once. */
 static int share_dedupe_check_and_add(stratum_server_t *s,
                                       const uint8_t hash_be[32]) {
+    stratum_shared_t *sh = s->shared;
     uint64_t h = fnv1a_bytes(hash_be, 32);
     int dup = 0;
-    pthread_mutex_lock(&s->share_dedupe_lock);
+    pthread_mutex_lock(&sh->dedupe_lock);
     for (size_t i = 0; i < SHARE_DEDUPE_RING; ++i) {
-        if (s->share_dedupe[i] == h) { dup = 1; break; }
+        if (sh->dedupe[i] == h) { dup = 1; break; }
     }
     if (!dup) {
-        s->share_dedupe[s->share_dedupe_head] = h;
-        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
+        sh->dedupe[sh->dedupe_head] = h;
+        sh->dedupe_head = (sh->dedupe_head + 1) % SHARE_DEDUPE_RING;
     }
-    pthread_mutex_unlock(&s->share_dedupe_lock);
+    pthread_mutex_unlock(&sh->dedupe_lock);
     return dup;
 }
 
@@ -1269,7 +1335,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     /* coinbase = cb1 || ex1 || ex2 || cb2 */
-    size_t cb_len = c->cb1_len + 4 + en2_len + c->cb2_len;
+    size_t cb_len = c->cb1_len + STRATUM_EXTRANONCE1_SIZE + en2_len + c->cb2_len;
     uint8_t *cb = malloc(cb_len);
     if (!cb) {
         pthread_mutex_unlock(&c->state_lock);
@@ -1279,7 +1345,8 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
     size_t off = 0;
     memcpy(cb + off, c->cb1, c->cb1_len);   off += c->cb1_len;
-    memcpy(cb + off, c->extranonce1, 4);    off += 4;
+    memcpy(cb + off, c->extranonce1, STRATUM_EXTRANONCE1_SIZE);
+    off += STRATUM_EXTRANONCE1_SIZE;
     memcpy(cb + off, en2_bytes, en2_len);   off += en2_len;
     memcpy(cb + off, c->cb2, c->cb2_len);   off += c->cb2_len;
     const double cur_diff       = c->difficulty;
@@ -1770,13 +1837,27 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     pthread_rwlock_init(&s->job_lock, NULL);
     pthread_mutex_init(&s->recent_lock, NULL);
     pthread_mutex_init(&s->conns_lock, NULL);
-    pthread_mutex_init(&s->share_dedupe_lock, NULL);
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
-    atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
+
+    /* A lone server (and every test) allocates its own; main.c passes one in
+     * so the rental port draws extranonce1 from the same sequence and dedupes
+     * against the same ring as the public port. */
+    if (s->cfg.shared) {
+        s->shared = s->cfg.shared;
+        s->shared_owned = 0;
+    } else {
+        s->shared = stratum_shared_new();
+        if (!s->shared) { free(s); return -1; }
+        s->shared_owned = 1;
+    }
 
     s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (s->listen_fd < 0) { free(s); return -1; }
+    if (s->listen_fd < 0) {
+        if (s->shared_owned) stratum_shared_free(s->shared);
+        free(s);
+        return -1;
+    }
     int one = 1;
     setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in addr = {0};
@@ -1786,18 +1867,18 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else {
         if (inet_pton(AF_INET, cfg->bind_addr, &addr.sin_addr) != 1) {
-            close(s->listen_fd); free(s); return -1;
+            close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
         }
     }
     if (bind(s->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, cfg->bind_port, strerror(errno));
-        close(s->listen_fd); free(s); return -1;
+        close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
     }
     if (listen(s->listen_fd, 64) < 0) {
-        close(s->listen_fd); free(s); return -1;
+        close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
     }
     if (pthread_create(&s->listener_thr, NULL, listener_thread, s) != 0) {
-        close(s->listen_fd); free(s); return -1;
+        close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
     }
     s->listener_started = 1;
     *out = s;
@@ -1912,6 +1993,6 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_rwlock_destroy(&s->job_lock);
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
-    pthread_mutex_destroy(&s->share_dedupe_lock);
+    if (s->shared_owned) stratum_shared_free(s->shared);
     free(s);
 }

@@ -44,19 +44,35 @@ simplepool uses the standard stratum-v1 split:
 ```
 coinbase scriptSig layout (assembled at share-check time):
 
-   [ height_push ] [ tag ] [ extranonce1 (4 B) ][ extranonce2 (4 B) ]
+   [ height_push ] [ tag ] [ extranonce1 (4 B) ][ extranonce2 (8 B) ]
                             └── pool assigns ──┘└──  miner picks   ──┘
 ```
 
 - **extranonce1 (4 bytes, `en1`)** — assigned by the pool when the
   connection subscribes. Immutable for the life of that TCP session.
-- **extranonce2 (4 bytes, `en2`)** — the miner's private search field.
+- **extranonce2 (8 bytes, `en2`)** — the miner's private search field.
   Each `mining.submit` carries an `en2` value; the miner sweeps it
   independently.
 
-Together they give each connection **2⁶⁴ distinct coinbases** to try
+Both widths come from `STRATUM_EXTRANONCE1_SIZE` / `STRATUM_EXTRANONCE2_SIZE`
+in `src/stratum.h`, and the submit path rejects any `en2` that is not exactly
+the advertised width — a mismatched width produces a coinbase whose scriptSig
+length prefix disagrees with its contents, which still hashes like a valid
+header but can never become a block.
+
+Together they give each connection **2⁹⁶ distinct coinbases** to try
 before it has to reconnect for a fresh `en1`. At any real hashrate,
 that's effectively unbounded.
+
+**Why `en2` is 8 and not the classic 4.** Not search space — 4 was already
+unreachable. The reason is *subdivision*. Rented hashrate from a marketplace
+does not arrive as many small miners; it arrives as one aggregated worker
+behind a proxy that splits the `en2` it is handed into a downstream-miner id
+(high bytes) plus that miner's own `en2` (low bytes). At 4 bytes a proxy
+spending 3 on addressing leaves its miners one byte, and some firmware refuses
+to run that narrow — which is why Braiins Hashpower rejects a pool URL
+advertising fewer than 7 outright. At 8 a proxy can spend 3 and still hand
+down the conventional 4.
 
 For each `en2` the miner picks, it then sweeps the header's 4-byte
 `nonce` field (2³² hashes) and, if version-rolling was negotiated,
@@ -65,12 +81,10 @@ also permutes the masked version bits. So each `en2` value gives
 
 ### Extranonce1 allocation — how uniqueness is guaranteed
 
-`src/stratum.c:688-694`:
-
 ```c
-/* Allocate extranonce1 from server counter ^ time. */
-unsigned seq = atomic_fetch_add(&s->extranonce1_seq, 1);
-uint32_t mix = seq ^ (uint32_t)now_ms();
+/* Straight from the counter — deliberately NOT mixed with the clock. */
+unsigned seq = atomic_fetch_add(&s->shared->extranonce1_seq, 1);
+uint32_t mix = (uint32_t)seq;
 c->extranonce1[0] = (uint8_t)(mix >> 24);
 c->extranonce1[1] = (uint8_t)(mix >> 16);
 c->extranonce1[2] = (uint8_t)(mix >> 8);
@@ -82,10 +96,22 @@ Two properties matter:
 1. **Uniqueness across concurrent connects** — `atomic_fetch_add` on
    `extranonce1_seq` guarantees that no two connections can read the
    same `seq` value even if they subscribe in the same nanosecond.
-2. **Freshness after counter wrap** — the 32-bit `seq` will wrap
-   after 4.3 billion connections. XORing with `now_ms()` (also 32
-   bits) ensures that even if a rig disconnects and reconnects days
-   later after the counter has cycled, it gets a different `en1`.
+   ⚠️ An earlier version XORed the counter with `now_ms()` to get
+   "freshness after wrap". That **destroyed** the guarantee it was
+   meant to strengthen: it collides whenever the delta in the clock
+   equals the delta in the counter, which a miner opening several
+   connections at once hits routinely. The counter is seeded from the
+   clock **once**, at construction, so values still differ across
+   restarts without the collisions.
+2. **Uniqueness across *servers*** — the counter lives in a
+   `stratum_shared_t` that every stratum server in the process shares,
+   not in the server itself. The pool runs two listeners when the
+   rental port is enabled, and two servers each seeding their own
+   clock-derived counter would seed within a millisecond of each other
+   and hand out overlapping `en1` values. Two connections with the same
+   `en1` render identical coinbases, mine identical headers, and find
+   the same hash from the same nonce — half the hashrate wasted and the
+   share credited twice.
 
 **No two miners on the pool are searching the same
 `(header, coinbase, nonce)` triple.** That's the fairness guarantee

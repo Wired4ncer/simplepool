@@ -119,6 +119,16 @@ include tests/test_thunder.mk
 include tests/test_pplns.mk
 include tests/test_config.mk
 
+# Rebuild every test binary when any header changes. The test .mk rules list
+# only .c files, so a header-only edit used to leave stale test binaries in
+# place — which silently disarms compile-time guards like the extranonce-width
+# _Static_assert in test_stratum.c. The recipes use $(filter %.c,$^) so these
+# extra prerequisites never reach the compiler as inputs.
+TEST_BINS := build/test_share build/test_bitcoind build/test_stratum \
+             build/test_store build/test_coinbase build/test_broadcast \
+             build/test_thunder build/test_pplns build/test_config
+$(TEST_BINS): $(wildcard src/*.h)
+
 test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_pplns build/test_config
 	./build/test_share
 	./build/test_bitcoind

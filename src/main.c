@@ -152,6 +152,10 @@ typedef struct {
     store_t           *store;
     broadcast_t       *bcast;
     stratum_server_t  *srv;
+    /* Optional second listener for hashrate marketplaces (config
+     * rental_listen_port). NULL when disabled. Same job, same callbacks, same
+     * PPLNS window — it differs only in the share difficulty it serves. */
+    stratum_server_t  *srv_rental;
     proxy_config_t    *cfg;
 
     pthread_mutex_t lock;
@@ -454,7 +458,8 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                                                s->cfg->operator_address,
                                                s->cfg->fee_bps,
                                                s->cfg->coinbase_tag,
-                                               /*en1*/ 4, /*en2*/ 4,
+                                               /*en1*/ STRATUM_EXTRANONCE1_SIZE,
+                                               /*en2*/ STRATUM_EXTRANONCE2_SIZE,
                                                &probe, NULL, NULL, NULL,
                                                berr, sizeof berr) < 0) {
             LOG_WARN("proportional: the builder refuses this payout set (%s) — "
@@ -601,7 +606,8 @@ static stratum_job_t *build_job_from_template(server_ctx_t *sctx,
         job_id, t->version, prev_le,
         t->coinbase_value_sats,
         t->default_witness_commitment,
-        /*en1*/ 4, /*en2*/ 4,
+        /*en1*/ STRATUM_EXTRANONCE1_SIZE,
+        /*en2*/ STRATUM_EXTRANONCE2_SIZE,
         (const uint8_t (*)[32])branches, branch_count,
         t->bits, t->curtime, target_be,
         (uint32_t)t->height,
@@ -998,6 +1004,13 @@ static void *tip_watcher(void *arg) {
                 bitcoind_template_free(t);
                 continue;
             }
+            /* Publish to the rental port first, taking the extra reference
+             * set_job consumes. Both listeners serve the SAME job object, so
+             * they agree on job_id, payout plan and merkle branches — a submit
+             * on either port settles against the same window. */
+            if (s->srv_rental) {
+                stratum_server_set_job(s->srv_rental, stratum_job_ref(job));
+            }
             stratum_server_set_job(s->srv, job);
             /* Difficulty and block value move with the template, so the
              * rate has to move with it too. */
@@ -1246,9 +1259,51 @@ int main(int argc, char **argv) {
     stcfg.on_block       = on_block_cb;
     stcfg.on_block_found = on_block_found_cb;
 
+    /* Validate the rental port BEFORE anything is started, so a bad value is
+     * a clean config error rather than a half-built pool. */
+    if (cfg.rental_listen_port > 0) {
+        if (cfg.rental_listen_port == cfg.listen_port) {
+            fprintf(stderr, "config error: rental_listen_port (%d) must differ "
+                            "from listen_port\n", cfg.rental_listen_port);
+            stratum_job_free(initial_job);
+            bitcoind_template_free(tmpl);
+            store_close(store);
+            bitcoind_client_free(&btc);
+            bitcoind_client_free(&btc_lp);
+            return 2;
+        }
+        if (cfg.rental_min_diff <= 0.0) {
+            fprintf(stderr, "config error: rental_min_diff must be > 0\n");
+            stratum_job_free(initial_job);
+            bitcoind_template_free(tmpl);
+            store_close(store);
+            bitcoind_client_free(&btc);
+            bitcoind_client_free(&btc_lp);
+            return 2;
+        }
+    }
+
+    /* Allocated before either server so both draw extranonce1 from one
+     * sequence and dedupe shares against one ring. Two servers left to
+     * allocate their own would seed the counter from the clock within a
+     * millisecond of each other, hand out colliding extranonce1 values, and
+     * have no cross-port guard to catch the duplicate shares that produces. */
+    stratum_shared_t *shared = stratum_shared_new();
+    if (!shared) {
+        fprintf(stderr, "stratum_shared_new failed\n");
+        stratum_job_free(initial_job);
+        bitcoind_template_free(tmpl);
+        store_close(store);
+        bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
+        return 7;
+    }
+    stcfg.shared = shared;
+
     stratum_server_t *srv = NULL;
     if (stratum_server_start(&stcfg, &srv) < 0) {
         fprintf(stderr, "stratum_server_start failed\n");
+        stratum_shared_free(shared);
         stratum_job_free(initial_job);
         bitcoind_template_free(tmpl);
         store_close(store);
@@ -1257,10 +1312,50 @@ int main(int argc, char **argv) {
         return 7;
     }
     sctx.srv = srv;
+    /* Take the rental server's reference before set_job consumes ours. */
+    stratum_job_t *initial_for_rental =
+        cfg.rental_listen_port > 0 ? stratum_job_ref(initial_job) : NULL;
     stratum_server_set_job(srv, initial_job);
-    bitcoind_template_free(tmpl);
 
     LOG_INFO("stratum listening on %s:%d", cfg.listen_addr, cfg.listen_port);
+
+    /* The rental port: same callbacks, same shared state, same job — it
+     * differs only in the difficulty it serves. rental_min_diff is both the
+     * starting difficulty and the vardiff floor, because a marketplace order
+     * that starts below its minimum and ramps up is cancelled for invalid
+     * shares before the ramp finishes. */
+    stratum_server_t *srv_rental = NULL;
+    if (cfg.rental_listen_port > 0) {
+        stratum_cfg_t rcfg = stcfg;   /* inherit every payout-relevant field */
+        rcfg.bind_port    = cfg.rental_listen_port;
+        rcfg.initial_diff = cfg.rental_min_diff;
+        rcfg.vardiff_min  = cfg.rental_min_diff;
+        if (rcfg.vardiff_max < cfg.rental_min_diff) {
+            rcfg.vardiff_max = cfg.rental_min_diff;
+        }
+        rcfg.max_conns = cfg.rental_max_conns > 0 ? cfg.rental_max_conns
+                                                  : cfg.max_conns;
+        if (stratum_server_start(&rcfg, &srv_rental) < 0) {
+            fprintf(stderr, "rental stratum_server_start failed on port %d\n",
+                    cfg.rental_listen_port);
+            stratum_job_free(initial_for_rental);
+            stratum_server_stop(srv);
+            stratum_server_free(srv);
+            stratum_shared_free(shared);
+            bitcoind_template_free(tmpl);
+            store_close(store);
+            bitcoind_client_free(&btc);
+            bitcoind_client_free(&btc_lp);
+            return 7;
+        }
+        sctx.srv_rental = srv_rental;
+        stratum_server_set_job(srv_rental, initial_for_rental);
+        LOG_INFO("rental stratum listening on %s:%d at fixed difficulty %.0f "
+                 "(vardiff floor; network difficulty still clamps it down)",
+                 cfg.listen_addr, cfg.rental_listen_port, cfg.rental_min_diff);
+    }
+
+    bitcoind_template_free(tmpl);
 
     /* Signals. */
     struct sigaction sa;
@@ -1282,8 +1377,10 @@ int main(int argc, char **argv) {
                 strerror(watcher_rc));
         LOG_ERROR("fatal: could not start the tip watcher: %s",
                   strerror(watcher_rc));
+        if (srv_rental) { stratum_server_stop(srv_rental); stratum_server_free(srv_rental); }
         stratum_server_stop(srv);
         stratum_server_free(srv);
+        stratum_shared_free(shared);
         store_close(store);
         if (bcast) broadcast_close(bcast);
         bitcoind_client_free(&btc);
@@ -1301,8 +1398,13 @@ int main(int argc, char **argv) {
 
     pthread_join(watcher, NULL);
 
+    /* Stop the rental port first: it holds no state the primary needs, and
+     * stopping it early stops new marketplace connections landing mid-teardown. */
+    if (srv_rental) { stratum_server_stop(srv_rental); stratum_server_free(srv_rental); }
     stratum_server_stop(srv);
     stratum_server_free(srv);
+    /* Both servers are gone, so nothing can touch the shared state again. */
+    stratum_shared_free(shared);
 
     store_flush(store);
     store_stats_t stats;

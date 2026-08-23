@@ -21,13 +21,57 @@ typedef struct stratum_job stratum_job_t;
  * window. Size against this constant, never against a hand-picked number. */
 #define STRATUM_RECENT_JOBS 8
 
+/* Extranonce widths, in bytes. Advertised at mining.subscribe, reserved in
+ * the coinbase scriptSig, and enforced on every submit — change them here and
+ * nowhere else.
+ *
+ * extranonce2 is 8, not the classic 4. The reason is not search space: at 4
+ * bytes one connection already has 2^80 headers per job once nonce and
+ * version rolling count, and jobs rotate long before that. The reason is
+ * *subdivision*. Rented hashrate does not arrive as many small miners, it
+ * arrives as one aggregated worker behind a proxy that splits the extranonce2
+ * it is handed into a downstream-miner id (high bytes) plus that miner's own
+ * extranonce2 (low bytes). At 4 a proxy spending 3 on addressing leaves its
+ * miners one byte, and some firmware refuses to run that narrow. At 8 it can
+ * spend 3 and still hand down the conventional 4.
+ *
+ * 8 rather than the 7 the marketplaces floor at: same cost, satisfies any
+ * ">= 7" rule, and 4/8 is the split proxies and firmware already expect. */
+#define STRATUM_EXTRANONCE1_SIZE 4
+#define STRATUM_EXTRANONCE2_SIZE 8
+
+/* State that must be common to every stratum server in the process.
+ *
+ * Two things in a server are only correct while there is exactly one of them,
+ * and both silently produce double-credited shares once a second server
+ * exists (the rental port):
+ *
+ *   - the extranonce1 counter. It is seeded from the clock at startup, so two
+ *     servers constructed in the same process seed within a millisecond of
+ *     each other and hand out overlapping extranonce1 values. Two connections
+ *     with the same extranonce1 render identical coinbases, mine identical
+ *     headers, and find the same hash from the same nonce.
+ *   - the share dedupe ring, which is what would otherwise catch exactly that.
+ *     Per-server rings are blind to each other, so the collision happens *and*
+ *     the guard against it is looking the wrong way.
+ *
+ * Servers sharing one of these draw extranonce1 from a single sequence and
+ * dedupe against a single ring. Pass the same pointer to every
+ * stratum_server_start() in the process; leave cfg.shared NULL and the server
+ * allocates a private one, which is the correct behaviour for a lone server
+ * and for every test. */
+typedef struct stratum_shared stratum_shared_t;
+
+stratum_shared_t *stratum_shared_new(void);
+void              stratum_shared_free(stratum_shared_t *sh);
+
 /* Create a job from template fields. The coinbase is *not* baked into the
  * job — each connection renders its own coinbase paying its miner address
  * (minus the configured operator fee). The job carries everything else
  * the server needs to materialise a per-connection coinbase on demand:
  *   - value_sats:           coinbasevalue from getblocktemplate
  *   - witness_commitment_hex: optional, may be NULL
- *   - en1_size / en2_size:  extranonce sizes, both currently 4
+ *   - en1_size / en2_size:  extranonce sizes, from STRATUM_EXTRANONCE{1,2}_SIZE
  *
  * tx_hex_list may be NULL if tx_count == 0. The job takes ownership of
  * its own heap copies; caller's buffers are not retained.
@@ -52,6 +96,11 @@ stratum_job_t *stratum_job_new(
     const char *coinbasetxn_hex, int coinbase_has_witness);
 
 void stratum_job_free(stratum_job_t *j);
+
+/* Take an additional reference to a job. stratum_server_set_job() consumes
+ * one reference, so publishing the same job to a second server needs one more
+ * taken first. Returns j for convenient nesting. */
+stratum_job_t *stratum_job_ref(stratum_job_t *j);
 
 /* Attach a proportional payout list to a job. Copies the array. Called by
  * main.c after computing the PPLNS window for a new template. Returns 0 ok,
@@ -139,6 +188,12 @@ typedef struct {
      * against half-open TCPs from crashed miners and misconfigured clients
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
+
+    /* Shared across every server in the process; NULL = allocate a private
+     * one. See stratum_shared_t above — this is not optional when more than
+     * one server runs, it is what keeps extranonce1 unique and share dedupe
+     * effective across ports. */
+    stratum_shared_t *shared;
 
     void  *ctx;
     share_observer_fn  on_share;

@@ -52,6 +52,12 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_window_sec = 30;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
 
+    /* Rental port off unless configured. 500000 clears both Braiins (>=1024,
+     * recommends 65536) and NiceHash (500000) with one listener. */
+    cfg->rental_listen_port = 0;
+    cfg->rental_min_diff    = 500000.0;
+    cfg->rental_max_conns   = 0;      /* 0 → inherit max_conns */
+
     cfg->redis_url[0] = '\0';
     cfg->redis_publish_timeout_ms   = 200;
     cfg->redis_reconnect_backoff_ms = 2000;
@@ -173,6 +179,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
+        else if (strcmp(k, "rental_listen_port")        == 0) cfg->rental_listen_port = atoi(v);
+        else if (strcmp(k, "rental_min_diff")           == 0) cfg->rental_min_diff = atof(v);
+        else if (strcmp(k, "rental_max_conns")          == 0) cfg->rental_max_conns = atoi(v);
         else if (strcmp(k, "idle_timeout_sec")          == 0) cfg->idle_timeout_sec = atoi(v);
         else if (strcmp(k, "db_path")                   == 0) copy_str(cfg->db_path, sizeof cfg->db_path, v);
         else if (strcmp(k, "commit_window_ms")          == 0) cfg->commit_window_ms = atoi(v);

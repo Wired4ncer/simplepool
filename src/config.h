@@ -20,6 +20,32 @@ typedef struct {
     double vardiff_max;           /* default 1e12; clamped by network diff */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
 
+    /* Rental port — a SECOND stratum listener for hashrate marketplaces
+     * (Braiins Hashpower, NiceHash). 0 disables it entirely, which is the
+     * default and leaves the pool exactly as it was.
+     *
+     * It exists because rented hashrate does not arrive as many small miners;
+     * it arrives as one aggregated worker with a hard minimum share
+     * difficulty. Braiins floors at 1024 and recommends 65536; NiceHash
+     * requires 500000. Serving those on the public port would price out every
+     * home miner, so they get their own listener, and shares from both feed
+     * the same PPLNS window.
+     *
+     * ⛔ Do NOT try to serve a marketplace by letting vardiff ramp up to the
+     * floor. It starts a connection below the minimum and every operator who
+     * has tried it had the order cancelled for invalid shares before the ramp
+     * finished. rental_min_diff is applied as BOTH the starting difficulty and
+     * the vardiff floor, so the very first share is already at it.
+     *
+     * ⚠️ The network-difficulty clamp still wins over this floor. During a
+     * minimum-difficulty window (a fork resets difficulty to powLimit) the
+     * chain cannot support the floor, connections get clamped below it, and
+     * marketplace orders will reject-flood until difficulty ramps back. That
+     * is a known, time-bounded limitation, not a misconfiguration. */
+    int    rental_listen_port;    /* default 0 = disabled */
+    double rental_min_diff;       /* default 500000 (clears Braiins + NiceHash) */
+    int    rental_max_conns;      /* default: same as max_conns */
+
     /* Idle-connection reaper. A connection that hasn't sent any bytes in
      * idle_timeout_sec is closed. Guards against half-open TCPs from
      * crashed miners and clients that connect but never authenticate.
