@@ -82,7 +82,9 @@ listeners differ only in the difficulty they serve.** A block found on either
 settles against the same window and the same coinbase.
 
 `rental_min_diff` is applied as **both** the starting difficulty and the vardiff
-floor.
+floor. It is a floor, **not a pin** — vardiff still ramps *above* it for a large
+order, which matters because 1 EH/s at difficulty 500000 is still ~466
+shares/sec.
 
 ⛔ **Do not try to reach the floor by letting vardiff ramp.** That starts the
 connection below the marketplace's minimum, and orders get cancelled for invalid
@@ -100,15 +102,36 @@ share target harder than the network target means the miner discards hashes that
 would have been valid blocks, before the pool ever sees them. That clamp applies
 on the rental port too, and it wins.
 
-So during a **minimum-difficulty window** — a fork that resets difficulty to
-`powLimit` — every connection including the rental port is clamped to ~1, and a
-marketplace order will reject-flood until difficulty ramps back.
+So whenever **network difficulty falls below a marketplace's floor**, orders on
+the rental port reject-flood until it climbs back. Lowering `rental_min_diff`
+does not help — the clamp overrides it either way.
 
-This matters because that window is *exactly* when rented hashrate is most
-wanted. It is time-bounded (one observed fork ramped 1 → 262,144 in ~5 hours),
-but it is a property of the chain, not a misconfiguration, and there is no
-setting that avoids it. **Tell the marketplace rather than letting them discover
-it during a paid order.**
+The thresholds, since this is the number that actually matters:
+
+| Marketplace | Works while network difficulty >= | shares/s at 1 PH/s |
+|---|---|---|
+| Braiins (absolute minimum) | **1,024** | 227 — already their "reject flood" example |
+| Braiins (recommended) | **65,536** | 3.6 |
+| NiceHash | **500,000** | 0.5 |
+
+The realistic way to hit this is a chain that **resets difficulty to `powLimit`
+at a fork activation height** (`pow.cpp`: `if (pindexLast->nHeight + 1 ==
+params.EcashHeight) bnNew = bnPowLimit;`, with a Bitcoin-style
+`powLimit` that means difficulty 1). It is time-bounded and it recovers in
+stages: with the usual 4x-per-retarget cap, difficulty passes 1,024 after 5
+retargets, 65,536 after 8 and 500,000 after 10 — so **Braiins comes back
+before NiceHash does**. One observed fork ramped ~8-9 retargets in about five
+hours, which put every floor within hours rather than days.
+
+⚠️ This is a property of the chain, not a misconfiguration, and no setting
+avoids it. **Tell the marketplace up front** rather than letting them discover it
+during a paid order that happens to span a fork.
+
+⚠️ Whether any *particular* upcoming fork resets difficulty is a question about
+that chain's `EcashHeight` and `powLimit` — **check the mainnet chainparams
+rather than assuming the previous fork's behaviour repeats.** The reset fires at
+exactly one height per chainparams, so a height that has already passed cannot
+fire again.
 
 ## Running two listeners safely
 
