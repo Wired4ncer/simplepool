@@ -1204,9 +1204,17 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
-    LOG_INFO("stratum: authorized '%s' from %s (fd=%d) at difficulty %.0f",
+    /* port= is the LISTENING port, not the peer's. With more than one server
+     * in the process (public 3334, rental 3335) the peer address alone cannot
+     * say which one a miner reached: proxy and datacenter IPs serve several
+     * worker names at once, and one IP routinely holds connections on both
+     * ports simultaneously. Share difficulty cannot substitute either --
+     * vardiff on the public port climbs past the rental floor, and a
+     * returning worker is hinted straight to a high difficulty. Without this
+     * field, attributing a share to a port is guesswork. */
+    LOG_INFO("stratum: authorized '%s' from %s (fd=%d, port=%d) at difficulty %.0f",
              c->worker_name, c->peer_ip[0] ? c->peer_ip : "?", c->fd,
-             c->difficulty);
+             s->cfg.bind_port, c->difficulty);
     /* Then push initial set_difficulty + notify (renders this conn's
      * coinbase against the current job using its payout address). */
     send_set_difficulty(buf, len, c->difficulty);
