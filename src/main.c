@@ -1242,6 +1242,7 @@ int main(int argc, char **argv) {
     stcfg.vardiff_max_window_mult = cfg.vardiff_max_window_mult;
     stcfg.vardiff_idle_step       = cfg.vardiff_idle_step;
     stcfg.idle_timeout_sec   = cfg.idle_timeout_sec;
+    stcfg.idle_timeout_authorized_sec = cfg.idle_timeout_authorized_sec;
 
     /* PPS. pool_mode=pps-classic takes Thunder-address usernames, pays every
      * coinbase into the pool's BTC wallet, and accrues per-share credits. */

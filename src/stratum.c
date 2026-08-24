@@ -1884,10 +1884,14 @@ static void *conn_thread(void *arg) {
     /* Seed activity tracking at connect time — a client that never sends
      * a single byte is still governed by cfg.idle_timeout_sec. */
     c->last_activity_ms = mono_ms();
-    const uint64_t idle_timeout_ms =
-        s->cfg.idle_timeout_sec > 0
-            ? (uint64_t)s->cfg.idle_timeout_sec * 1000u
-            : 0;
+    /* Two budgets, chosen per check because authorize happens mid-loop.
+     * The short one is for sockets that never authenticate; an authorized
+     * miner gets the long one, because inbound silence from a miner means
+     * "no share to send yet", not "dead". See config.h. */
+    const int idle_unauth_sec = s->cfg.idle_timeout_sec;
+    const int idle_auth_sec   = s->cfg.idle_timeout_authorized_sec > 0
+                                  ? s->cfg.idle_timeout_authorized_sec
+                                  : s->cfg.idle_timeout_sec;
 
     while (!atomic_load(&s->stop)) {
         ssize_t n = recv(c->fd, buf + blen, sizeof(buf) - 1 - blen, 0);
@@ -1896,10 +1900,15 @@ static void *conn_thread(void *arg) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* SO_RCVTIMEO wake. Drop iff we've been silent past the
                  * configured budget. Otherwise loop and try again. */
+                int budget_sec = c->authorized ? idle_auth_sec
+                                               : idle_unauth_sec;
+                uint64_t idle_timeout_ms = budget_sec > 0
+                                             ? (uint64_t)budget_sec * 1000u
+                                             : 0;
                 if (idle_timeout_ms > 0 &&
                     mono_ms() - c->last_activity_ms > idle_timeout_ms) {
-                    LOG_INFO("stratum: idle timeout after %us — closing fd=%d worker='%s'",
-                             s->cfg.idle_timeout_sec, c->fd,
+                    LOG_INFO("stratum: idle timeout after %ds — closing fd=%d worker='%s'",
+                             budget_sec, c->fd,
                              c->worker_name[0] ? c->worker_name : "(unauthorized)");
                     goto done;
                 }

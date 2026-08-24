@@ -88,6 +88,23 @@ typedef struct {
      * Set to a negative value to disable entirely; 0 uses the default. */
     int    idle_timeout_sec;      /* default 600 (10 min) */
 
+    /* Reaper budget for a connection that HAS authorized. Default 3600.
+     *
+     * ⚠️ The reaper measures inbound silence, and a miner with nothing to
+     * submit sends nothing — so at a high difficulty floor a perfectly
+     * healthy small rig is indistinguishable from a half-open socket.
+     * At rental_min_diff=500000 a share takes 500000*2^32/H seconds, so a
+     * 600s budget reaps a 3.6 TH/s rig 37% of the time and a 1 TH/s rig
+     * 76% of the time. It then reconnects and is reaped again: the miner
+     * reads a permanent 0 TH/s. Observed in production 2026-08-24, where
+     * every reaped connection had lived EXACTLY 604s.
+     *
+     * Keeping the two budgets separate preserves what the short one is
+     * actually for — scanners and half-open TCPs that never authenticate —
+     * without applying it to miners that are demonstrably alive, since the
+     * job broadcast keeps succeeding on their socket. */
+    int    idle_timeout_authorized_sec;  /* default 3600 (1 h) */
+
     /* bitcoind */
     char bitcoind_url[512];
     char bitcoind_user[128];

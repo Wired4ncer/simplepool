@@ -197,6 +197,11 @@ typedef struct {
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
 
+    /* Same, for a connection that has authorized. See config.h — a miner
+     * with nothing to submit is silent, so this must be sized against the
+     * expected share interval at the difficulty floor, not against TCP
+     * liveness. <= 0 falls back to idle_timeout_sec (legacy behaviour). */
+    int    idle_timeout_authorized_sec;
 
     /* listen() backlog: how many completed handshakes the kernel may hold
      * before accept() takes them. <= 0 uses STRATUM_DEFAULT_BACKLOG.
