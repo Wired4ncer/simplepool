@@ -23,6 +23,12 @@ every requirement below:
 Six things. Five are satisfied; the sixth is NiceHash-only and not blocking —
 stated plainly so nobody rediscovers them during a paid order.
 
+⚠️ **Satisfying all six is necessary, not sufficient.** They are the marketplace's
+*technical* gate. Acceptance also has a **policy** dimension that no amount of
+protocol correctness satisfies — see [Policy, not protocol](#policy-not-protocol).
+A pool can serve a marketplace order with a literal **zero** reject rate and
+still have it cancelled.
+
 | # | Requirement | Status |
 |---|---|---|
 | 1 | `extranonce2_size >= 7` | ✅ **8** |
@@ -197,8 +203,57 @@ seeded at 1, under the marketplace minimum. The hint is therefore floored at
 easy and lets the first retarget lift it — and widening the floor to cover
 `initial_diff` breaks that.
 
+## Policy, not protocol
+
+The six requirements above are what a marketplace's *software* checks. They are
+not the whole of what a marketplace enforces, and the rest is not discoverable
+by testing your stratum.
+
+🔴 **Concentration is the one that bites.** Marketplaces have rules against
+delivering hashrate that hands a single pool majority control of a chain — the
+51 %-attack scenario — and enforcing them by cancelling orders and blacklisting
+the destination pool is normal, not exceptional. On a **small chain** this
+threshold is far closer than it looks: an order that is unremarkable on Bitcoin
+can be a supermajority of a young fork within the hour. The pool operator does
+not choose this and cannot see it coming from stratum metrics.
+
+**Watch your share of network hashrate, not just your pool's health.** Compute it
+from block timestamps rather than a stats page — an epoch-averaged network
+hashrate lags a surge badly and will tell you your share is small while it is
+not:
+
+```sh
+# seconds per block over the last N blocks, straight from the chain
+TIP=$(bitcoin-cli getblockcount)
+T1=$(bitcoin-cli getblockheader $(bitcoin-cli getblockhash $TIP)        | jq .time)
+T0=$(bitcoin-cli getblockheader $(bitcoin-cli getblockhash $((TIP-50))) | jq .time)
+echo "interval: $(( (T1-T0) / 50 ))s/block"
+# network hashrate ~= difficulty * 2^32 / interval; your share = your blocks / all blocks
+```
+
+⚠️ **A cancelled order is not evidence of a technical fault, and diagnosing it as
+one wastes the window in which you could be talking to the marketplace.** Check
+your reject rate for that address first: if it is zero, the cause is not your
+stratum, and the answer is in the marketplace's message rather than your logs.
+
+⛔ **Get the exact wording of any cancellation or blacklist notice before acting.**
+"51 % risk", "unknown pool" and "unsupported chain" demand completely different
+responses, and they are indistinguishable from your side.
+
+🔴 **The conflict worth planning around:** a minimum-difficulty window (§"The one
+case where this cannot work") is exactly when rented hashrate is cheapest to
+point at a small chain — which is also when it most easily produces a
+supermajority. **The window that makes rentals attractive is the window that
+makes them a policy problem.** If a fork with a difficulty reset is on your
+roadmap, settle this with the marketplace *before* it, not during.
+
 ## Known gaps
 
+- 🔴 **No visibility into your share of network hashrate.** Nothing in the pool
+  warns when it approaches a level that trips marketplace concentration policy,
+  and the stats API's network hashrate is epoch-averaged so it understates
+  during exactly the surge that matters. Until that exists, measure it by hand
+  from block timestamps — see [Policy, not protocol](#policy-not-protocol).
 - ⛔ **`d=` in the password field (requirement 6).** `mining.authorize` ignores
   `params[1]`. NiceHash uses it to request a difficulty; Braiins does not. A
   rental port pinned at 500000 already serves NiceHash's floor, so this is not
