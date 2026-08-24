@@ -316,6 +316,12 @@ struct stratum_conn {
     pthread_t thr;
     int thr_started;
 
+    /* Peer address, filled at accept(). Recorded so a miner's complaint can
+     * be tied to the socket it actually came from: worker names are chosen by
+     * the miner and several connections routinely share one, so the name
+     * alone cannot answer "did their proxy ever reach us?". */
+    char     peer_ip[INET_ADDRSTRLEN];
+
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
     int      subscribed;
@@ -1198,6 +1204,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
+    LOG_INFO("stratum: authorized '%s' from %s (fd=%d) at difficulty %.0f",
+             c->worker_name, c->peer_ip[0] ? c->peer_ip : "?", c->fd,
+             c->difficulty);
     /* Then push initial set_difficulty + notify (renders this conn's
      * coinbase against the current job using its payout address). */
     send_set_difficulty(buf, len, c->difficulty);
@@ -1296,11 +1305,25 @@ oom:
 
 static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                          cJSON *params, char **buf, size_t *len) {
+    /* Both refusals below answer the miner with an error, so they count as
+     * rejects on ITS dashboard. Recording them keeps our reject table and the
+     * miner's own numbers describing the same events — without this a miner
+     * refused on every submit reads as simply absent here. */
     if (!c->authorized) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx,
+                             c->worker_name[0] ? c->worker_name
+                                               : "(unauthorized)",
+                             now_ms(), "unauthorized");
+        }
         cJSON *err = make_error(24, "unauthorized");
         return emit_response(buf, len, id, NULL, err);
     }
     if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "bad params");
+        }
         cJSON *err = make_error(20, "bad params");
         return emit_response(buf, len, id, NULL, err);
     }
@@ -1916,6 +1939,8 @@ static void *listener_thread(void *arg) {
         stratum_conn_t *c = stratum_conn_new_for_test(s);
         if (!c) { close(fd); continue; }
         c->fd = fd;
+        if (!inet_ntop(AF_INET, &cli.sin_addr, c->peer_ip, sizeof c->peer_ip))
+            snprintf(c->peer_ip, sizeof c->peer_ip, "?");
         atomic_fetch_add(&s->conn_count, 1);
         conn_register(s, c);
         if (pthread_create(&c->thr, NULL, conn_thread, c) != 0) {
@@ -1993,7 +2018,8 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     return 0;
 }
 
-void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
+void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
+                            int clean) {
     if (!s || !new_job) return;
     pthread_rwlock_wrlock(&s->job_lock);
     stratum_job_t *old = s->current_job;
@@ -2001,15 +2027,29 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job) {
     pthread_rwlock_unlock(&s->job_lock);
     if (old) retire_job(s, old);
 
-    /* broadcast notify with clean_jobs=true. Each conn renders its own
-     * coinbase against the new job (paying its miner address). */
+    /* Broadcast the new job. Each conn renders its own coinbase against it
+     * (paying its miner address).
+     *
+     * `clean` is the caller's answer to "must miners throw away work in
+     * progress?", and it is only true when the previous block changed —
+     * anything still being hashed against the old tip can now only produce an
+     * orphan. It must be FALSE for a same-tip refresh that merely adds
+     * transactions and moves ntime: the old job is still valid work, and
+     * flushing it discards every miner's partial progress for nothing.
+     *
+     * This is not a cosmetic distinction. A hashrate marketplace's proxy
+     * flushes its own fleet whenever an upstream sets the flag, and its
+     * miners' in-flight shares then come back stale on ITS side — invisible
+     * in our reject counters, which is exactly why a pool doing this looks
+     * healthy from here while the marketplace measures a reject storm and
+     * drops the upstream. */
     pthread_mutex_lock(&s->conns_lock);
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
         if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
         char *out = NULL; size_t olen = 0;
         pthread_mutex_lock(&c->state_lock);
         vardiff_check_idle(s, c, &out, &olen);
-        send_current_notify(s, c, &out, &olen, 1);
+        send_current_notify(s, c, &out, &olen, clean);
         pthread_mutex_unlock(&c->state_lock);
         if (out) {
             pthread_mutex_lock(&c->write_lock);

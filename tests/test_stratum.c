@@ -168,7 +168,7 @@ static void test_authorize_triggers_setdiff_notify(void) {
 
     /* Provide a job so notify can be sent. */
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("0001", net));
+    stratum_server_set_job(s, make_test_job("0001", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -240,7 +240,7 @@ static void test_submit_share_and_dedupe(void) {
 
     /* Network target = all zeros -> never a block. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -299,7 +299,7 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -435,7 +435,7 @@ static void *race_job_thread(void *arg) {
         snprintf(jid, sizeof jid, "J%d", i);
         stratum_job_t *j = make_test_job(jid, net);
         if (!j) break;
-        stratum_server_set_job(s, j);
+        stratum_server_set_job(s, j, 1);
     }
     return NULL;
 }
@@ -456,7 +456,7 @@ static void test_job_rotation_races_submits(void) {
 
     uint8_t net[32];
     memset(net, 0xff, sizeof net);
-    stratum_server_set_job(s, make_test_job("J0", net));
+    stratum_server_set_job(s, make_test_job("J0", net), 1);
 
     /* Each connection needs a real fd and a place in the broadcast list, or
      * set_job skips it and the race under test never happens. socketpair
@@ -587,7 +587,7 @@ static void test_block_wins_over_low_difficulty(void) {
         &out, &olen); free(out); out=NULL; olen=0;
 
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     int rc = stratum_handle_message(s, c,
         "{\"id\":3,\"method\":\"mining.submit\","
@@ -625,7 +625,7 @@ static void test_vardiff_clamped_to_network_diff(void) {
     /* DIFF1 target = difficulty 1.0. */
     uint8_t net[32] = {0};
     net[4] = 0xff; net[5] = 0xff;
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -673,7 +673,7 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
     /* All-zero network target: nothing is ever a block, so acceptance can
      * only come from the share-difficulty path. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -864,7 +864,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -883,7 +883,7 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     free(out); out=NULL; olen=0;
 
     /* Same template, new id. Identical header -> identical hash. */
-    stratum_server_set_job(s, make_test_job("J2", net));
+    stratum_server_set_job(s, make_test_job("J2", net), 1);
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J2\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
@@ -1079,7 +1079,7 @@ static void test_proportional_shared_coinbase(void) {
     stratum_job_t *job = make_prop_job("P1", net);
     CHECK(job != NULL);
     CHECK(stratum_job_set_payouts(job, payouts, 2) == 0);
-    stratum_server_set_job(s, job);
+    stratum_server_set_job(s, job, 1);
 
     char cb1[2][4096] = {{0}}, cb2[2][4096] = {{0}}, en1[2][64] = {{0}};
     stratum_conn_t *c[2];
@@ -1151,7 +1151,7 @@ static void test_proportional_falls_back_without_window(void) {
 
     /* No stratum_job_set_payouts call at all. */
     uint8_t net[32]; memset(net, 0xff, 32);
-    stratum_server_set_job(s, make_prop_job("P2", net));
+    stratum_server_set_job(s, make_prop_job("P2", net), 1);
 
     char cb2[2][4096] = {{0}}, cb1[2][4096] = {{0}};
     stratum_conn_t *c[2];
@@ -1315,7 +1315,7 @@ static void test_hint_below_vardiff_min_is_floored(void) {
      * → feedback_tests-that-pass-for-the-wrong-reason */
     uint8_t net[32] = {0};
     net[7] = 0xff; net[8] = 0xff;
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -1359,7 +1359,7 @@ static void test_initial_diff_below_vardiff_min_is_not_floored(void) {
     /* Same high-difficulty target, same reason. */
     uint8_t net[32] = {0};
     net[7] = 0xff; net[8] = 0xff;
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -1400,7 +1400,7 @@ static stratum_server_t *setup_job_diff_conn(obs_t *obs, double issued_diff,
     if (stratum_server_start(&cfg, &s) != 0 || !s) return NULL;
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net));
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -1508,7 +1508,7 @@ static void test_unknown_job_record_falls_back_to_grace(void) {
     /* Rotate to a job this connection is never notified of (its fd is -1, so
      * the broadcast skips it) — J2 therefore has no per-job record here. */
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J2", net));
+    stratum_server_set_job(s, make_test_job("J2", net), 1);
 
     /* Current difficulty unreachable, and the grace holds the reachable one. */
     stratum_conn_force_difficulty_for_test(c, 1e9, 1e-12);
@@ -1567,6 +1567,127 @@ static void test_rerecording_a_job_does_not_consume_ring_slots(void) {
     printf("ok: re-notifying a job does not evict it from the ring\n");
 }
 
+/* Read one mining.notify off `fd` and return its clean_jobs flag (-1 if no
+ * notify arrived). The flag is params[8]; reading it back off a real socket is
+ * the only way to prove what a miner actually receives, since the broadcast
+ * loop skips any connection without a live fd. */
+static int read_notify_clean_flag(int fd) {
+    char buf[65536];
+    ssize_t n = recv(fd, buf, sizeof buf - 1, MSG_DONTWAIT);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    int flag = -1;
+    for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n")) {
+        cJSON *m = cJSON_Parse(line);
+        if (!m) continue;
+        cJSON *meth = cJSON_GetObjectItem(m, "method");
+        if (cJSON_IsString(meth) && strcmp(meth->valuestring, "mining.notify") == 0) {
+            cJSON *pr = cJSON_GetObjectItem(m, "params");
+            cJSON *cj = cJSON_GetArrayItem(pr, 8);
+            if (cJSON_IsBool(cj)) flag = cJSON_IsTrue(cj) ? 1 : 0;
+        }
+        cJSON_Delete(m);
+    }
+    return flag;
+}
+
+/* clean_jobs must reflect whether work in progress became worthless.
+ *
+ * A new block invalidates everything a miner is hashing, so the flag is true.
+ * A same-tip refresh only adds transactions and moves ntime — the miner's
+ * current job is still valid work, and flagging it clean throws away the whole
+ * fleet's partial progress. Setting it unconditionally is what gets a pool
+ * dropped by hashrate marketplaces, whose proxies flush their fleet on it. */
+static void test_clean_jobs_only_on_a_new_block(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1.0,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J0", net), 1);
+
+    int fds[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+        &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out);
+
+    /* Preconditions: the broadcast loop skips a conn that is not subscribed,
+     * authorized and holding a live fd, and then this test would assert
+     * against a notify that was never sent. */
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    CHECK(stratum_conn_subscribed_for_test(c) == 1);
+    stratum_conn_register_for_test(s, c, fds[0]);
+
+    /* Drain anything the handshake left on the wire so the next read can only
+     * see the broadcast under test. */
+    (void)read_notify_clean_flag(fds[1]);
+
+    /* A same-tip refresh: still valid work, so do NOT flush. */
+    stratum_server_set_job(s, make_test_job("J1", net), 0);
+    int refresh_flag = read_notify_clean_flag(fds[1]);
+    CHECK(refresh_flag == 0);
+
+    /* A new block: everything in flight is now an orphan, so flush. */
+    stratum_server_set_job(s, make_test_job("J2", net), 1);
+    int newblock_flag = read_notify_clean_flag(fds[1]);
+    CHECK(newblock_flag == 1);
+
+    close(fds[0]);
+    close(fds[1]);
+    stratum_server_free(s);
+    stratum_conn_free_for_test(c);
+}
+
+/* A submit that is refused before it can become a share still counts as a
+ * reject on the miner's own dashboard, so it has to be recorded here too —
+ * otherwise a miner refused on every submit is indistinguishable from one
+ * that never connected. */
+static void test_unauthorized_submit_is_recorded_as_a_reject(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    /* Subscribed but deliberately NOT authorized. */
+    stratum_handle_message(s, c,
+        "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+        &out, &olen); free(out); out = NULL; olen = 0;
+    CHECK(stratum_conn_authorized_for_test(c) == 0);
+
+    CHECK(obs.rejects == 0);
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
+        &out, &olen); free(out); out = NULL; olen = 0;
+    CHECK(obs.rejects == 1);
+
+    /* Malformed params are the other path that used to answer the miner with
+     * an error and record nothing. */
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"w\"]}",
+        &out, &olen); free(out);
+    CHECK(obs.rejects == 2);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -1596,6 +1717,8 @@ int main(void) {
     test_submit_below_the_jobs_own_difficulty_is_rejected();
     test_unknown_job_record_falls_back_to_grace();
     test_rerecording_a_job_does_not_consume_ring_slots();
+    test_clean_jobs_only_on_a_new_block();
+    test_unauthorized_submit_is_recorded_as_a_reject();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

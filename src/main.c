@@ -986,15 +986,24 @@ static void *tip_watcher(void *arg) {
         }
 
         int need_rebuild = 0;
+        int new_tip      = 0;
         pthread_mutex_lock(&s->lock);
         if (t->height != s->last_height ||
             strcmp(t->prev_hash_hex, s->last_prev_hash) != 0) {
             need_rebuild = 1;
+            new_tip      = 1;
         } else if (now_ms() - s->last_built_ms > 30000) {
             /* Periodic refresh for new ntime + included txs. */
             need_rebuild = 1;
         }
         pthread_mutex_unlock(&s->lock);
+
+        /* The two branches above are exactly the clean_jobs distinction, and
+         * it used to be computed here and then thrown away: every job went
+         * out flagged clean. On a same-tip refresh that tells every miner to
+         * discard valid work in progress, several times a minute, for nothing.
+         * A block change is the only thing that makes work worthless. */
+        int clean = new_tip || s->cfg->clean_jobs_on_refresh;
 
         if (need_rebuild) {
             char berr[256] = {0};
@@ -1009,9 +1018,10 @@ static void *tip_watcher(void *arg) {
              * they agree on job_id, payout plan and merkle branches — a submit
              * on either port settles against the same window. */
             if (s->srv_rental) {
-                stratum_server_set_job(s->srv_rental, stratum_job_ref(job));
+                stratum_server_set_job(s->srv_rental, stratum_job_ref(job),
+                                       clean);
             }
-            stratum_server_set_job(s->srv, job);
+            stratum_server_set_job(s->srv, job, clean);
             /* Difficulty and block value move with the template, so the
              * rate has to move with it too. */
             refresh_pps_rate(s, t);
@@ -1315,7 +1325,7 @@ int main(int argc, char **argv) {
     /* Take the rental server's reference before set_job consumes ours. */
     stratum_job_t *initial_for_rental =
         cfg.rental_listen_port > 0 ? stratum_job_ref(initial_job) : NULL;
-    stratum_server_set_job(srv, initial_job);
+    stratum_server_set_job(srv, initial_job, 1);
 
     LOG_INFO("stratum listening on %s:%d", cfg.listen_addr, cfg.listen_port);
 
@@ -1349,7 +1359,7 @@ int main(int argc, char **argv) {
             return 7;
         }
         sctx.srv_rental = srv_rental;
-        stratum_server_set_job(srv_rental, initial_for_rental);
+        stratum_server_set_job(srv_rental, initial_for_rental, 1);
         LOG_INFO("rental stratum listening on %s:%d at fixed difficulty %.0f "
                  "(vardiff floor; network difficulty still clamps it down)",
                  cfg.listen_addr, cfg.rental_listen_port, cfg.rental_min_diff);

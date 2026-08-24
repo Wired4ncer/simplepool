@@ -207,7 +207,17 @@ typedef struct stratum_server stratum_server_t;
 
 int  stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out);
 /* Atomically swap the current job. Takes ownership of new_job. */
-void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job);
+/* Publish `new_job` and broadcast it to every subscribed connection.
+ * Consumes one reference to `new_job`.
+ *
+ * `clean` becomes the mining.notify clean_jobs flag: pass 1 only when the
+ * previous block changed, so work in progress is now worthless. Pass 0 for a
+ * same-tip template refresh — the miner's current job is still valid, and
+ * flushing it throws away partial progress across the whole fleet. The pool
+ * keeps STRATUM_RECENT_JOBS solvable either way, so a share arriving against
+ * the older job is still accepted. */
+void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
+                            int clean);
 void stratum_server_stop(stratum_server_t *s);
 void stratum_server_free(stratum_server_t *s);
 

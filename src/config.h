@@ -20,6 +20,13 @@ typedef struct {
     double vardiff_max;           /* default 1e12; clamped by network diff */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
 
+    /* Set clean_jobs=true on the periodic same-tip template refresh as well
+     * as on a real new block. Default 1 preserves the historical behaviour;
+     * 0 is correct and is what a hashrate marketplace requires, because its
+     * proxy flushes its whole fleet on the flag. Kept as a switch so the
+     * behaviour can be reverted without rebuilding the binary. */
+    int    clean_jobs_on_refresh; /* default 1 */
+
     /* Rental port — a SECOND stratum listener for hashrate marketplaces
      * (Braiins Hashpower, NiceHash). 0 disables it entirely, which is the
      * default and leaves the pool exactly as it was.
