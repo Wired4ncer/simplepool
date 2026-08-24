@@ -23,6 +23,32 @@ typedef struct {
     double vardiff_max;           /* default 1e12; clamped by network diff */
     int    vardiff_window_sec;    /* retarget interval, default 30 */
 
+    /* Minimum accepted shares a window must contain before its rate is
+     * trusted enough to retarget on. Default 20.
+     *
+     * At target_spm=12 and a 30s window an ON-TARGET connection produces
+     * SIX shares, and Poisson noise on six samples is +/-41% (1/sqrt(6)).
+     * The ratio therefore lands outside the [0.5, 2.0] deadband routinely
+     * even when the difficulty is already perfect, so the controller
+     * oscillates instead of converging. Below this floor the window is
+     * EXTENDED rather than acted on — up to vardiff_max_window_mult times
+     * the nominal window, after which we act on what we have so a
+     * genuinely over-difficult connection still ratchets down. */
+    int    vardiff_min_samples;   /* default 20 */
+
+    /* How far a window may be extended, as a multiple of vardiff_window_sec,
+     * while waiting for vardiff_min_samples. Default 8. */
+    int    vardiff_max_window_mult;  /* default 8 */
+
+    /* Max step for a window that did NOT meet vardiff_min_samples. A window
+     * that met it keeps the historical 4x. Default 2.
+     *
+     * This is what stops an idle connection being driven to the floor: a
+     * proxied rental customer spreads one rig over many connections, each
+     * of which goes quiet between bursts, and a zero-share window otherwise
+     * cuts difficulty 4x — twice in a row is 16x. */
+    double vardiff_idle_step;     /* default 2.0 */
+
     /* Set clean_jobs=true on the periodic same-tip template refresh as well
      * as on a real new block. Default 1 preserves the historical behaviour;
      * 0 is correct and is what a hashrate marketplace requires, because its

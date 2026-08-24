@@ -188,11 +188,15 @@ typedef struct {
     double vardiff_min;
     double vardiff_max;
     int    vardiff_window_sec;
+    int    vardiff_min_samples;      /* see config.h; 0 = legacy behaviour */
+    int    vardiff_max_window_mult;  /* see config.h */
+    double vardiff_idle_step;        /* see config.h */
 
     /* Drop a connection whose recv() has been silent for this long. Guards
      * against half-open TCPs from crashed miners and misconfigured clients
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
+
 
     /* listen() backlog: how many completed handshakes the kernel may hold
      * before accept() takes them. <= 0 uses STRATUM_DEFAULT_BACKLOG.

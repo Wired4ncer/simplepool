@@ -53,6 +53,9 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_min        = 1.0;
     cfg->vardiff_max        = 1e12;
     cfg->vardiff_window_sec = 30;
+    cfg->vardiff_min_samples     = 20;
+    cfg->vardiff_max_window_mult = 8;
+    cfg->vardiff_idle_step       = 2.0;
     cfg->clean_jobs_on_refresh = 1;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
 
@@ -184,6 +187,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_min")               == 0) cfg->vardiff_min = atof(v);
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
+        else if (strcmp(k, "vardiff_min_samples")       == 0) cfg->vardiff_min_samples = atoi(v);
+        else if (strcmp(k, "vardiff_max_window_mult")   == 0) cfg->vardiff_max_window_mult = atoi(v);
+        else if (strcmp(k, "vardiff_idle_step")         == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "clean_jobs_on_refresh")     == 0) cfg->clean_jobs_on_refresh = atoi(v);
         else if (strcmp(k, "rental_listen_port")        == 0) cfg->rental_listen_port = atoi(v);
         else if (strcmp(k, "rental_min_diff")           == 0) cfg->rental_min_diff = atof(v);

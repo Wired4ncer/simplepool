@@ -652,6 +652,86 @@ static void test_vardiff_clamped_to_network_diff(void) {
     stratum_server_free(s);
 }
 
+/* vardiff_min_samples: a window that elapsed but holds too few shares must
+ * NOT retarget — it must stay open and keep accumulating.
+ *
+ * This is the oscillation fix. At target_spm=12 over a 30s window an
+ * on-target connection produces six shares, and Poisson noise on six
+ * samples (+/-41%) pushes `ratio` outside the [0.5, 2.0] deadband on its
+ * own — so the controller chased noise and cycled 500000 -> 1141329 ->
+ * 569753 -> 500000 in production on 2026-08-24.
+ *
+ * ⚠️ The assertion that matters is the NEGATIVE one on shares 1..4. To keep
+ * it from passing for the wrong reason, share 5 must then prove a retarget
+ * was reachable all along: same connection, same elapsed window, same
+ * ratio — the only thing that changed is the sample count. */
+static void test_vardiff_waits_for_min_samples(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-12,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 0.001,
+                           .vardiff_min = 1e-12,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .vardiff_min_samples = 5,
+                           .vardiff_max_window_mult = 8,
+                           .vardiff_idle_step = 2.0,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    /* All-zero network target: nothing is ever a block, and no network
+     * clamp can mask the retarget we are looking for. */
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Let the nominal window elapse. Every submit below is past it. */
+    sleep_ms(1100);
+
+    for (int i = 1; i <= 4; ++i) {
+        char msg[256];
+        snprintf(msg, sizeof msg,
+                 "{\"id\":%d,\"method\":\"mining.submit\","
+                 "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\","
+                 "\"0000000%d\"]}", 10 + i, i);
+        stratum_handle_message(s, c, msg, &out, &olen);
+        CHECK(out != NULL);
+        /* Under the sample floor: accepted, but no difficulty change. */
+        CHECK(strstr(out, "mining.set_difficulty") == NULL);
+        free(out); out=NULL; olen=0;
+    }
+    /* Precondition for the negative assertions above: those four shares
+     * really were ACCEPTED, so they really did land in the vardiff window.
+     * Without this the test would pass just as well if every submit had
+     * been rejected before ever reaching the retarget path. */
+    CHECK(obs.shares == 4);
+    CHECK(obs.rejects == 0);
+
+    /* Fifth share meets the floor — now the retarget fires. */
+    stratum_handle_message(s, c,
+        "{\"id\":15,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000005\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    CHECK(strstr(out, "mining.set_difficulty") != NULL);
+    CHECK(obs.shares == 5);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* After a retarget raises the difficulty, shares mined against the old
  * difficulty must stay acceptable for the grace period (the miner only
  * applies set_difficulty on a later job). */
@@ -1700,6 +1780,7 @@ int main(void) {
     test_block_wins_over_low_difficulty();
     test_vardiff_clamped_to_network_diff();
     test_vardiff_grace_accepts_old_diff_shares();
+    test_vardiff_waits_for_min_samples();
     test_socket_setup_applies_rcvtimeo();
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();
