@@ -24,6 +24,9 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     snprintf(cfg->listen_addr, sizeof cfg->listen_addr, "%s", "0.0.0.0");
     cfg->listen_port  = 3334;
     cfg->max_conns    = 500;
+    /* 0 = defer to STRATUM_DEFAULT_BACKLOG in stratum.c. Kept as a literal so
+     * config.c needs no dependency on the stratum header. */
+    cfg->listen_backlog = 0;
     cfg->initial_diff = 1.0;
 
     snprintf(cfg->bitcoind_url,  sizeof cfg->bitcoind_url,  "%s", "http://127.0.0.1:18443");
@@ -158,6 +161,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         if      (strcmp(k, "listen_addr")               == 0) copy_str(cfg->listen_addr, sizeof cfg->listen_addr, v);
         else if (strcmp(k, "listen_port")               == 0) cfg->listen_port = atoi(v);
         else if (strcmp(k, "max_conns")                 == 0) cfg->max_conns = atoi(v);
+        else if (strcmp(k, "listen_backlog")            == 0) cfg->listen_backlog = atoi(v);
         else if (strcmp(k, "initial_diff")              == 0) cfg->initial_diff = atof(v);
         else if (strcmp(k, "bitcoind_url")              == 0) copy_str(cfg->bitcoind_url, sizeof cfg->bitcoind_url, v);
         else if (strcmp(k, "bitcoind_user")             == 0) copy_str(cfg->bitcoind_user, sizeof cfg->bitcoind_user, v);

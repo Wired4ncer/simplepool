@@ -1225,6 +1225,8 @@ int main(int argc, char **argv) {
     snprintf(stcfg.bind_addr, sizeof stcfg.bind_addr, "%s", cfg.listen_addr);
     stcfg.bind_port    = cfg.listen_port;
     stcfg.max_conns    = cfg.max_conns;
+    /* rcfg is a copy of stcfg, so the rental listener inherits this too. */
+    stcfg.listen_backlog = cfg.listen_backlog;
     stcfg.initial_diff = cfg.initial_diff;
     snprintf(stcfg.operator_address, sizeof stcfg.operator_address, "%s",
              cfg.operator_address);

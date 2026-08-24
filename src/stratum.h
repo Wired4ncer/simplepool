@@ -21,6 +21,11 @@ typedef struct stratum_job stratum_job_t;
  * window. Size against this constant, never against a hand-picked number. */
 #define STRATUM_RECENT_JOBS 8
 
+/* Default listen() backlog. 1024 rather than the kernel's own default: a
+ * marketplace order arrives as one burst of hundreds of connections, and the
+ * queue only has to absorb the burst until the listener thread drains it. */
+#define STRATUM_DEFAULT_BACKLOG 1024
+
 /* Extranonce widths, in bytes. Advertised at mining.subscribe, reserved in
  * the coinbase scriptSig, and enforced on every submit — change them here and
  * nowhere else.
@@ -188,6 +193,18 @@ typedef struct {
      * against half-open TCPs from crashed miners and misconfigured clients
      * that connect but never authenticate. 0 disables (legacy). Default 600. */
     int    idle_timeout_sec;
+
+    /* listen() backlog: how many completed handshakes the kernel may hold
+     * before accept() takes them. <= 0 uses STRATUM_DEFAULT_BACKLOG.
+     *
+     * This was hardcoded at 64, which is far too small for a hashrate
+     * marketplace: those fan out hundreds of connections in a burst, and a
+     * full accept queue makes the kernel DROP the SYN. The client sees a
+     * connection that never completed, the pool sees nothing at all -- there
+     * is no accept() error to log, because there was no accept. The only
+     * evidence is TcpExt:ListenOverflows, which reached 769 on this pool
+     * before anyone thought to read it. */
+    int    listen_backlog;
 
     /* Shared across every server in the process; NULL = allocate a private
      * one. See stratum_shared_t above — this is not optional when more than

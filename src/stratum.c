@@ -2015,7 +2015,11 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
         LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, cfg->bind_port, strerror(errno));
         close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
     }
-    if (listen(s->listen_fd, 64) < 0) {
+    /* Clamped by net.core.somaxconn, so asking for more than the kernel
+     * allows is harmless -- asking for less than it allows is not. */
+    int backlog = cfg->listen_backlog > 0 ? cfg->listen_backlog
+                                          : STRATUM_DEFAULT_BACKLOG;
+    if (listen(s->listen_fd, backlog) < 0) {
         close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
     }
     if (pthread_create(&s->listener_thr, NULL, listener_thread, s) != 0) {

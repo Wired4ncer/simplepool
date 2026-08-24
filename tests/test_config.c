@@ -129,6 +129,39 @@ static void test_rental_port_parses(void) {
     CHECK(cfg.initial_diff == 1.0);
 }
 
+/* The backlog defaults to 0, which stratum.c reads as "use
+ * STRATUM_DEFAULT_BACKLOG". 0 is the sentinel on purpose: config.c must not
+ * depend on the stratum header just to name a default. */
+static void test_listen_backlog_defaults_to_sentinel(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listen_backlog == 0);
+}
+
+/* An explicit backlog is what lets a marketplace burst be absorbed without a
+ * rebuild. It was hardcoded at 64, and TcpExt:ListenOverflows reached 769 in
+ * production before that was noticed -- a dropped SYN produces no accept()
+ * error, so there is nothing in the pool's own logs to find. */
+static void test_listen_backlog_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listen_backlog = 2048\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listen_backlog == 2048);
+    /* Nothing else moved. */
+    CHECK(cfg.max_conns == 500);
+    CHECK(cfg.listen_port == 3334);
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
@@ -137,6 +170,8 @@ int main(void) {
     test_rejects_bad_operator_address();
     test_rental_port_defaults_off();
     test_rental_port_parses();
+    test_listen_backlog_defaults_to_sentinel();
+    test_listen_backlog_parses();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;
