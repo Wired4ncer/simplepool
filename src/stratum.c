@@ -48,6 +48,10 @@
  * must be able to cover every job that is still solvable. */
 #define RECENT_JOBS    STRATUM_RECENT_JOBS
 #define RECENT_JOB_TTL_MS 60000
+/* Per-connection job -> issued-difficulty ring. Must cover every job stratum
+ * will still accept a submit for: the recent ring plus the current job,
+ * doubled for headroom. See stratum_conn.job_diff. */
+#define JOB_DIFF_RING  ((STRATUM_RECENT_JOBS + 1) * 2)
 /* Upper bound on a single blocking send to one miner. See conn_socket_setup. */
 #define SEND_TIMEOUT_SEC 10
 
@@ -341,11 +345,34 @@ struct stratum_conn {
     uint64_t vd_window_start_ms;
     uint32_t vd_window_shares;
 
+    /* The difficulty this connection was on when each recent job was SENT to
+     * it — i.e. the difficulty the miner actually mined that job at.
+     *
+     * A submit names the job it solved, and that job may be several retargets
+     * old: the server keeps STRATUM_RECENT_JOBS solvable, which is minutes of
+     * history, while a vardiff window is seconds. Judging such a submit at the
+     * connection's CURRENT difficulty rejects work the miner performed
+     * correctly at the difficulty we asked it for. Marketplaces report that as
+     * the single most common way a pool integration fails: it passes the
+     * extranonce check, then collapses the first time difficulty moves.
+     *
+     * Sized to cover every job that can still be solved (the recent ring plus
+     * the current job), doubled for headroom — the same reasoning as
+     * PROP_PLAN_RING in main.c, and for the same reason: a ring shorter than
+     * what stratum will still accept a submit for silently mis-judges the
+     * oldest one. */
+    struct {
+        char   job_id[32];
+        double difficulty;
+    } job_diff[JOB_DIFF_RING];
+    size_t   job_diff_head;
+
     /* The pre-retarget difficulty, honored for a grace period after a
-     * set_difficulty: the miner applies the new value only on a later job,
-     * so in-flight and old-job shares still arrive at the old difficulty.
-     * A back-to-back retarget overwrites this — only the latest old value
-     * is honored. */
+     * set_difficulty. Still the fallback when job_diff has no record for a
+     * submit, and when a miner applies a set_difficulty on a LATER job than we
+     * recorded it against — stratum does not pin down which job a
+     * set_difficulty first applies to, so miners differ. A back-to-back
+     * retarget overwrites this — only the latest old value is honored. */
     double   prev_difficulty;
     uint64_t diff_changed_ms;
 
@@ -886,6 +913,51 @@ static void vardiff_check_idle(stratum_server_t *s, stratum_conn_t *c,
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
 }
 
+/* Record the difficulty this connection is on as we hand it `job_id`.
+ *
+ * This is the difficulty the miner will mine that job at, which is what a
+ * later submit naming that job has to be judged against. Re-recording an
+ * existing job_id updates it in place rather than consuming a fresh slot, so a
+ * re-notify of the same job (a reconnect, or a periodic refresh) cannot push
+ * older still-solvable jobs out of the ring.
+ *
+ * CALLER MUST HOLD c->state_lock. */
+static void conn_record_job_diff(stratum_conn_t *c, const char *job_id,
+                                 double diff) {
+    if (!job_id || !*job_id) return;
+    for (size_t i = 0; i < JOB_DIFF_RING; ++i) {
+        if (strcmp(c->job_diff[i].job_id, job_id) == 0) {
+            c->job_diff[i].difficulty = diff;
+            return;
+        }
+    }
+    size_t slot = c->job_diff_head;
+    snprintf(c->job_diff[slot].job_id, sizeof c->job_diff[slot].job_id,
+             "%s", job_id);
+    c->job_diff[slot].difficulty = diff;
+    c->job_diff_head = (slot + 1) % JOB_DIFF_RING;
+}
+
+/* Difficulty `job_id` was issued to this connection at. Returns 1 and fills
+ * *out when known, 0 when this connection was never sent that job (or the ring
+ * has since wrapped past it) — in which case the caller falls back to the
+ * current-difficulty-plus-grace behaviour.
+ *
+ * CALLER MUST HOLD c->state_lock. */
+static int conn_job_diff_lookup(const stratum_conn_t *c, const char *job_id,
+                                double *out) {
+    if (!job_id || !*job_id) return 0;
+    for (size_t i = 0; i < JOB_DIFF_RING; ++i) {
+        if (c->job_diff[i].job_id[0] &&
+            strcmp(c->job_diff[i].job_id, job_id) == 0) {
+            if (c->job_diff[i].difficulty <= 0.0) return 0;
+            *out = c->job_diff[i].difficulty;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void send_current_notify(stratum_server_t *s, stratum_conn_t *c,
                                 char **buf, size_t *len, int clean) {
     pthread_rwlock_rdlock(&s->job_lock);
@@ -893,7 +965,14 @@ static void send_current_notify(stratum_server_t *s, stratum_conn_t *c,
     if (cur && conn_render_coinbase(s, c, cur) == 0) {
         cJSON *p = make_notify_params(cur, c->cb1, c->cb1_len,
                                       c->cb2, c->cb2_len, clean);
-        if (p) emit_notification(buf, len, "mining.notify", p);
+        if (p) {
+            emit_notification(buf, len, "mining.notify", p);
+            /* Only once the notify is actually going out. Both call sites hold
+             * state_lock, and both emit any pending mining.set_difficulty
+             * BEFORE this, so c->difficulty here is the value the miner has
+             * when it starts on this job. */
+            conn_record_job_diff(c, cur->job_id, c->difficulty);
+        }
     }
     pthread_rwlock_unlock(&s->job_lock);
 }
@@ -1352,6 +1431,11 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     const double cur_diff       = c->difficulty;
     const double prev_diff      = c->prev_difficulty;
     const uint64_t diff_changed = c->diff_changed_ms;
+    /* The difficulty THIS job was issued to THIS connection at. Snapshotted
+     * under the same lock as the rest of the vardiff set, so the tip watcher
+     * cannot retarget between reading one and reading another. */
+    double job_diff = 0.0;
+    const int have_job_diff = conn_job_diff_lookup(c, jid, &job_diff);
     pthread_mutex_unlock(&c->state_lock);
     free(en2_bytes);
 
@@ -1370,8 +1454,15 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint8_t hash_be[32];
     hash_header(header, hash_be);
 
+    /* Judge the share at the difficulty THIS job was issued to THIS connection
+     * at, not at whatever the connection has retargeted to since. A submit may
+     * name a job several retargets old — the server keeps STRATUM_RECENT_JOBS
+     * solvable — and the miner mined it at the difficulty we asked for at the
+     * time. Falls back to the current difficulty when this connection has no
+     * record of the job. */
+    const double judge_diff = have_job_diff ? job_diff : cur_diff;
     uint8_t worker_target[32];
-    worker_diff_to_target(cur_diff, worker_target);
+    worker_diff_to_target(judge_diff, worker_target);
 
     char sent_hash_hex[65] = {0};
     char worker_target_hex[65] = {0};
@@ -1401,11 +1492,16 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint64_t ts_now   = now_ms();
     int is_block      = be32_cmp(hash_be, job->network_target_be) <= 0;
     int meets_worker  = be32_cmp(hash_be, worker_target) < 0;
-    double share_diff = cur_diff;
+    double share_diff = judge_diff;
 
-    /* Honor the pre-retarget difficulty for a grace period: the miner only
-     * applies a set_difficulty on a later job, so shares mined against the
-     * old difficulty keep arriving after a retarget. */
+    /* Second chance at the pre-retarget difficulty, within a grace period.
+     *
+     * Still needed even with judge_diff above, because stratum does not pin
+     * down which job a mining.set_difficulty first applies to: we record it
+     * against the notify it was sent with, but a miner that applies it only on
+     * the FOLLOWING job mined this one easier than we recorded. Without this
+     * that miner's honest work is rejected. Miners differ here, so the
+     * tolerance is deliberate rather than a workaround for one of them. */
     if (!meets_worker && prev_diff > 0.0 &&
         ts_now - diff_changed < diff_grace_ms(s)) {
         uint8_t prev_target[32];
@@ -1589,6 +1685,18 @@ const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c) {
 }
 int stratum_conn_authorized_for_test(const stratum_conn_t *c) {
     return c ? c->authorized : 0;
+}
+
+void stratum_conn_force_difficulty_for_test(stratum_conn_t *c,
+                                            double cur, double prev) {
+    if (!c) return;
+    pthread_mutex_lock(&c->state_lock);
+    c->difficulty = cur;
+    c->prev_difficulty = prev;
+    c->diff_changed_ms = now_ms();   /* grace window is OPEN, so a test that
+                                      * passes is not passing because it
+                                      * expired */
+    pthread_mutex_unlock(&c->state_lock);
 }
 int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
     return c ? c->subscribed : 0;

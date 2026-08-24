@@ -228,6 +228,18 @@ void            stratum_conn_free_for_test(stratum_conn_t *c);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
+
+/* Force the connection's vardiff state directly, bypassing the retarget path.
+ *
+ * Exists because the interesting case for per-job difficulty — a submit for a
+ * job issued SEVERAL retargets ago — cannot be reached through
+ * vardiff_maybe_retarget in a unit test: raising difficulty needs accepted
+ * shares, and once difficulty is high enough to reject a random hash no
+ * further share is accepted to drive the next retarget. Setting `prev`
+ * models the second retarget having overwritten the original difficulty,
+ * which is exactly what puts it beyond the one-deep grace. */
+void stratum_conn_force_difficulty_for_test(stratum_conn_t *c,
+                                            double cur, double prev);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
 
 /* Live connection threads. Zero after stratum_server_stop() returns is the

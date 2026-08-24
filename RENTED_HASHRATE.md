@@ -20,15 +20,15 @@ every requirement below:
 
 ## What the marketplaces require
 
-Six things. Four are satisfied, two are not — stated plainly so nobody
-rediscovers them during a paid order.
+Six things. Five are satisfied; the sixth is NiceHash-only and not blocking —
+stated plainly so nobody rediscovers them during a paid order.
 
 | # | Requirement | Status |
 |---|---|---|
 | 1 | `extranonce2_size >= 7` | ✅ **8** |
 | 2 | A dedicated high-difficulty port | ✅ `rental_listen_port` |
 | 3 | Rejects as real stratum errors | ✅ codes 20/21/22/23/24/25 + rejects ledger |
-| 4 | Judge a submit at **its job's** difficulty | 🟠 **partial** — see [Known gaps](#known-gaps) |
+| 4 | Judge a submit at **its job's** difficulty | ✅ per-connection job record |
 | 5 | Version rolling / ASICBoost | ✅ BIP310 `mining.configure`, BIP320 mask |
 | 6 | `d=` in the password field | ⛔ **not parsed** — NiceHash only |
 
@@ -155,6 +155,35 @@ is correct for a lone server and for every unit test.
 ⚠️ **Anything that adds a third listener must pass the same `stratum_shared_t`.**
 This is the invariant to check first if duplicate shares ever appear.
 
+### 3. Judging a submit at its own job's difficulty
+
+Each connection records the difficulty it was on when each job was **sent to
+it**, and a submit naming that job is judged against that value rather than
+against whatever the connection has retargeted to since.
+
+This matters because the two timescales are wildly different: the server keeps
+`STRATUM_RECENT_JOBS` jobs solvable — minutes of history — while a vardiff
+window is seconds. A miner can legitimately return work for a job that predates
+several retargets, and judging it at the current difficulty throws away work it
+performed exactly as instructed. Marketplaces report this as their **single most
+common cause of failed pool integrations**: the pool passes the extranonce
+check, then collapses the first time difficulty moves.
+
+The credited difficulty is the job's too, not just the accept/reject verdict —
+that value is the share's PPLNS weight, so judging correctly but crediting at
+the current difficulty would misprice the share instead of dropping it.
+
+The older `prev_difficulty` grace is **kept as a fallback**, for two cases the
+per-job record does not cover: a submit for a job this connection was never sent
+(no record), and a miner that applies a `mining.set_difficulty` to a *later* job
+than the one it arrived with. Stratum does not pin down which job a
+`set_difficulty` first applies to, and miners genuinely differ, so that
+tolerance is deliberate.
+
+Cost is one small ring per connection — `(STRATUM_RECENT_JOBS + 1) * 2` entries,
+about 720 bytes, so ~350 KB at 500 connections — and a short linear scan per
+notify and per submit, which is nothing beside the SHA-256 work already done.
+
 ### The difficulty hint
 
 `on_difficulty_hint` replays what a **worker name** converged to previously, and
@@ -170,16 +199,6 @@ easy and lets the first retarget lift it — and widening the floor to cover
 
 ## Known gaps
 
-- 🟠 **Per-job difficulty at submit (requirement 4).** A submit for a retired job
-  is currently judged at the connection's *current* difficulty, falling back to
-  `prev_difficulty` for a **time**-based grace of
-  `max(2 × vardiff_window_sec, 60s)`. That is one level deep, while the job ring
-  is `STRATUM_RECENT_JOBS` (8) deep — two fast retargets inside the grace window
-  and the oldest difficulty is gone. Marketplaces report this as their **single
-  most common cause of failed integrations**: a pool passes the extranonce check
-  and then collapses when difficulty changes. The fix is to record the
-  connection's difficulty at the moment each job was sent to it and judge a
-  submit against that. **Worth landing before a first paid order.**
 - ⛔ **`d=` in the password field (requirement 6).** `mining.authorize` ignores
   `params[1]`. NiceHash uses it to request a difficulty; Braiins does not. A
   rental port pinned at 500000 already serves NiceHash's floor, so this is not
@@ -209,8 +228,11 @@ length prefix disagrees with its contents, so this is the check that matters.
 
 Unit coverage lives in `tests/test_stratum.c`: the advertised width, rejection
 one byte under and one byte over, the shared extranonce1 sequence across two
-servers (asserted **consecutive**, so it cannot pass by luck), and the hint
-floor.
+servers (asserted **consecutive**, so it cannot pass by luck), the hint floor,
+and per-job difficulty — a submit for a job issued two retargets ago is accepted
+*and credited* at that job's difficulty, a share under its own job's difficulty
+is still rejected, an unrecorded job still falls back to the grace path, and
+re-notifying a job does not evict it from the ring.
 
 ⚠️ `TEST_EN2` in `tests/test_stratum.c` is guarded by a `_Static_assert` against
 `STRATUM_EXTRANONCE2_SIZE`. Changing the width without updating the fixture is a

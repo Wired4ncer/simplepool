@@ -24,12 +24,13 @@ static int g_fail = 0;
 
 /* Observers + state. */
 typedef struct {
-    int   shares;
-    int   rejects;
-    int   blocks;
-    int   last_is_block;
-    char  last_worker[64];
-    char  last_reason[128];
+    int    shares;
+    int    rejects;
+    int    blocks;
+    int    last_is_block;
+    double last_difficulty;   /* what the share was CREDITED at */
+    char   last_worker[64];
+    char   last_reason[128];
 } obs_t;
 
 /* The callbacks are invoked from whichever thread handled the share, and
@@ -41,10 +42,11 @@ static pthread_mutex_t obs_mu = PTHREAD_MUTEX_INITIALIZER;
 static void on_share(void *ctx, const char *w, const char *addr,
                      uint64_t ts, double d,
                      int is_block, const char *blk) {
-    (void)ts; (void)d; (void)blk; (void)addr;
+    (void)ts; (void)blk; (void)addr;
     obs_t *o = ctx;
     pthread_mutex_lock(&obs_mu);
     o->shares++;
+    o->last_difficulty = d;
     o->last_is_block = is_block;
     if (is_block) o->blocks++;
     snprintf(o->last_worker, sizeof(o->last_worker), "%s", w ? w : "");
@@ -331,7 +333,11 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
     CHECK(obs.shares == 1);                 /* not credited */
     CHECK(obs.rejects == 1);
     CHECK(strstr(obs.last_reason, "extranonce2") != NULL);
-    CHECK(strstr(out, "\"error\"") != NULL);
+    /* Match the error PAYLOAD, not the "error" key — the key is present on a
+     * successful response too, so the old check passed either way. Stratum
+     * errors are the array form [code, message, null], not an object. */
+    CHECK(strstr(out, "\"error\":[") != NULL);
+    CHECK(strstr(out, "\"result\":true") == NULL);
     free(out); out=NULL; olen=0;
 
     /* One byte too long (9 bytes). */
@@ -1371,6 +1377,196 @@ static void test_initial_diff_below_vardiff_min_is_not_floored(void) {
     printf("ok: initial_diff below vardiff_min is left alone\n");
 }
 
+/* Build a server + one authorized connection sitting on job "J1", with the
+ * connection's difficulty recorded against that job at `issued_diff`.
+ *
+ * All-zero network target throughout: nothing is ever a block, so acceptance
+ * can only come from the share-difficulty path, and vardiff's
+ * network-difficulty clamp cannot interfere.
+ */
+static stratum_server_t *setup_job_diff_conn(obs_t *obs, double issued_diff,
+                                             stratum_conn_t **out_c) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = issued_diff,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 0.0,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .ctx = obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0 || !s) return NULL;
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net));
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    /* authorize emits set_difficulty + notify, and the notify is what records
+     * J1 against this connection's current difficulty. */
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out);
+    *out_c = c;
+    return s;
+}
+
+/* THE marketplace defect: a submit naming an OLD job must be judged at the
+ * difficulty that job was issued at, not at whatever the connection has
+ * retargeted to since.
+ *
+ * The server keeps STRATUM_RECENT_JOBS jobs solvable — minutes of history —
+ * while a vardiff window is seconds, so a miner can legitimately return work
+ * for a job that predates several retargets. Judging it at the current
+ * difficulty throws away work the miner performed exactly as instructed.
+ * Marketplaces report this as the single most common way a pool integration
+ * fails: it passes the extranonce check, then collapses the first time
+ * difficulty moves.
+ *
+ * `prev` is set to another high value on purpose: that models a SECOND
+ * retarget having overwritten the original difficulty, which is precisely the
+ * case the one-deep prev_difficulty grace cannot cover. The grace window is
+ * left wide open (diff_changed_ms = now), so a pass here is the per-job record
+ * working and not the grace expiring. */
+static void test_submit_judged_at_the_jobs_own_difficulty(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    stratum_server_t *s = setup_job_diff_conn(&obs, 1e-12, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    /* Two retargets have happened since J1 went out: 1e-12 -> 1e6 -> 4e6. */
+    stratum_conn_force_difficulty_for_test(c, 4e6, 1e6);
+
+    char *out = NULL; size_t olen = 0;
+    int rc = stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(rc == 0);
+
+    /* Accepted, because J1 was issued at 1e-12 and the hash clears it. */
+    CHECK(obs.shares == 1);
+    CHECK(obs.rejects == 0);
+    /* And CREDITED at the job's difficulty — this is the PPLNS weight, so
+     * crediting it at 4e6 would misprice the share as well as accept it. */
+    CHECK(obs.last_difficulty == 1e-12);
+    /* "error" is a KEY in every JSON-RPC response, success included, so match
+     * the result rather than the key's presence. */
+    CHECK(out != NULL && strstr(out, "\"result\":true") != NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a submit is judged at its own job's difficulty\n");
+}
+
+/* The converse, so the rule above cannot be satisfied by simply accepting
+ * everything: a share that fails even the difficulty its job was issued at is
+ * still rejected. */
+static void test_submit_below_the_jobs_own_difficulty_is_rejected(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    /* J1 issued at a difficulty a random hash cannot meet. */
+    stratum_server_t *s = setup_job_diff_conn(&obs, 1e9, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    /* Current difficulty far LOWER than the job's, and no grace to lean on —
+     * so nothing but the job's own difficulty can decide this. */
+    stratum_conn_force_difficulty_for_test(c, 1e-12, 0.0);
+
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000002\"]}",
+        &out, &olen);
+
+    CHECK(obs.shares == 0);
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "low difficulty") != NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a share under its own job's difficulty is still rejected\n");
+}
+
+/* A job this connection was never sent has no record, so the old
+ * current-difficulty-plus-grace path must still apply rather than the share
+ * being accepted by default. */
+static void test_unknown_job_record_falls_back_to_grace(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    stratum_server_t *s = setup_job_diff_conn(&obs, 1e-12, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    /* Rotate to a job this connection is never notified of (its fd is -1, so
+     * the broadcast skips it) — J2 therefore has no per-job record here. */
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J2", net));
+
+    /* Current difficulty unreachable, and the grace holds the reachable one. */
+    stratum_conn_force_difficulty_for_test(c, 1e9, 1e-12);
+
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J2\",\"" TEST_EN2 "\",\"60000000\",\"00000003\"]}",
+        &out, &olen);
+
+    /* Accepted via the grace, and credited at the grace difficulty. */
+    CHECK(obs.shares == 1);
+    CHECK(obs.rejects == 0);
+    CHECK(obs.last_difficulty == 1e-12);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: no per-job record falls back to the grace path\n");
+}
+
+/* Re-notifying the SAME job must update its record in place rather than
+ * consume a ring slot, or a long-lived connection on a slow chain evicts jobs
+ * that are still solvable and silently returns to the old behaviour. */
+static void test_rerecording_a_job_does_not_consume_ring_slots(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    stratum_server_t *s = setup_job_diff_conn(&obs, 1e-12, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    /* Re-authorize many more times than the ring is deep. Each one re-notifies
+     * the same current job, so J1's record must survive all of them. */
+    for (int i = 0; i < 64; ++i) {
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c,
+            "{\"id\":9,\"method\":\"mining.authorize\","
+             "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+            &out, &olen);
+        free(out);
+    }
+
+    stratum_conn_force_difficulty_for_test(c, 4e6, 1e6);
+
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000004\"]}",
+        &out, &olen);
+
+    CHECK(obs.shares == 1);
+    CHECK(obs.rejects == 0);
+    CHECK(obs.last_difficulty == 1e-12);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: re-notifying a job does not evict it from the ring\n");
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -1396,6 +1592,10 @@ int main(void) {
     test_server_without_shared_still_allocates_one();
     test_hint_below_vardiff_min_is_floored();
     test_initial_diff_below_vardiff_min_is_not_floored();
+    test_submit_judged_at_the_jobs_own_difficulty();
+    test_submit_below_the_jobs_own_difficulty_is_rejected();
+    test_unknown_job_record_falls_back_to_grace();
+    test_rerecording_a_job_does_not_consume_ring_slots();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
