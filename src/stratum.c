@@ -937,10 +937,20 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
  * submits whatever beats its own target — so the loop has no gradient to
  * follow, and any share rate that happens to land inside the deadband is a
  * fixed point. A miner floored at 256 while assigned 1 therefore sits at 1
- * forever, and since a share is credited at the difficulty we assigned
- * (share_diff = c->difficulty in handle_submit), the pool books 1/256th of
- * the work it actually received: a hashrate estimate 256x low, and on a
- * pps-classic pool a payout 256x short.
+ * forever, and since a share is credited at the difficulty WE assigned rather
+ * than the one it achieved, the pool books 1/256th of the work it actually
+ * received: a hashrate estimate 256x low, and on a pps-classic pool a payout
+ * 256x short.
+ *
+ * ⚠️ Do NOT "correct" this to say share_diff = c->difficulty. It used to, and
+ * an earlier revision of this comment still said so; handle_submit now credits
+ * `judge_diff`, the difficulty of the share's OWN JOB (2df373a6 — judging a
+ * submit at the connection's current difficulty was the pool's single largest
+ * source of miner complaints). The argument above is unaffected either way,
+ * because the job's difficulty is still a difficulty the pool assigned — just
+ * at job time rather than connection-current. The distinction matters only to
+ * whoever reads this next: matching the code to this sentence would undo that
+ * fix. → feedback_copied-is-not-honoured
  *
  * So alongside the rate loop, watch the difficulty the shares actually
  * achieve. Every share in the window achieving far more than we asked for is
