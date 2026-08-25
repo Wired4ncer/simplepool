@@ -845,6 +845,118 @@ static void test_vardiff_tracks_miner_local_floor(void) {
     stratum_server_free(s);
 }
 
+/* The floor detector must obey the SAME sample floor the rate loop obeys.
+ *
+ * `vardiff_min_samples` extends an under-sampled window rather than acting on
+ * it, but the extension is bounded by `vardiff_max_window_mult` — so a slow
+ * connection's window still ends holding somewhere between
+ * VD_FLOOR_MIN_SAMPLES and vardiff_min_samples shares. Upstream's floor check
+ * reads `vd_window_shares` directly, so in that band it fires on as few as
+ * five samples no matter how high the sample floor is set.
+ *
+ * That band is not hypothetical: it is exactly the proxied rental connection
+ * `cacc888` was written for, going quiet between bursts. An accepted share
+ * achieves at least the difficulty it was accepted at, and P(achieved > 4x
+ * assigned) = 1/4 for a uniform hash, so a false trigger costs 0.25^n per
+ * window — 1/1024 at five samples, not the 0.25^20 the sample floor is
+ * supposed to buy. The correction is uncapped and the recovery is capped, so
+ * a false trigger costs more to undo than it cost to cause.
+ *
+ * Below: a window that ends at the extension cap with five shares, every one
+ * of them clearing 1000x the assigned difficulty. The rate loop is inside its
+ * deadband, so any difficulty change here is the floor detector's. It must
+ * not fire — and then, with the window properly sampled, it must. */
+static void test_vardiff_floor_detect_respects_min_samples(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-9,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 150.0,
+                           .vardiff_min = 1e-9,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .vardiff_min_samples = 20,
+                           .vardiff_max_window_mult = 2,
+                           .vardiff_idle_step = 2.0,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    CHECK(stratum_conn_difficulty_for_test(c) == 1e-9);
+
+    /* Pre-mine every share up front: mining is far slower than submitting,
+     * and a window armed before it would elapse during the mining. */
+    const int N = 25;
+    uint32_t nonce[25];
+    double   floor_seen = 1e300;
+    uint32_t from = 1;
+    int mined = 1;
+    for (int i = 0; i < N; ++i) {
+        double a = mine_nonce(s, c, "J1", TEST_EN2, 1e-6, HUGE_VAL,
+                              from, &nonce[i]);
+        if (a <= 0.0) { mined = 0; break; }
+        if (a < floor_seen) floor_seen = a;
+        from = nonce[i] + 1;
+    }
+    CHECK(mined == 1);
+    if (!mined) { stratum_conn_free_for_test(c); stratum_server_free(s); return; }
+
+    /* ---- under-sampled window: five shares, all clearing 1000x ---------- */
+    rearm_vardiff_window(s, c);
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < 4; ++i) {
+        submit_nonce(s, c, TEST_EN2, nonce[i], &out, &olen);
+        CHECK(set_diff_value(out) < 0.0);
+        free(out); out = NULL; olen = 0;
+    }
+    /* Past the extension cap (window_sec * max_window_mult = 2s), so the
+     * window ends on the next share instead of extending further. */
+    sleep_ms(2200);
+    submit_nonce(s, c, TEST_EN2, nonce[4], &out, &olen);
+
+    /* The fixture must prove it reached the retarget path at all, or this
+     * negative assertion passes for the wrong reason. */
+    CHECK(obs.shares == 5);
+    CHECK(obs.rejects == 0);
+    /* ~136 spm against a 150 target: ratio 0.91, inside the [0.5, 2.0]
+     * deadband, so the rate loop proposes nothing and the only thing that
+     * could move the difficulty here is the floor detector. */
+    CHECK(set_diff_value(out) < 0.0);
+    CHECK(stratum_conn_difficulty_for_test(c) == 1e-9);
+    free(out); out = NULL; olen = 0;
+
+    /* ---- properly sampled window: the detector must still work ---------- */
+    /* The window was reset by the retarget above; fill this one to the
+     * sample floor. Same connection, same shares, same ratio — only the
+     * sample count differs, which is what proves the guard is a sample
+     * floor and not a disabled detector. */
+    for (int i = 5; i < 24; ++i) {
+        submit_nonce(s, c, TEST_EN2, nonce[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(1100);
+    submit_nonce(s, c, TEST_EN2, nonce[24], &out, &olen);
+    CHECK(obs.shares == 25);
+    CHECK(obs.rejects == 0);
+
+    double got = set_diff_value(out);
+    CHECK(got > 0.0);
+    CHECK(got > 1e-7);                       /* off vardiff_min for good */
+    CHECK(got < floor_seen);                 /* just UNDER the measured floor */
+    free(out);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: the floor detector obeys vardiff_min_samples\n");
+}
+
 /* The floor detector must not block a legitimate downward retarget. A miner
  * whose shares match its assigned difficulty still achieves slightly more
  * than it on every accepted share, so testing the window minimum against the
@@ -2664,6 +2776,7 @@ int main(void) {
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
     test_vardiff_tracks_miner_local_floor();
+    test_vardiff_floor_detect_respects_min_samples();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
     test_vardiff_grace_accepts_old_diff_shares();

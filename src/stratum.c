@@ -1051,8 +1051,28 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
      * it against a proposal the rate loop has just cut by 4x would fire on
      * every such cut and pin the difficulty of every miner that legitimately
      * slowed down. */
+    /* The floor detector needs the SAME sample floor the rate loop needs,
+     * for the same reason. VD_FLOOR_MIN_SAMPLES alone reads vd_window_shares
+     * directly, so it is unaffected by vardiff_min_samples — and a window
+     * that ended at the vardiff_max_window_mult extension cap holds somewhere
+     * between the two. In that band the trigger costs 0.25^n per window
+     * (1/1024 at five samples), not the 0.25^20 the sample floor is meant to
+     * buy, and the band is populated by exactly the proxied rental
+     * connections the sample floor was written for.
+     *
+     * Requiring the full sample floor costs detection nothing: a miner
+     * enforcing a local floor submits at a rate set by THAT floor, not by the
+     * difficulty we assigned, so it fills its windows fast — the production
+     * case upstream found ran 12-19 spm against a target of 12. A false
+     * trigger, by contrast, raises UNCAPPED and is walked back at a capped
+     * step, so it costs more to undo than it cost to cause. */
+    uint32_t floor_min_samples = VD_FLOOR_MIN_SAMPLES;
+    if (s->cfg.vardiff_min_samples > (int)floor_min_samples) {
+        floor_min_samples = (uint32_t)s->cfg.vardiff_min_samples;
+    }
+
     int from_floor = 0;
-    if (c->vd_window_shares >= VD_FLOOR_MIN_SAMPLES &&
+    if (c->vd_window_shares >= floor_min_samples &&
         isfinite(c->vd_window_min_achieved) &&
         c->vd_window_min_achieved > old_diff * VD_FLOOR_TRIGGER) {
         double floor_diff = c->vd_window_min_achieved * VD_FLOOR_BACKOFF;
