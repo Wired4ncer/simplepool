@@ -1697,6 +1697,27 @@ double store_worker_recent_difficulty(store_t *s, const char *worker_name,
 
 /* ---------- proportional / PPLNS helpers ---------- */
 
+/* ⛔ TAKES tx_mu, and must. store_prop_settle_block rewrites this table WHOLE —
+ * DELETE FROM prop_ledger, then re-INSERT row by row, inside one transaction on
+ * THIS SAME HANDLE. A connection sees its own uncommitted writes, so an
+ * unsynchronised read here can land between the DELETE and the COMMIT and
+ * return a PARTIALLY REBUILT table. A subset of a zero-sum ledger is not
+ * zero-sum, and pplns_compute_payouts then refuses it — costing that block its
+ * proportional split, which is paid to the finder instead.
+ *
+ * Observed in production 2026-08-25: six torn reads in ~19 h, five of which
+ * landed on a block. Always negative, because the table holds a few large
+ * negative claims and many small positive ones, so an interrupted rebuild
+ * skews that way. The stored ledger was never corrupt — only the read was.
+ *
+ * ⚠️ The writer thread's batches only INSERT, so an unsynchronised read of the
+ * tables IT owns is merely stale. Only a DELETE-then-rebuild turns a stale read
+ * into a torn one — which is why this was the one getter that needed the lock
+ * and the only one that showed it. Any future path that rewrites a table whole
+ * puts every reader of that table under the same rule.
+ *
+ * Safe against deadlock: the only caller is prop_build_plan on the template
+ * thread, which holds no store lock. */
 int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
     if (!s || !out || !n) return -1;
     *out = NULL; *n = 0;
@@ -1705,20 +1726,32 @@ int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
         "SELECT address, claim_fraction FROM prop_ledger"
         "  WHERE claim_fraction != 0";
     sqlite3_stmt *st = NULL;
+
+    pthread_mutex_lock(&s->tx_mu);
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->tx_mu);
         atomic_fetch_add(&s->pg_errors, 1);
         return -1;
     }
 
     size_t cap = 64, count = 0;
     pplns_claim_t *buf = (pplns_claim_t *)calloc(cap, sizeof(*buf));
-    if (!buf) { sqlite3_finalize(st); return -1; }
+    if (!buf) {
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&s->tx_mu);
+        return -1;
+    }
 
     while (sqlite3_step(st) == SQLITE_ROW) {
         if (count >= cap) {
             size_t ncap = cap * 2;
             pplns_claim_t *nb = (pplns_claim_t *)realloc(buf, ncap * sizeof(*nb));
-            if (!nb) { free(buf); sqlite3_finalize(st); return -1; }
+            if (!nb) {
+                free(buf);
+                sqlite3_finalize(st);
+                pthread_mutex_unlock(&s->tx_mu);
+                return -1;
+            }
             buf = nb; cap = ncap;
         }
         const char *addr = (const char *)sqlite3_column_text(st, 0);
@@ -1728,6 +1761,7 @@ int store_prop_get_ledger(store_t *s, pplns_claim_t **out, size_t *n) {
         count++;
     }
     sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->tx_mu);
     *out = buf;
     *n = count;
     return 0;

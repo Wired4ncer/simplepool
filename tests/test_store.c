@@ -1064,6 +1064,103 @@ static void test_proportional_window_boundary_spans_a_page(void) {
  *
  * Settling the delta composes instead: each block moves the ledger by what it
  * actually changed, so both are still there afterwards. */
+/* The claim ledger must never be observed mid-rewrite.
+ *
+ * store_prop_settle_block rewrites prop_ledger WHOLE — DELETE, then re-INSERT
+ * row by row — inside one transaction on the store's single sqlite handle. A
+ * connection sees its own uncommitted writes, so a reader that does not take
+ * tx_mu can return a partially rebuilt table. A subset of a zero-sum ledger is
+ * not zero-sum; pplns_compute_payouts refuses it, and the block that lands on
+ * that plan pays its finder instead of splitting. Six such reads happened in
+ * production on 2026-08-25, five of them costing a block its split.
+ *
+ * The ledger here is deliberately shaped like the real one: one large negative
+ * claim and many small positive ones. That is what makes a torn read obvious
+ * AND what made every observed imbalance negative — an interrupted rebuild has
+ * usually written the big negative row but not yet all the small positives. */
+typedef struct {
+    store_t *s;
+    volatile int stop;
+    long reads;          /* how many reads completed */
+    long full_reads;     /* reads that saw the whole table */
+    double worst_abs_sum;/* largest |sum| any read observed */
+} ledger_reader_arg_t;
+
+#define LEDGER_ROWS 400
+
+static void *ledger_reader_fn(void *p) {
+    ledger_reader_arg_t *a = (ledger_reader_arg_t *)p;
+    while (!a->stop) {
+        pplns_claim_t *got = NULL; size_t n = 0;
+        if (store_prop_get_ledger(a->s, &got, &n) != 0) continue;
+        if (n > 0) {
+            double sum = 0.0;
+            for (size_t i = 0; i < n; i++) sum += got[i].claim_fraction;
+            if (fabs(sum) > a->worst_abs_sum) a->worst_abs_sum = fabs(sum);
+            a->reads++;
+            if (n == LEDGER_ROWS + 1) a->full_reads++;
+        }
+        free(got);
+    }
+    return NULL;
+}
+
+static void test_prop_ledger_read_is_not_torn(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Seed: one big negative, LEDGER_ROWS small positives, summing to zero. */
+    static pplns_claim_t seed[LEDGER_ROWS + 1];
+    seed[0].claim_fraction = -0.5;
+    snprintf(seed[0].address, sizeof seed[0].address, "%s", "big_negative_claim");
+    for (int i = 0; i < LEDGER_ROWS; i++) {
+        snprintf(seed[i + 1].address, sizeof seed[i + 1].address, "small_%04d", i);
+        seed[i + 1].claim_fraction = 0.5 / (double)LEDGER_ROWS;
+    }
+    assert(store_prop_settle_block(s, 1000, NULL, 0, seed, LEDGER_ROWS + 1) == 0);
+
+    ledger_reader_arg_t arg = { .s = s, .stop = 0, .reads = 0,
+                                .full_reads = 0, .worst_abs_sum = 0.0 };
+    pthread_t th;
+    assert(pthread_create(&th, NULL, ledger_reader_fn, &arg) == 0);
+
+    /* Force repeated whole-table rewrites. An empty delta leaves the contents
+     * identical, so ANY non-zero sum a reader sees is a torn read and nothing
+     * else — the data is never actually changing. */
+    for (int i = 0; i < 25; i++) {
+        assert(store_prop_settle_block(s, 2000 + i, NULL, 0, NULL, 0) == 0);
+        /* Yield between settles. Without this the settles hold tx_mu almost
+         * continuously and the reader starves, which would make the fixture
+         * guards fail for the wrong reason — the point is a reader running
+         * ALONGSIDE the rewrites, not one locked out of them. */
+        nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 3000000}, NULL);
+    }
+    arg.stop = 1;
+    pthread_join(th, NULL);
+
+    /* Fixture guards: the reader must actually have run against the rewrites,
+     * or "no torn read" proves nothing. */
+    assert(arg.reads > 20);
+    assert(arg.full_reads > 0);
+
+    if (arg.worst_abs_sum > 1e-9) {
+        fprintf(stderr,
+                "TORN READ: a reader observed prop_ledger summing to %+.9f "
+                "instead of zero (%ld reads, %ld saw all %d rows) — the ledger "
+                "was read between DELETE and COMMIT\n",
+                arg.worst_abs_sum, arg.reads, arg.full_reads, LEDGER_ROWS + 1);
+        assert(0 && "prop_ledger observed mid-rewrite");
+    }
+    printf("  ok test_prop_ledger_read_is_not_torn (%ld reads, %ld full)\n",
+           arg.reads, arg.full_reads);
+    store_close(s);
+}
+
 static void test_proportional_settles_compose(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -1524,6 +1621,7 @@ int main(void) {
     test_proportional_window_pages();
     test_proportional_window_boundary_spans_a_page();
     test_proportional();
+    test_prop_ledger_read_is_not_torn();
     test_proportional_settles_compose();
     test_proportional_window_floor();
     test_proportional_window_when_every_share_is_a_block();
