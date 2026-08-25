@@ -104,7 +104,24 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  checked_via     TEXT"
     ");"
     "CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);"
-    "CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status);"
+    /* ⛔ The status index is NOT here, and must not be moved here.
+     *
+     * This array is applied STRICTLY — any error fails store_open and the pool
+     * does not start. `CREATE TABLE IF NOT EXISTS` is a no-op on a database
+     * that already has blocks_found, so on every existing deployment the table
+     * still lacks `status` at this point, and indexing a column that does not
+     * exist yet fails with "no such column: status". The ALTER that adds it
+     * lives in the MIGRATIONS array below, which is error-tolerant — and which
+     * never runs, because this section aborts first.
+     *
+     * That took the production pool down on 2026-08-25: three crash-loop
+     * restarts, ~3 minutes with no listener, reverted. ⚠️ Every test passed,
+     * because tests build a FRESH database where the CREATE TABLE above does
+     * include `status`. The failure needs a pre-existing table without it —
+     * i.e. only production. See test_store_opens_a_pre_status_database.
+     *
+     * The migrations array creates this index, which covers both cases:
+     * migrations run on every open, so a fresh database gets it there too. */
     /* Single-row mirror of the upstream bitcoind tip. Updated on every
      * tip-watcher poll. The dashboard reads this for 'latest block' /
      * 'time since last block' without needing any RPC of its own. */

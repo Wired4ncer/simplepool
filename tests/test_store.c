@@ -1105,6 +1105,86 @@ static void *ledger_reader_fn(void *p) {
     return NULL;
 }
 
+/* 🔴 THE REGRESSION THAT TOOK THE POOL DOWN.
+ *
+ * Every other test in this file starts from an empty file, so store_open()
+ * always runs against a database it just created — where CREATE TABLE includes
+ * every current column. Production is the opposite: the table already exists,
+ * from an older schema, and the new columns arrive only via the MIGRATIONS
+ * array. Nothing exercised that path, so a statement added to the strict schema
+ * section that depended on a migrated column passed all 15 store tests and then
+ * failed to start the pool: "schema apply (part 1) failed: no such column:
+ * status", three crash-loop restarts, ~3 minutes with no listener.
+ *
+ * This builds a database the way the pre-merge schema did and asserts the store
+ * OPENS. ⚠️ It must keep using an explicitly old CREATE TABLE rather than
+ * anything derived from the current source, or it stops testing the upgrade the
+ * day the schema changes again. */
+static void test_store_opens_a_pre_status_database(void) {
+    const char *path = fresh_db_path();
+
+    /* The blocks_found of 6f36a49 — no status/confirmations/submit_error. */
+    sqlite3 *raw = NULL;
+    assert(sqlite3_open(path, &raw) == SQLITE_OK);
+    assert(sqlite3_exec(raw,
+        "CREATE TABLE blocks_found ("
+        "  id              INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ts              INTEGER NOT NULL,"
+        "  height          INTEGER NOT NULL,"
+        "  hash            TEXT NOT NULL,"
+        "  finder_id       INTEGER,"
+        "  finder_address  TEXT,"
+        "  reward_sats     INTEGER,"
+        "  fee_sats        INTEGER"
+        ");"
+        "INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats)"
+        "  VALUES (1000, 900001, 'deadbeef', 312000000, 780000);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    if (rc != 0) {
+        fprintf(stderr, "store_open FAILED on a pre-status database — this is "
+                        "exactly the production outage of 2026-08-25\n");
+    }
+    assert(rc == 0);
+
+    /* And the upgrade must actually have happened, not merely not-crashed. */
+    sqlite3 *chk = NULL;
+    assert(sqlite3_open(path, &chk) == SQLITE_OK);
+    int has_status = 0, has_index = 0, rows = 0;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(chk, "PRAGMA table_info(blocks_found)", -1, &st, NULL) == SQLITE_OK);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, "status") == 0) has_status = 1;
+    }
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(chk, "PRAGMA index_list(blocks_found)", -1, &st, NULL) == SQLITE_OK);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *n = (const char *)sqlite3_column_text(st, 1);
+        if (n && strcmp(n, "blocks_found_status_idx") == 0) has_index = 1;
+    }
+    sqlite3_finalize(st);
+    /* the pre-existing row must survive the upgrade */
+    assert(sqlite3_prepare_v2(chk, "SELECT COUNT(*) FROM blocks_found", -1, &st, NULL) == SQLITE_OK);
+    if (sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(chk);
+
+    assert(has_status && "migration must add blocks_found.status");
+    assert(has_index  && "migration must create blocks_found_status_idx");
+    assert(rows == 1  && "the pre-existing block row must survive");
+
+    store_close(s);
+    printf("  ok test_store_opens_a_pre_status_database\n");
+}
+
 static void test_prop_ledger_read_is_not_torn(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -1621,6 +1701,7 @@ int main(void) {
     test_proportional_window_pages();
     test_proportional_window_boundary_spans_a_page();
     test_proportional();
+    test_store_opens_a_pre_status_database();
     test_prop_ledger_read_is_not_torn();
     test_proportional_settles_compose();
     test_proportional_window_floor();
