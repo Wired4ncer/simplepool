@@ -748,6 +748,29 @@ static void test_ipv4_wildcard_is_still_ipv4_only(void) {
     CHECK(v4 >= 0);                       /* IPv4 still works */
     if (v4 >= 0) close(v4);
 
+    /* ⛔ Prove IPv6 is usable HERE before trusting a refusal. Without this the
+     * test passes on a host with no IPv6 at all, having proven nothing — the
+     * same vacuous-pass shape this suite keeps catching elsewhere. The other
+     * two dual-stack tests skip via start_on() returning NULL; this one never
+     * calls it, so it cannot tell "refused" from "impossible" on its own.
+     * ⚠️ And it prints SKIP, not ok: a vacuous pass and a real pass must not
+     * read the same. */
+    int probe_port = 39400;
+    stratum_server_t *probe = start_on("::", &probe_port);
+    if (!probe) {
+        stratum_server_free(s);
+        printf("SKIP: no IPv6 on this host — the 0.0.0.0 gate is UNTESTED\n");
+        return;
+    }
+    int ok6 = dial(AF_INET6, probe_port);
+    stratum_server_free(probe);
+    if (ok6 < 0) {
+        stratum_server_free(s);
+        printf("SKIP: no IPv6 loopback — the 0.0.0.0 gate is UNTESTED\n");
+        return;
+    }
+    close(ok6);
+
     int v6 = dial(AF_INET6, port);
     CHECK(v6 < 0);                        /* IPv6 must be REFUSED */
     if (v6 >= 0) close(v6);

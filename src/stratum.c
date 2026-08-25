@@ -2192,9 +2192,12 @@ int stratum_server_last_peer_ip_for_test(stratum_server_t *s, char *out, size_t 
     if (!s || !out || cap == 0) return -1;
     pthread_mutex_lock(&s->conns_lock);
     stratum_conn_t *c = s->conns_head;   /* register() pushes to the head */
+    int found = (c != NULL);
     if (c) snprintf(out, cap, "%s", c->peer_ip);
     pthread_mutex_unlock(&s->conns_lock);
-    return c ? 0 : -1;
+    /* `found`, not `c`: once the lock is dropped another thread may have freed
+     * the connection, and even comparing a dangling pointer is UB by the letter. */
+    return found ? 0 : -1;
 }
 
 /* ---- real connection thread ------------------------------------------ */
