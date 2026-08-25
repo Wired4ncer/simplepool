@@ -162,6 +162,100 @@ static void test_listen_backlog_parses(void) {
     CHECK(cfg.listen_port == 3334);
 }
 
+/* The new listener spelling parses, and every field lands where the accept
+ * path reads it. min_diff sets three things at once — the rate-loop floor, the
+ * starting difficulty, and the PROMISE — and the last of those is what
+ * survives the network-difficulty ceiling, so it is recorded separately. */
+static void test_listener_line_parses(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3335 min_diff=500000 label=braiins\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listener_count == 1);
+    CHECK(cfg.listeners[0].port == 3335);
+    CHECK(cfg.listeners[0].min_diff == 500000.0);
+    CHECK(cfg.listeners[0].vardiff_min == 500000.0);
+    CHECK(cfg.listeners[0].initial_diff == 500000.0);
+    CHECK(strcmp(cfg.listeners[0].label, "braiins") == 0);
+    /* The public port is untouched by any of it. */
+    CHECK(cfg.listen_port == 3334);
+    CHECK(cfg.initial_diff == 1.0);
+}
+
+/* A config that names no listener has none — which is what makes installing
+ * this binary a no-op for an operator still on the rental_* keys. */
+static void test_listeners_default_to_none(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listener_count == 0);
+}
+
+/* Two ports that collide must be refused at config time. The alternative is a
+ * bind() failing at startup with EADDRINUSE and no indication of WHICH of the
+ * operator's two lines was the mistake. */
+static void test_listener_colliding_with_listen_port_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3334 min_diff=500000\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc != 0);
+    CHECK(strstr(err, "3334") != NULL);
+}
+
+/* The same, for an operator mid-migration who has written both spellings of
+ * the rental port. Silently honouring one and dropping the other is how a
+ * rental port ends up bound at the wrong difficulty. */
+static void test_listener_colliding_with_rental_port_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "rental_listen_port = 3335\n"
+             "listener = port=3335 min_diff=500000\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc != 0);
+    CHECK(strstr(err, "3335") != NULL);
+}
+
+/* ⛔ The submit ceiling ships OFF. Upstream defaults it to 20000; refusing a
+ * submit is miner-visible and gets opened by measurement, not by a default. */
+static void test_max_submits_per_sec_defaults_off(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.max_submits_per_sec == 0);
+}
+
+/* An operator typo in a label must fail at startup rather than reach the DB
+ * and the dashboard unescaped. */
+static void test_listener_label_is_constrained(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3335 min_diff=500000 label=bad\"quote\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc != 0);
+}
+
 int main(void) {
     printf("running test_config...\n");
     test_hash_inside_value_is_kept();
@@ -172,6 +266,12 @@ int main(void) {
     test_rental_port_parses();
     test_listen_backlog_defaults_to_sentinel();
     test_listen_backlog_parses();
+    test_listener_line_parses();
+    test_listeners_default_to_none();
+    test_listener_colliding_with_listen_port_is_refused();
+    test_listener_colliding_with_rental_port_is_refused();
+    test_max_submits_per_sec_defaults_off();
+    test_listener_label_is_constrained();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");
     return 0;
