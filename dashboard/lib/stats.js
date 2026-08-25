@@ -1,12 +1,38 @@
 // Stats queries against the simplepool SQLite schema.
 //
-// All hashrate estimates use:  H/s ≈ sum(difficulty) * 2^32 / windowSec
+// All hashrate estimates use:  H/s ≈ sum(difficulty) * 2^32 / elapsedSec
+//
+// elapsedSec is the time the shares actually span, NOT the nominal window.
+// Dividing a partial window by its full length reports a rate the miner never
+// ran at: a pool eleven hours old reads half its true rate against a 24h
+// window, and a rig that connected ten minutes ago reads 1/144th of its own.
+// Both correct themselves once the window fills, which is what makes it hard
+// to catch — the number is only wrong while a pool or a miner is new, which
+// is exactly when someone is most likely to be reading it.
 //
 // The handle passed in is the wrapper from lib/db.js — it may not yet be
 // connected (proxy hasn't started). In that case we return empty/zero
 // shapes so the templates render gracefully.
 
 const TWO_32 = 4294967296;
+
+/* Never divide by less than this. The span runs from the first share in the
+ * window to now, so a lone share a few seconds old would otherwise divide by
+ * ~0 and report an absurd spike. A minute is short enough to keep a new
+ * miner's reading honest and long enough to damp that. */
+const MIN_SPAN_SEC = 60;
+
+/* Seconds of real coverage inside `windowSec`, given the oldest share ts that
+ * falls within it. Never exceeds the nominal window — a share selected by
+ * `ts >= now - windowSec` cannot be older than that — and never drops below
+ * MIN_SPAN_SEC. With no shares at all it returns the nominal window, so an
+ * idle pool divides 0 by the full window and reports 0 H/s. */
+function spanFor(oldestTs, nowSec, windowSec) {
+    if (oldestTs == null) return windowSec;
+    const span = nowSec - oldestTs;
+    if (!Number.isFinite(span) || span <= 0) return MIN_SPAN_SEC;
+    return Math.min(windowSec, Math.max(span, MIN_SPAN_SEC));
+}
 
 const EMPTY_OVERVIEW = {
     accepted: 0,
@@ -18,6 +44,7 @@ const EMPTY_OVERVIEW = {
     workers_active: 0,
     hashrate: 0,
     window_sec: 86400,
+    window_effective_sec: 86400,
     db_ready: false,
 };
 
@@ -35,24 +62,25 @@ function db(handle) {
     return handle.get();
 }
 
-/* Hashrate over an arbitrary window. Uses the standard estimator
- * H/s ≈ sum(difficulty) * 2^32 / windowSec. */
+/* Hashrate over an arbitrary window, divided by the span the shares actually
+ * cover rather than the nominal window — see spanFor. */
 function hashrateOver(d, nowSec, windowSec) {
     const row = d.prepare(
-        'SELECT COALESCE(SUM(difficulty),0) AS sum_diff FROM shares WHERE ts >= ?'
+        'SELECT COALESCE(SUM(difficulty),0) AS sum_diff, MIN(ts) AS first_ts FROM shares WHERE ts >= ?'
     ).get(nowSec - windowSec);
-    return (row.sum_diff * TWO_32) / windowSec;
+    return (row.sum_diff * TWO_32) / spanFor(row.first_ts, nowSec, windowSec);
 }
 
 export function overview(handle, windowSec = 86400) {
     const d = db(handle);
-    if (!d) return { ...EMPTY_OVERVIEW, window_sec: windowSec };
+    if (!d) return { ...EMPTY_OVERVIEW, window_sec: windowSec, window_effective_sec: windowSec };
     const nowSec = Math.floor(Date.now() / 1000);
     const since = nowSec - windowSec;
 
     const acc = d.prepare(
-        'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best FROM shares WHERE ts >= ?'
+        'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best, MIN(ts) AS first_ts FROM shares WHERE ts >= ?'
     ).get(since);
+    const accSpan = spanFor(acc.first_ts, nowSec, windowSec);
     const rej = d.prepare('SELECT COUNT(*) AS n FROM rejects WHERE ts >= ?').get(since);
     const blk = d.prepare(
         `SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ? AND ${CONFIRMED}`
@@ -86,7 +114,7 @@ export function overview(handle, windowSec = 86400) {
         blocks_orphaned: Number(candidates?.orphaned || 0),
         blocks_rejected: Number(candidates?.rejected || 0),
         workers_active: wk.n,
-        hashrate: (acc.sum_diff * TWO_32) / windowSec,   // 24h estimate
+        hashrate: (acc.sum_diff * TWO_32) / accSpan,     // 24h estimate
         hashrate_1h: hashrateOver(d, nowSec, 3600),
         hashrate_5m: hashrateOver(d, nowSec, 300),
         best_share_24h: acc.best,
@@ -98,6 +126,7 @@ export function overview(handle, windowSec = 86400) {
         oldest_share_ts: lifetime.oldest_ts,
         last_share_ts: last.ts,
         window_sec: windowSec,
+        window_effective_sec: accSpan,
         db_ready: true,
     };
 }
@@ -117,6 +146,7 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
                w.payout_address  AS payout_address,
                COUNT(s.id)       AS shares,
                MAX(s.ts)         AS last_seen,
+               MIN(s.ts)         AS first_ts,
                COALESCE(SUM(s.difficulty), 0) AS sum_diff
           FROM shares s
           JOIN workers w ON w.id = s.worker_id
@@ -127,21 +157,21 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
     `).all(since, limit);
 
     const sumShort = d.prepare(
-        'SELECT COALESCE(SUM(difficulty),0) AS sd FROM shares WHERE worker_id = ? AND ts >= ?'
+        'SELECT COALESCE(SUM(difficulty),0) AS sd, MIN(ts) AS first_ts FROM shares WHERE worker_id = ? AND ts >= ?'
     );
 
     const totalDiff = rows.reduce((a, r) => a + r.sum_diff, 0);
     return rows.map(r => {
-        const sd1h = sumShort.get(r.id, since1h).sd;
-        const sd5m = sumShort.get(r.id, since5m).sd;
+        const r1h = sumShort.get(r.id, since1h);
+        const r5m = sumShort.get(r.id, since5m);
         return {
             name: r.name,
             payout_address: r.payout_address || null,
             shares: r.shares,
             last_seen: r.last_seen,
-            hashrate_est: (r.sum_diff * TWO_32) / windowSec,
-            hashrate_1h: (sd1h * TWO_32) / 3600,
-            hashrate_5m: (sd5m * TWO_32) / 300,
+            hashrate_est: (r.sum_diff * TWO_32) / spanFor(r.first_ts, nowSec, windowSec),
+            hashrate_1h: (r1h.sd * TWO_32) / spanFor(r1h.first_ts, nowSec, 3600),
+            hashrate_5m: (r5m.sd * TWO_32) / spanFor(r5m.first_ts, nowSec, 300),
             share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
         };
     });
@@ -154,7 +184,8 @@ export function leaderboard(handle, windowSec = 86400, limit = 50) {
 export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
     const d = db(handle);
     if (!d) return [];
-    const since = Math.floor(Date.now() / 1000) - windowSec;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const since = nowSec - windowSec;
 
     // Aggregate shares per (payout_address). Workers with no payout_address
     // recorded (legacy rows) fall back to their `name` as the key so they
@@ -163,6 +194,7 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
         SELECT COALESCE(NULLIF(w.payout_address, ''), w.name) AS addr,
                COUNT(s.id)                                    AS shares,
                MAX(s.ts)                                      AS last_seen,
+               MIN(s.ts)                                      AS first_ts,
                COALESCE(SUM(s.difficulty), 0)                 AS sum_diff,
                COUNT(DISTINCT w.id)                           AS rigs,
                GROUP_CONCAT(DISTINCT w.name)                  AS worker_names
@@ -188,7 +220,7 @@ export function leaderboardByAddress(handle, windowSec = 86400, limit = 50) {
             labels,
             shares: r.shares,
             last_seen: r.last_seen,
-            hashrate_est: (r.sum_diff * TWO_32) / windowSec,
+            hashrate_est: (r.sum_diff * TWO_32) / spanFor(r.first_ts, nowSec, windowSec),
             share_of_pool_pct: totalDiff > 0 ? (r.sum_diff / totalDiff) * 100 : 0,
         };
     });
@@ -201,7 +233,8 @@ export function worker(handle, name, windowSec = 86400) {
     const w = d.prepare('SELECT * FROM workers WHERE name = ?').get(name);
     if (!w) return { worker: null, shares: [], buckets: [] };
 
-    const since = Math.floor(Date.now() / 1000) - windowSec;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const since = nowSec - windowSec;
 
     const sharesRaw = d.prepare(`
         SELECT ts, difficulty, is_block, block_hash AS share_hash
@@ -241,7 +274,8 @@ export function worker(handle, name, windowSec = 86400) {
 
     const sumRow = d.prepare(`
         SELECT COALESCE(SUM(difficulty),0) AS sum_diff,
-               COUNT(*)                   AS n
+               COUNT(*)                   AS n,
+               MIN(ts)                    AS first_ts
           FROM shares
          WHERE worker_id = ? AND ts >= ?
     `).get(w.id, since);
@@ -352,7 +386,7 @@ export function worker(handle, name, windowSec = 86400) {
             first_seen: w.first_seen,
             last_seen: w.last_seen,
             window_shares: sumRow.n,
-            window_hashrate: (sumRow.sum_diff * TWO_32) / windowSec,
+            window_hashrate: (sumRow.sum_diff * TWO_32) / spanFor(sumRow.first_ts, nowSec, windowSec),
         },
         shares,
         buckets,
@@ -386,12 +420,12 @@ export function worker(handle, name, windowSec = 86400) {
 function poolIdentity(d) {
     const blank = {
         network: null, network_source: null, coinbase_tag: null,
-        operator_address: null, pool_btc_address: null,
+        operator_address: null, pool_btc_address: null, listeners: null,
     };
     try {
         const r = d.prepare(`
             SELECT network, network_source, coinbase_tag,
-                   operator_address, pool_btc_address
+                   operator_address, pool_btc_address, listeners
               FROM pool_meta WHERE id = 1
         `).get();
         if (!r) return blank;
@@ -404,10 +438,34 @@ function poolIdentity(d) {
             coinbase_tag:     or_(r.coinbase_tag),
             operator_address: or_(r.operator_address),
             pool_btc_address: or_(r.pool_btc_address),
+            listeners:        parseListeners(r.listeners),
         };
     } catch {
         return blank;   /* DB predating the identity columns */
     }
+}
+
+/* The proxy publishes its stratum ports as a JSON array. Anything malformed
+ * reads as "not published" rather than taking the banner down — a pool that
+ * cannot describe its ports still has to serve its pages.
+ *
+ * Returns null when there is nothing trustworthy to show, never [] — the
+ * banner distinguishes "the proxy has not told us" from "there are no
+ * ports", and only the first is a state this pool can actually be in. */
+function parseListeners(raw) {
+    if (!raw) return null;
+    let arr;
+    try { arr = JSON.parse(raw); } catch { return null; }
+    if (!Array.isArray(arr)) return null;
+    const out = arr
+        .filter(l => l && Number.isFinite(Number(l.port)) && Number(l.port) > 0)
+        .map(l => ({
+            port:         Number(l.port),
+            label:        (typeof l.label === 'string' && l.label) ? l.label : null,
+            min_diff:     Number.isFinite(Number(l.min_diff))     ? Number(l.min_diff)     : null,
+            initial_diff: Number.isFinite(Number(l.initial_diff)) ? Number(l.initial_diff) : null,
+        }));
+    return out.length ? out : null;
 }
 
 export function poolMeta(handle) {

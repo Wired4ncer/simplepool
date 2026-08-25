@@ -62,7 +62,12 @@ This repository ships **three modes**, selected by `pool_mode` in
 - **`pool_mode = pps-classic`** — every accepted block's coinbase pays a
   single pool-owned BTC wallet (`pool_btc_address`) as a normal output.
   Each accepted share credits the miner's `pps_credits.accrued_sats` at
-  the configured `pps_sats_per_diff` rate; the operator batches the
+  a rate the proxy **derives from each block template** — the block's
+  own value over the network difficulty, net of `fee_bps` — so the
+  price of a share tracks the chain instead of going stale.
+  (`pps_sats_per_diff` exists to pin that rate and should be left
+  unset: a pinned value silently bypasses `fee_bps` and cannot follow a
+  retarget.) The operator batches the
   accumulated BTC into the pool's Thunder reserve from the admin
   dashboard, and a separate payout service (not in this binary) issues
   Thunder transactions to drain those credits to miners. Stratum
@@ -169,7 +174,10 @@ sequenceDiagram
         B-->>P: template
         alt new tip
             P->>P: rebuild stratum_job_t
-            P-->>M: mining.notify (new job, clean=true) — broadcast to all conns
+            P-->>M: mining.notify (new job, clean=TRUE) — broadcast to all conns<br/>every held job builds on a parent that is no longer the tip
+        else same tip, template ≥30s old
+            P->>P: rebuild stratum_job_t (fresher ntime, new txs)
+            P-->>M: mining.notify (new job, clean=FALSE) — broadcast to all conns<br/>the job in hand is still valid, submits against it are still accepted
         end
     end
 
@@ -221,7 +229,22 @@ Key invariants the diagram glosses over but the code enforces:
 - **vardiff doesn't invalidate the active job.** A
   `mining.set_difficulty` only relaxes/tightens the per-share check;
   the current `mining.notify` stays valid against it. We do not force
-  a re-notify on a difficulty change.
+  a re-notify on a difficulty change. Each job also carries the
+  difficulty it went out under, so a submit is judged at *that* value
+  rather than whatever the connection has drifted to since.
+- **`clean_jobs` is an instruction, not a description.** It means
+  "throw away the work you are holding", and only a tip change makes
+  that true. The periodic template refresh sends `clean_jobs=false`:
+  the job in hand still builds on the current tip, and the pool goes on
+  accepting submits against it out of an 8-deep retention ring. Sending
+  it as true on every refresh discards work in flight on every
+  connected miner ~20 times per block, which is invisible to a probe
+  that reads one notify and leaves.
+- **More than one stratum port.** A `listener` line binds an extra port
+  with its own difficulty policy, so a rented fleet and a home ASIC can
+  be served by the same pool without either getting the other's
+  difficulty. `listen_port` is unaffected, and a config naming no
+  listeners binds exactly what it always did.
 
 ### Stratum username convention
 
@@ -420,6 +443,10 @@ operator_address = bc1q...   # required: recipient of the fee_bps cut
 fee_bps          = 100       # 100 = 1%; valid range 0..1000 (max 10%)
 coinbase_tag     = /simplepool/ # short string baked into the coinbase scriptSig
 ```
+
+These are the keys you have to think about; every key the proxy accepts
+is documented inline in [`proxy.conf.example`](proxy.conf.example),
+which is the reference rather than this list.
 
 `fee_bps = 0` disables the fee output (single-payout coinbase, all to
 the miner). If the computed fee would be below the relay dust threshold

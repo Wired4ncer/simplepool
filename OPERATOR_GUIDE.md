@@ -317,6 +317,108 @@ view.
 
 ---
 
+## Taking rented hashrate (Braiins, NiceHash)
+
+Rented hashrate does not arrive as many small miners. The marketplace
+aggregates a whole fleet behind **one** connection, so the share rate on
+that single socket is the fleet's entire hashrate divided by the
+difficulty you assign it. At difficulty 1024, 1 PH/s is **~227 shares per
+second**. That is why both marketplaces enforce a floor and refuse to
+deliver below it — Braiins wants at least 1024 and recommends 65536,
+NiceHash requires 500000.
+
+Do **not** try to serve them from the same port as your home miners, and
+do not rely on vardiff climbing into range. Vardiff moves by at most 4x
+per window, so from difficulty 1 it needs eight windows — four minutes at
+the 30s default — to reach 65536, and the reject flood on the way there
+is what gets an order cancelled. Add a port instead, already at the right
+difficulty:
+
+```ini
+# proxy.conf
+listener = port=3335 min_diff=65536 label=braiins
+listener = port=3336 min_diff=500000 label=nicehash
+```
+
+Open the new ports in the firewall — a `listener` line binds a socket, it
+does not touch `ufw`:
+
+```sh
+sudo ufw allow 3335/tcp
+sudo ufw allow 3336/tcp
+```
+
+Restart, and confirm both ports came up:
+
+```sh
+journalctl -u simplepool -n 20 | grep listening
+# stratum listening on 0.0.0.0:3334 (difficulty from 1)
+# stratum listening on 0.0.0.0:3335 — braiins (difficulty from 65536, floor 65536)
+```
+
+Then check they are reachable and not just bound, which the log cannot tell
+you apart:
+
+```sh
+sudo simplepoolctl doctor
+#     stratum port 3335 accepting connections     ok
+#     firewall allows port 3335                   ok
+```
+
+The dashboard's identity strip then lists every port with what it is for,
+so miners can pick without asking you.
+
+### Check what the chain costs you
+
+Share difficulty is normally capped at the network difficulty, because a
+miner filters locally against the stratum target — a harder share target
+throws away valid blocks before the pool ever sees them.
+
+**`min_diff` overrides that cap, on purpose.** Without the override a 500000
+port on a chain at difficulty 1200 really serves 1200, the marketplace
+measures what it was given, and the order is cancelled with nothing in your
+logs explaining it. So a port that states `min_diff` gets that difficulty
+held for it.
+
+**What you pay is blocks.** Miners on that port filter at the promised
+difficulty, so they discard solutions the chain would have accepted —
+roughly `min_diff / network_difficulty` of them. At 500000 over 1200 that is
+about 416 of every 417. Nothing else on the pool is affected: `listen_port`
+and any listener without a `min_diff` are capped exactly as before.
+
+You do not have to work either half out by hand. The pool warns at startup
+for every port in this position, and the dashboard runs a **"Stratum ports
+can hold their difficulty"** health check that distinguishes the two cases —
+
+> port 3335 (braiins) promises min_diff 65536 and the pool is holding it,
+> but network difficulty is only 1200. Miners there ... discard roughly 53
+> of every 55 blocks they solve
+
+versus, for a port that set no `min_diff`:
+
+> port 3336 (nicehash) is configured for difficulty 500000 but network
+> difficulty is only 1200, so miners there are served 1200 instead
+
+The first is a bill; decide whether the rented hashrate is worth it, or drop
+that port's `min_diff`. The second is a port that will not satisfy the
+marketplace at all — add `min_diff` if you want it held, or wait for the
+chain to retarget.
+
+### Before you tell them to send an order
+
+Verify what the pool advertises, from outside the box:
+
+```sh
+(echo '{"id":1,"method":"mining.subscribe","params":[]}'; sleep 1) \
+  | nc <pool-host> 3335 | head -1
+```
+
+The third element of `result` is `extranonce2_size`, and it must be **>=
+7** — marketplaces block the target below that, because their router has
+to slice the extranonce2 space per machine. simplepool advertises **8**.
+
+---
+
 ## Rotating the admin password
 
 ```sh

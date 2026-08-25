@@ -1,6 +1,10 @@
 listen_addr = 0.0.0.0
 listen_port = 3334
 
+# Maximum concurrent stratum connections, across every listener. A connection
+# past this is closed immediately at accept. Each one costs a thread and an fd.
+max_conns = 500
+
 bitcoind_url = http://127.0.0.1:18443
 # bitcoind_user / bitcoind_pass are optional. Omit BOTH for a block-template
 # backend that doesn't require authentication; the RPC call is then made
@@ -26,6 +30,10 @@ coinbase_tag = /simplepool/
 # vardiff — auto-adjust each connection's difficulty to keep the share
 # rate near `target_spm` shares/minute. Set vardiff_enabled = 0 to pin
 # every connection to initial_diff (legacy behaviour).
+#
+# These are the settings for listen_port, which is the port home miners are
+# pointed at. Rented hashrate does not belong here — give it its own listener
+# below, with its own floor.
 initial_diff       = 1
 vardiff_enabled    = 1
 vardiff_target_spm = 12       # ~1 share every 5 seconds per connection
@@ -33,33 +41,94 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30       # how often to retarget
 
-# ---------------------------------------------------------------------------
-# Rental port — a SECOND stratum listener for hashrate marketplaces
-# (Braiins Hashpower, NiceHash). 0 or unset = off, and the pool behaves
-# exactly as it did before this existed.
+# Extra stratum ports, each with its own difficulty policy. Repeatable —
+# unlike every other key here, a second `listener` line adds a port rather
+# than replacing the first. listen_port above is always served too, on the
+# settings above.
 #
-# Rented hashrate does not arrive as many small miners. It arrives as one
-# aggregated worker behind a proxy, with a hard minimum share difficulty:
-# Braiins floors at 1024 and recommends 65536, NiceHash requires 500000.
-# Serving those on the public port would price out every home miner, so they
-# get their own listener. Shares from both ports feed the SAME PPLNS window
-# and the same coinbase — the ports differ only in the difficulty they serve.
+#   port           the port to bind (required)
+#   min_diff       vardiff floor for this port, and its starting difficulty
+#   initial_diff   starting difficulty, if it should differ from min_diff
+#   max_diff       vardiff ceiling for this port
+#   label          shown in the log and on the dashboard; [A-Za-z0-9_-]
 #
-# 500000 clears both marketplaces with one port.
+# Why a second port at all: one difficulty cannot serve both a home ASIC and
+# rented hashrate. Rented hashrate does not arrive as many small miners — a
+# marketplace aggregates a whole fleet behind one connection, and 1 PH/s at
+# difficulty 1024 is ~227 shares per SECOND down that single socket. The
+# marketplaces know this and refuse to deliver to a pool below their floor:
+# Braiins wants at least 1024 and recommends 65536, NiceHash requires 500000.
 #
-# rental_min_diff is used as BOTH the starting difficulty and the vardiff
-# floor. Do NOT try to reach the floor by letting vardiff ramp: that starts a
-# connection below the marketplace minimum, and orders get cancelled for
-# invalid shares before the ramp finishes.
+# Vardiff cannot bridge the gap. It moves by at most 4x per window, so at the
+# 30s default it takes eight windows — four minutes — to climb from 1 to
+# 65536, and the reject flood on the way there is what gets an order
+# cancelled. The miner has to arrive at the right difficulty, which is what a
+# dedicated port is for.
 #
-# NOTE: the network-difficulty clamp still wins over this floor. During a
-# minimum-difficulty window (a fork resets difficulty to powLimit) the chain
-# cannot support the floor and marketplace orders will reject-flood until
-# difficulty ramps back. Known and time-bounded, not a misconfiguration.
+# listener = port=3335 min_diff=65536 label=braiins
+# listener = port=3336 min_diff=500000 label=nicehash
 #
-# rental_listen_port = 3335
-# rental_min_diff    = 500000
-# rental_max_conns   = 0        # 0 = inherit max_conns
+# IMPORTANT — min_diff is KEPT even when the chain is easier than it, and
+# that costs blocks. Share difficulty is otherwise capped at the network
+# difficulty, because a miner filters locally against the stratum target and
+# a harder share target makes it discard valid blocks before the pool ever
+# sees them. min_diff overrides that cap, on purpose: a marketplace measures
+# the difficulty on the wire, so a 500000 port that quietly served 1200 would
+# have its order cancelled and the pool would never learn why.
+#
+# The trade is therefore explicit and confined to the ports that ask for it.
+# On a 500000 port over a chain at 1200, miners discard roughly 416 of every
+# 417 blocks they solve. simplepool warns at startup for every listener in
+# that position, and the dashboard reports it too (the "Stratum ports can
+# hold their difficulty" health check). If keeping every block matters more
+# to you than serving rented hashrate on that port, drop its min_diff — the
+# cap then applies as it always has.
+#
+# listen_port and any listener without a min_diff are untouched by all of
+# this: no floor, cap as before.
+
+# Ceiling on mining.submit per second, per connection. 0 disables it.
+#
+# A connection's share rate is its hashrate divided by the difficulty it was
+# assigned, and nothing stops those from being badly mismatched — an
+# aggregated fleet pointed at a home-miner port is 1 PH/s against difficulty
+# 1, which is ~232,000 submits per second down one socket. Validating a submit
+# costs about 9 microseconds, so that one connection asks for more than two
+# cores, and every share it lands passes through the store's ring, which drops
+# events once full: work a miner was told was accepted, never credited.
+#
+# The default is far above anything a correctly configured miner reaches. With
+# vardiff on, the steady state is vardiff_target_spm — 0.2/s at the default —
+# for a connection of ANY size, because that is what vardiff converges on. The
+# only rates that come near this ceiling are transients while vardiff climbs,
+# and they only get near it when the difficulty is already badly wrong. For
+# scale, the largest plausible legitimate burst — 1 EH/s at difficulty
+# 65536, before vardiff has raised it — is about 3,500/s.
+#
+# Raise it if you pin a low difficulty for a very large miner
+# (vardiff_enabled = 0), since then a high sustained rate is the correct
+# behaviour rather than a symptom.
+max_submits_per_sec = 20000
+
+# Idle-connection reaper, in seconds. Two budgets, because the two states are
+# not the same risk:
+#
+#   idle_timeout_sec            a socket that has not authorized. It has told
+#                               us nothing and costs an fd for nothing.
+#   idle_timeout_authorized_sec a miner that HAS authorized. Having nothing to
+#                               say is its normal resting state — the pool
+#                               asks it nothing between shares — so a small
+#                               rig that has not cleared its assigned
+#                               difficulty yet is silent but perfectly
+#                               healthy. Reaping it on the short budget
+#                               disconnects working hashrate, which is one of
+#                               the behaviours marketplaces delist pools for.
+#
+# TCP keepalive (2 min idle + 3x30s probes) already reaps a socket whose peer
+# is genuinely gone, so the long budget only has to catch a peer answering
+# keepalives while doing no work. Negative disables either one.
+idle_timeout_sec            = 600
+idle_timeout_authorized_sec = 7200
 
 db_path = ./data/shares.db
 commit_window_ms = 100
@@ -89,36 +158,7 @@ redis_reconnect_backoff_ms = 2000
 #               pps_credits. The operator batches accumulated BTC into
 #               Thunder from the admin dashboard, and the payout worker
 #               drains that reserve to miners.
-#   proportional Coinbase-direct PPLNS. ONE shared coinbase per template pays
-#               every address in the PPLNS window pro-rata by share difficulty.
-#               Requires a server-provided coinbase (a CUSF enforcer
-#               getblocktemplate); without one it falls back to solo shape.
-#               The pool holds no funds in any mode, this one included.
 pool_mode = solo
-
-# proportional — the PPLNS window, measured in WORK, not share count and not
-# wall time, so it survives a difficulty retarget without operator action.
-# The window is whichever is LARGER: prop_window_k blocks of work, or
-# prop_window_min_sec seconds of shares.
-#
-# ⚠️ Do not set prop_window_min_sec to 0. Difficulty resets to powLimit at a
-# fork, so k blocks of work can be a handful of shares — a window a few seconds
-# wide, which squeezes out every miner but the most recent at exactly the moment
-# a new chain is most worth mining. The floor is what keeps the window
-# meaningful when difficulty collapses.
-# prop_window_k       = 3
-# prop_window_min_sec = 600
-
-# proportional — an address whose cut falls below this is deferred rather than
-# paid, and its claim (a signed fraction of a block reward, never sats) rolls
-# into a later block. Must be at least the 546-sat dust limit.
-# prop_min_payout_sats = 1000000
-
-# proportional — cap on payout outputs per block. Each extra P2WPKH output is
-# 124 weight units beyond what the template budgeted for, and a block that goes
-# over 4 MWU is rejected at submitblock. Measure the headroom on real templates
-# before raising this.
-# prop_max_outputs = 12
 
 # pps-classic — required
 # pool_btc_address = REPLACE_WITH_POOL_BTC_ADDRESS

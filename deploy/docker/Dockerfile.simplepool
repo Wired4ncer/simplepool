@@ -42,6 +42,9 @@ COPY --from=build /src/build/simplepool /usr/local/bin/simplepool
 
 USER simplepool
 WORKDIR /home/simplepool
+# Documentation only: the compose file runs this with network_mode: host, so
+# every port proxy.conf binds is reachable without being named here — extra
+# `listener` ports included. The host firewall still has to allow them.
 EXPOSE 3334
 # `tini` reaps zombies and forwards SIGTERM so docker stop is clean.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/simplepool"]

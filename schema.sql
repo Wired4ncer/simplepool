@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS pool_meta (
    * never reached the DB after every commit retry failed. Must be 0 — it is
    * work a miner was told was accepted and that no query can otherwise see. */
   events_lost         INTEGER NOT NULL DEFAULT 0,  /* unix seconds */
+  /* The stratum ports this pool listens on and the difficulty policy of
+   * each, as a JSON array of {port, label, min_diff, initial_diff}. Written
+   * at startup with the rest of the identity. A miner cannot tell from the
+   * URL it was handed which port suits its hardware -- a home ASIC and a
+   * rented fleet want opposite difficulties -- so the dashboard has to say
+   * it, and it can only say what the proxy published. */
+  listeners           TEXT,
   updated_at          INTEGER   /* unix seconds */
 );
 

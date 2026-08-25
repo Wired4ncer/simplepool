@@ -52,19 +52,72 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
    mined. Confirmed: credit every worker in it now. Still in the mempool:
    nudge Thunder to mine and stop for this tick. Undeterminable: stop and
    log loudly (see below).
-2. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`,
+2. **Halt if any in-flight row is unresolved** — see *One payout at a time*
+3. `SELECT … FROM pps_credits JOIN workers WHERE accrued - paid >= min`,
    excluding anyone with an in-flight row
-3. `thunder.balance()` — bail this tick if the reserve is short
-4. **Broadcast** everyone due in ONE transaction, and stamp its txid onto
+4. `thunder.mempool()` — bail this tick if Thunder is holding anything unmined
+5. `thunder.balance()` — bail this tick if the reserve is short
+6. **Broadcast** everyone due in ONE transaction, and stamp its txid onto
    their in-flight rows. Nobody is credited here.
 
-Payouts *are* batched into a single transaction. Thunder advances only when
-a mainchain block commits to it and cannot spend the change of an unconfirmed
-transaction, so one tx per worker would cost one sidechain block each and the
-queue would drain slower than it fills. The cost is failure isolation: one bad
-address fails the whole batch. That is the right trade — every recipient is an
-address the proxy validated at authorize time, and a failed batch credits
-nobody and strands nobody.
+## One payout at a time
+
+Thunder selects UTXOs without excluding those already spent by transactions in
+its own mempool, and a transfer consumes every wallet UTXO and returns the
+remainder as change — unspendable until it is mined. So a second payout
+started while a first is outstanding picks the very inputs the first one
+spends, and one of the two ends up live and untracked.
+
+Two rows of defence, because "outstanding" has two shapes:
+
+- A row **with** a txid is a broadcast batch. `settlePending()` waits on it,
+  and nothing else goes out until it is seen in a block.
+- A row **without** one is a crash around a broadcast, where it is unknown
+  whether a transfer went out. That is not settleable — `pendingBatch()`
+  ignores it, or the loop would block forever on a phantom txid — but it is
+  very much outstanding. `listDue` excludes those *workers*, which is not
+  enough: any other worker coming due would start a second payout. So the tick
+  halts on `inFlightCount() > 0` until an operator reconciles.
+
+Beyond both, `thunder.mempool()` catches what neither row can describe: a
+transfer the ledger has no record of at all.
+
+## Batching
+
+Every due worker goes out in ONE transaction. Thunder advances only when a
+mainchain block commits to it and cannot spend the change of an unconfirmed
+transaction, so a transaction per recipient costs a sidechain block per
+recipient and the queue drains slower than it fills.
+
+The batch is built by asking `create_transfer` for the total and splitting its
+payment output into one output per recipient — inputs, utreexo proof and
+change untouched, since the proof commits to inputs and not to outputs.
+
+**Whether that is possible is the node's decision.** Thunder ≥ 0.17.1 (commit
+`a195d67`) signs and broadcasts inside `create_transfer`, and it takes a single
+destination:
+
+```rust
+async fn create_transfer(&self, dest: Address, value_sats: u64, fee_sats: u64)
+    -> RpcResult<Txid> { … self.app.sign_and_send(tx) … }
+```
+
+There is no unsigned transaction to split and no second destination to name, so
+on such a node the response arrives with the whole total already paid to
+whichever address was listed first — uncallable. The loop therefore pays one
+address per transaction *until a transfer proves the node can do better*: a
+result that came back unsigned means the splice worked, and from then on every
+address goes out together. An unproven node is treated as the restrictive one,
+because the cost of guessing wrong is somebody else's balance.
+
+Rigs share an address, so a single miner is one transaction either way. If you
+want true multi-address batching against a modern Thunder, the fix belongs
+upstream — `create_transfer` needs either a `broadcast: false` flag or a
+multi-output form.
+
+The remaining cost is failure isolation: one bad address fails the batch. That
+is the right trade — every recipient is an address the proxy validated at
+authorize time, and a failed batch credits nobody and strands nobody.
 
 ## Three clocks, not one
 
@@ -193,16 +246,10 @@ Two situations need an operator. Neither is auto-resolved, because both turn
 on a question only a human can answer: *did this transaction make it onto the
 sidechain?*
 
-**A row with no txid.** It is unknown whether anything went out. Two things
-produce this: the worker died around the broadcast, or the broadcast itself
-failed without the node answering — a timeout, a dropped connection, or any
-error that is not a JSON-RPC rejection. A rejection *is* an answer ("nothing
-was broadcast"), so those rows are released automatically and the batch simply
-retries; only the genuinely unanswered case is left here, because a broadcast
-that happened cannot be told apart from one that did not, and guessing wrong
-pays the batch twice.
-
-Check the Thunder node, then:
+**A row with no txid.** The worker died around the broadcast, so it is unknown
+whether anything went out. **Payouts are halted** while it sits there — see
+*One payout at a time* — so this is the one to resolve first. Check the Thunder
+node, then:
 
 ```sh
 # the tx is live or mined — adopt it, and the normal settle path takes over
@@ -210,6 +257,29 @@ sqlite3 data/shares.db "UPDATE payouts_in_flight SET txid = '<txid>' WHERE id = 
 
 # it never went out — release the workers to be paid again next tick
 sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE id = <id>;"
+```
+
+**`Thunder is holding N unmined transaction(s)`.** Settlement found nothing
+outstanding, yet Thunder's mempool is not empty — so there is a transfer out
+of the pool wallet that this ledger has no record of, spending the UTXOs the
+next payout would use. Every batch built against it dies as `utxo double
+spent` at the *create* stage, which looks like a clean abort, so an unguarded
+loop retries forever and pays nobody. The gate stops that, and deliberately
+does **not** mine: a block here would confirm a transfer the pool never
+recorded.
+
+```sh
+CLI=…/thunder_app_cli
+# what is in there, and where is it going?
+sudo -u forknet $CLI get-block-template | jq '.block.body.transactions[].outputs'
+```
+
+If it is meant to go out, mine it (`$CLI mine`) and reconcile the ledger by
+hand afterwards — nobody in it is credited. If it is not, drop it and the next
+tick rebuilds the batch correctly:
+
+```sh
+sudo -u forknet $CLI remove-from-mempool <txid>
 ```
 
 **`CANNOT DETERMINE settlement`.** The loop can see neither the transaction
@@ -226,6 +296,73 @@ If it was mined, finalize the batch by hand (all rows sharing the txid, in one
 transaction). If it truly never landed, `DELETE` those rows and the workers are
 paid again on the next tick. Do not delete rows you have not positively shown
 to be unmined — that is how a batch gets paid twice.
+
+### Retracting a batch
+
+**Only when the distribution is wrong — never because it is slow.**
+
+A broadcast batch that has not confirmed is almost always a *correct* payout
+waiting for a Thunder block, and waiting costs nothing: accruals keep
+accumulating in `pps_credits`, so whoever came due meanwhile is paid by the
+next tick once the block lands. The loop halts and says so; the right response
+is to get a block, not to rewrite the payment.
+
+Retract only when the transaction pays the wrong people or the wrong amounts —
+the failure mode fixed in this PR, where a node that broadcasts inside
+`create_transfer` paid a whole multi-address batch to one address.
+
+**Two things to understand before doing it.**
+
+*Retracting does not cancel a BMM attempt.* `app.mine()` snapshots the mempool
+into a block body **before** requesting BMM, and connects that snapshot if the
+commitment lands:
+
+```rust
+let BlockTemplate { bribe, header, body, .. } = self.build_block_template(fee).await?;
+let bmm_txid = miner_write.attempt_bmm(bribe.to_sat(), 0, header, body).await?;
+if let Some((main_hash, header, body)) = miner_write.confirm_bmm().await? {
+    self.node.submit_block(main_hash, &header, &body).await?   // the snapshotted body
+```
+
+`remove_from_mempool` touches the node's mempool only. If a request is already
+in flight the transaction can still land afterwards. Check Thunder's log for an
+`attempt BMM: created TX` with no following `confirm BMM` line — that is a
+parked request, and it is worth waiting for it to resolve first.
+
+*You cannot pay twice.* A transfer consumes every wallet UTXO, so any rebuilt
+payout spends the same inputs and is a double-spend of the original. Only one
+can ever be in the chain. What is at risk is crediting the wrong distribution
+if the retracted one lands after you have moved on.
+
+```sh
+CLI=…/thunder_app_cli
+
+sudo systemctl stop simplepool-payout          # or it builds into the gap
+
+# 1. it must be unconfirmed: tx non-null, block_hash null
+sudo -u forknet $CLI get-transaction <txid>
+
+# 2. drop it, and prove it is gone
+sudo -u forknet $CLI remove-from-mempool <txid>
+sudo -u forknet $CLI get-transaction <txid>                     # expect null
+sudo -u forknet $CLI get-block-template | jq '.block.body.transactions|length'
+
+# 3. release the rows so the batch is rebuilt from current balances
+sqlite3 data/shares.db "DELETE FROM payouts_in_flight WHERE txid = '<txid>';"
+
+sudo systemctl start simplepool-payout
+```
+
+Nobody was credited, so nothing in `pps_credits` needs undoing — that is the
+whole point of settling on confirmation rather than on broadcast.
+
+Afterwards, watch for the retracted txid coming back. If it ever appears as a
+wallet UTXO outpoint, it won and the replacement is dead, so the ledger needs
+correcting by hand:
+
+```sh
+sudo -u forknet $CLI get-wallet-utxos | grep <old-txid>
+```
 
 ## Block-withholding audit (`audit.js`)
 

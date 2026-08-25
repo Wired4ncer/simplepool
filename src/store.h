@@ -170,7 +170,8 @@ int store_record_pool_identity(store_t *s, const char *network,
                                const char *network_source,
                                const char *coinbase_tag,
                                const char *operator_address,
-                               const char *pool_btc_address);
+                               const char *pool_btc_address,
+                               const char *listeners_json);
 
 int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
                            const char *rate_source,

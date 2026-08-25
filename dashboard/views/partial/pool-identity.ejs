@@ -68,5 +68,31 @@
             <strong class="mono poolid-addr"><%= _p.pool_btc_address %></strong>
         </span>
         <% } %>
+
+        <%# Which port to point which machine at. Nothing about a stratum URL
+            says whether the difficulty behind it suits one ASIC or a rented
+            fleet, and getting it wrong is not a subtle failure: a fleet on
+            the low-difficulty port floods the pool with shares and the order
+            is cancelled for invalid work. So the ports are listed with what
+            each is for, the same reasoning as the rest of this banner.
+
+            Only shown when the proxy published more than one — a
+            single-port pool has no choice to explain. %>
+        <% const _ls = _p.listeners; %>
+        <% if (_ls && _ls.length > 1) { %>
+        <span class="poolid-item poolid-ports">
+            <label title="Each stratum port serves a different starting difficulty. Pick the one that matches what you are pointing at this pool.">ports</label>
+            <% _ls.forEach((l, i) => { %><%
+                const _d = (l.initial_diff !== null && l.initial_diff > 0)
+                         ? l.initial_diff : null;
+                const _hi = _d !== null && _d >= 1024;
+            %><strong class="mono"><%= l.port %></strong><em class="poolid-note"><%
+                if (l.label) { %><%= l.label %>, <% }
+                %><% if (_d === null) { %>default difficulty<% }
+                     else if (_hi) { %>from difficulty <%= _d.toLocaleString('en-US') %> — for rented or aggregated hashrate<% }
+                     else { %>from difficulty <%= _d.toLocaleString('en-US') %> — for individual miners<% } %></em><%
+                if (i < _ls.length - 1) { %> <% } %><% }) %>
+        </span>
+        <% } %>
     <% } %>
 </section>

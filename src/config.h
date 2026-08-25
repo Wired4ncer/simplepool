@@ -4,15 +4,34 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "stratum.h"   /* stratum_listener_t, STRATUM_MAX_LISTENERS */
+
 typedef struct {
     /* listener */
     char listen_addr[64];
     int  listen_port;
     int  max_conns;
-    /* listen() backlog for both stratum listeners. 0 -> STRATUM_DEFAULT_BACKLOG.
-     * Raise only; the kernel clamps to net.core.somaxconn. */
+    /* Still 1: the difficulty policy lives on the listener now, so a config
+     * naming no listeners behaves exactly as it always did. A rental port
+     * sets its own via `listener = port=3335 min_diff=65536`. */
+
+    /* listen() backlog for every stratum listener. 0 -> STRATUM_DEFAULT_BACKLOG.
+     * Raise only; the kernel clamps to net.core.somaxconn.
+     * ⚠️ OURS — no upstream equivalent. 64 was silently dropping SYNs under a
+     * marketplace burst (784 ListenOverflows, no log line, no counter). */
     int  listen_backlog;
     double initial_diff;
+
+    /* Extra stratum ports beyond listen_port, each with its own difficulty
+     * policy — see `listener` in proxy.conf.example. The point is serving a
+     * home ASIC and a rented fleet from the same pool without either one
+     * getting the other's difficulty. */
+    stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
+    int  listener_count;
+
+    /* Per-connection ceiling on mining.submit per second. 0 disables.
+     * See stratum.h for why it sits where it does. */
+    int  max_submits_per_sec;
 
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
@@ -106,22 +125,19 @@ typedef struct {
      * Set to a negative value to disable entirely; 0 uses the default. */
     int    idle_timeout_sec;      /* default 600 (10 min) */
 
-    /* Reaper budget for a connection that HAS authorized. Default 3600.
-     *
-     * ⚠️ The reaper measures inbound silence, and a miner with nothing to
-     * submit sends nothing — so at a high difficulty floor a perfectly
-     * healthy small rig is indistinguishable from a half-open socket.
-     * At rental_min_diff=500000 a share takes 500000*2^32/H seconds, so a
-     * 600s budget reaps a 3.6 TH/s rig 37% of the time and a 1 TH/s rig
-     * 76% of the time. It then reconnects and is reaped again: the miner
-     * reads a permanent 0 TH/s. Observed in production 2026-08-24, where
-     * every reaped connection had lived EXACTLY 604s.
-     *
-     * Keeping the two budgets separate preserves what the short one is
-     * actually for — scanners and half-open TCPs that never authenticate —
-     * without applying it to miners that are demonstrably alive, since the
-     * job broadcast keeps succeeding on their socket. */
-    int    idle_timeout_authorized_sec;  /* default 3600 (1 h) */
+    /* The same reaper, but for a connection that has authorized. It is a
+     * separate (much longer) budget because the two cases are not the same
+     * risk: an unauthorized socket is a squatter and costs an fd for nothing,
+     * whereas an authorized miner that has sent nothing is usually just a
+     * small rig that has not found a share at its assigned difficulty yet.
+     * The pool never solicits anything from a miner, so a healthy ASIC has no
+     * reason to speak between shares — reaping it at 10 minutes disconnects
+     * working hashrate, which is exactly the behaviour marketplaces blacklist
+     * pools for. TCP keepalive (2 min idle + 3x30s probes) already reaps a
+     * genuinely dead socket in ~3.5 min, so this only needs to catch a peer
+     * that is answering keepalives while doing no work.
+     * Negative disables; 0 uses the default. */
+    int    idle_timeout_authorized_sec;  /* default 7200 (2 h) */
 
     /* bitcoind */
     char bitcoind_url[512];

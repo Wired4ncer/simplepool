@@ -85,6 +85,16 @@ a:hover { text-decoration: underline; }
  * anything — so they have to be allowed to wrap rather than widen the page. */
 .poolid-addr { font-weight: 400; word-break: break-all; }
 .poolid-unknown { color: var(--warn); }
+/* The port list is guidance, not a warning, so its notes drop the amber that
+ * .poolid-note carries elsewhere in this banner. Each port and its
+ * description stay glued together while the list as a whole wraps. */
+.poolid-ports { flex-wrap: wrap; gap: 6px 14px; }
+.poolid-ports .poolid-note {
+    color: var(--muted);
+    margin-left: 4px;
+    white-space: nowrap;
+}
+.poolid-ports strong { white-space: nowrap; }
 .tag-test { color: var(--warn); }
 .top-admin .tag-test { color: #ffe9c0; }
 

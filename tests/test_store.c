@@ -391,7 +391,9 @@ static void test_pool_identity(void) {
 
     /* Identity first, template second — the startup order. */
     assert(store_record_pool_identity(s, "signet", "node", "/simplepool/",
-                                      "tb1qoperator", "tb1qpoolwallet") == 0);
+                                      "tb1qoperator", "tb1qpoolwallet",
+                                      "[{\"port\":3334,\"label\":\"\","
+                                      "\"min_diff\":1,\"initial_diff\":1}]") == 0);
     assert(store_record_pool_meta(s, "pps-classic", 100, "derived",
                                   2783.22, 2811.33, 100.4,
                                   111157.455, 312500000, 1700000000ULL) == 0);
@@ -422,7 +424,7 @@ static void test_pool_identity(void) {
      * stalled template path would keep looking alive. */
     int64_t seen = scalar_i64(db, "SELECT updated_at FROM pool_meta");
     assert(store_record_pool_identity(s, "regtest", "inferred", "/other/",
-                                      "bcrt1qop", NULL) == 0);
+                                      "bcrt1qop", NULL, NULL) == 0);
     assert(scalar_i64(db, "SELECT updated_at FROM pool_meta") == seen);
 
     /* Solo mode: NULL, not "". */

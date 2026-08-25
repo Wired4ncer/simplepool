@@ -53,7 +53,7 @@
 
 import { listDue, listStuck, recordTxAttempt, asRawTx,
          beginBatch, finalizeBatch, abortBatch, attachBatchTxid,
-         pendingBatch } from './db.js';
+         pendingBatch, inFlightCount } from './db.js';
 
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
@@ -218,6 +218,42 @@ async function nudgeMine(ctx, log, { force = false, reason = '' } = {}) {
     }
 }
 
+/* Everyone due, grouped by the address their money actually goes to, biggest
+ * debt first.
+ *
+ * Batching every due worker into ONE transaction is the goal and stays the
+ * goal: Thunder advances only when a mainchain block commits to it, so a
+ * transaction per recipient costs a sidechain block per recipient and the
+ * queue drains slower than it fills.
+ *
+ * Whether that is achievable is the node's decision, not ours. The batch is
+ * built by asking `create_transfer` for the total and splitting its payment
+ * output into one per recipient — and Thunder >= 0.17.1 (commit a195d67)
+ * signs and broadcasts inside `create_transfer`, which takes exactly ONE
+ * destination. On such a node there is nothing to split: the response arrives
+ * with the whole total already paid to whichever address was listed first, and
+ * no error can call that back. It fired twice on avonpool on 2026-08-24 and
+ * left an untracked transaction sitting on the wallet's only UTXO.
+ *
+ * So grouping is the fallback for a node that cannot build the batch, and
+ * runOnce() uses it only until the node has proved otherwise — see
+ * `canBatchAcrossAddresses`. Rigs share an address either way, so the common
+ * case is one transaction regardless.
+ *
+ * Sorted by debt so the largest liability clears first; ties keep listDue's
+ * order. */
+export function groupByAddress(rows) {
+    const byAddress = new Map();
+    for (const r of rows) {
+        const g = byAddress.get(r.thunder_address);
+        if (g) { g.rows.push(r); g.owed += r.owed_sats; }
+        else byAddress.set(r.thunder_address,
+                           { address: r.thunder_address, rows: [r], owed: r.owed_sats });
+    }
+    return [...byAddress.values()]
+        .sort((a, b) => (a.owed < b.owed ? 1 : a.owed > b.owed ? -1 : 0));
+}
+
 export async function runOnce(ctx, log) {
     const { db, thunder, cfg } = ctx;
 
@@ -238,16 +274,106 @@ export async function runOnce(ctx, log) {
         }
     }
 
-    const due = listDue(db, { minSats: cfg.minSats, limit: cfg.maxPerTick });
-    if (due.length === 0) {
+    /* One payout transaction at a time, and "at a time" is counted in rows, not
+     * in settleable batches.
+     *
+     * settlePending() has just handled every row that carries a txid. What can
+     * still be here is a row with txid='' — a crash around a broadcast, where
+     * it is unknown whether a transfer went out. listDue excludes those
+     * WORKERS, but not the situation: any other worker coming due would start
+     * a second payout, and Thunder picks its inputs without excluding what its
+     * own mempool has already spent, so the two collide on the same UTXOs. One
+     * of them is then live and untracked, which is the state this whole file
+     * exists to avoid.
+     *
+     * reportStuck() and payout/README.md tell the operator how to resolve it;
+     * until they do, nothing new goes out. */
+    if (!cfg.dryRun) {
+        const outstanding = inFlightCount(db);
+        if (outstanding > 0) {
+            log.error(
+                `payout: ${outstanding} in-flight payout row(s) are unresolved — no txid, ` +
+                'so it cannot be told whether a transfer went out. Not starting another ' +
+                'payout: a second transaction would spend the same UTXOs. Reconcile first ' +
+                '(payout/README.md -> Reconciling by hand).');
+            return { attempted: 0, paid: 0, failed: 0, settled, reason: 'in-flight-unresolved' };
+        }
+    }
+
+    const allDue = listDue(db, { minSats: cfg.minSats, limit: cfg.maxPerTick });
+    if (allDue.length === 0) {
         log.debug?.('payout: no due workers');
         return { attempted: 0, paid: 0, failed: 0, settled };
     }
 
+    /* Batch everyone into one transaction where the node can build one.
+     *
+     * `_nodeBroadcastsOnCreate` is what a previous transfer proved about this
+     * Thunder: false means create_transfer handed back an unsigned transaction
+     * and the splice worked, so a multi-address batch is safe and every due
+     * worker goes out together. true means it signed and broadcast on its own,
+     * so only one destination is expressible. undefined means no transfer has
+     * come back yet — and an unproven node is treated as the dangerous one,
+     * because the cost of guessing wrong is somebody else's balance.
+     *
+     * Learned from the result rather than probed, because every probe of this
+     * question is itself a transfer. One address goes out first; the answer
+     * arrives with it. */
+    const groups = groupByAddress(allDue);
+    const canBatchAcrossAddresses = ctx._nodeBroadcastsOnCreate === false;
+    const due    = canBatchAcrossAddresses ? allDue : groups[0].rows;
+    const queued = canBatchAcrossAddresses ? 0 : groups.length - 1;
+
     const totalOwed = due.reduce((a, r) => a + r.owed_sats, 0n);
     /* One transaction, one fee — not one per recipient. */
     const totalFees = TX_FEE_SATS;
-    log.info(`payout: ${due.length} due, total owed=${totalOwed} sats, fee=${totalFees}`);
+    log.info(`payout: ${due.length} due, total owed=${totalOwed} sats, fee=${totalFees}` +
+             (queued > 0 ? ` (this node cannot batch across addresses, so paying ` +
+                           `${groups[0].address} now; ${queued} more address(es) follow ` +
+                           'on later ticks)' : ''));
+
+    /* Do not build a transfer against a Thunder that cannot settle one.
+     *
+     * settlePending() has already established that WE have nothing
+     * outstanding, so anything still in the mempool is a transaction the
+     * ledger knows nothing about — and it is spending the very UTXOs the next
+     * transfer would pick, because Thunder selects inputs without excluding
+     * those its own mempool has already spent. Every attempt then fails with
+     *
+     *     mempool error: can't add transaction, utxo double spent
+     *
+     * at the 'create' stage, which reads as a clean abort, so the loop retries
+     * on the next tick and the next, indefinitely. That is the shape of the
+     * avonpool outage: 216 identical failures across 24 hours, nobody paid.
+     *
+     * Deliberately NOT nudged. Mining is what confirms that transaction, and
+     * an untracked transfer out of the pool wallet is exactly the thing not to
+     * confirm on a timer — on avonpool it would have paid one miner's balance
+     * to another. A block here moves money, so it is the operator's call:
+     * either mine it deliberately, or drop it with `remove-from-mempool` and
+     * let the loop rebuild the batch correctly.
+     *
+     * An unreachable node is deliberately not treated as blocked: the transfer
+     * would fail safely on its own, and refusing to pay because a diagnostic
+     * RPC is down would be a self-inflicted outage. */
+    if (!cfg.dryRun) {
+        const mp = await thunder.mempool();
+        if (mp.ok && mp.count > 0) {
+            log.error(
+                `payout: Thunder is holding ${mp.count} unmined transaction(s) that this ` +
+                'ledger has no record of, and they are spending the wallet\'s UTXOs — ' +
+                'payouts are halted. Not creating a batch (it could only fail as a ' +
+                'double spend) and not mining one either, because mining is what would ' +
+                'confirm a transfer this pool never recorded. An operator must decide: ' +
+                'mine it if it is meant to go out, or drop it with remove-from-mempool ' +
+                'and let the next tick rebuild the batch ' +
+                '(payout/README.md -> Reconciling by hand).');
+            return { attempted: 0, paid: 0, failed: 0, settled, mempool_blocked: mp.count };
+        }
+        if (!mp.ok) {
+            log.debug?.(`payout: could not read Thunder's mempool (${mp.error}); proceeding`);
+        }
+    }
 
     if (!cfg.dryRun) {
         let bal;
@@ -291,74 +417,53 @@ export async function runOnce(ctx, log) {
         res = await thunder.transferBatchDetailed(
             batch.map(b => ({ address: b.address, sats: b.sats })), TX_FEE_SATS);
     } catch (e) {
-        /* Whether these rows may be released depends on WHERE it failed.
-         *
-         * create and sign are local: nothing reached the network, so this is a
-         * clean abort and the next tick retries with paid_sats untouched.
-         *
-         * submit splits in two, and the split is the whole point.
-         *
-         * If the node ANSWERED with an error (e.rpcRejected — a mempool
-         * rejection being the everyday case) it ran the method and declined:
-         * nothing was broadcast, so this is a clean abort too and the next tick
-         * retries normally. That is the common path and it must stay cheap.
-         *
-         * If we never got an answer, it is not. The node may have accepted the
-         * transaction and lost the reply, and on thunder >= 0.17.1 it has
-         * DEFINITELY broadcast — create_transfer signs and sends internally,
-         * paying the whole total to one address (see transferBatchDetailed).
-         * Deleting the in-flight rows there hands the same batch back to the
-         * next tick, which rebroadcasts the moment the first transaction
-         * confirms and frees its inputs. That pays twice, and repeats every
-         * tick until the reserve is empty.
-         *
-         * So on an unanswered submit the rows STAY, with txid='' — listDue
-         * keeps skipping these workers and listStuck reports them. That is
-         * exactly the ambiguous state the crash-semantics contract at the top
-         * of this file already defines, and the only honest one: a broadcast
-         * that happened cannot be told apart from one that did not.
-         *
-         * An unknown stage is treated as an unanswered submit. The safe
-         * reading of "we do not know where it failed" is "it may have gone
-         * out". */
-        /* create is NOT unconditionally safe. On thunder >= 0.17.1
-         * create_transfer signs and broadcasts internally (see
-         * transferBatchDetailed), so an unanswered create — timeout, transport
-         * failure — may already be on the network, exactly like an unanswered
-         * submit. Releasing its rows there is the double-payment this whole
-         * branch exists to prevent, just one stage earlier. An ANSWERED create
-         * (rpcRejected) is a clean abort: the node ran the method and declined.
-         *
-         * sign stays unconditional. It only runs on thunder < 0.17.1, where
-         * create_transfer merely builds and signing is local — nothing can have
-         * reached the network by then. */
-        const clean = e.stage === 'sign' ||
-                      ((e.stage === 'create' || e.stage === 'submit') &&
-                       e.rpcRejected === true);
-        if (clean) abortBatch(db, rowIds);
+        /* Only one thing produces a broadcastTxid: create_transfer signing and
+         * sending on its own. Whatever else went wrong, the node has answered
+         * the batching question, and it must never be asked again. */
+        if (e.broadcastTxid) ctx._nodeBroadcastsOnCreate = true;
+
         recordTxAttempt(db, {
-            kind: 'payout', status: 'failed', stage: e.stage || 'unknown',
-            txid: e.txid ?? null,
+            kind: 'payout', status: e.broadcastTxid ? 'broadcast' : 'failed',
+            stage: e.stage || 'unknown', txid: e.broadcastTxid || null,
             rawTx: asRawTx(e.signed || e.unsigned),
             amountSats: totalOwed, feeSats: TX_FEE_SATS,
             destination: batch.length === 1 ? batch[0].address : `${batch.length} recipients`,
             workerId: batch.length === 1 ? batch[0].worker_id : null,
             error: e.message || String(e),
         });
-        if (clean) {
-            log.warn(`payout: batch of ${batch.length} failed at ${e.stage} — nothing was ` +
-                     `broadcast, retrying next tick: ${e.message}`);
-        } else {
+
+        /* A failure that still put a transaction on the network is not an
+         * abort, and must never be treated as one. Dropping the in-flight rows
+         * would leave the ledger with no record of a live transfer, so the next
+         * tick would build another against UTXOs that transaction already
+         * spends, and every tick after that would too. Keeping the rows against
+         * its txid hands the batch to settlePending(), which blocks the queue
+         * and says so once — the difference between one alert and 216 silent
+         * retries. Nobody is credited either way: settlement still requires
+         * seeing it in a block. */
+        if (e.broadcastTxid) {
+            attachBatchTxid(db, rowIds, e.broadcastTxid);
             log.error(
-                `payout: batch of ${batch.length} failed at ${e.stage || 'an unknown stage'} ` +
-                `and MAY have been broadcast: ${e.message}. Leaving ${batch.length} ` +
-                'in-flight row(s) with no txid so nobody can be paid twice — these ' +
-                'workers stay skipped until an operator reconciles ' +
-                '(payout/README.md -> Reconciling by hand).');
+                `payout: batch of ${batch.length} FAILED WITH FUNDS ON THE NETWORK ` +
+                `(txid=${e.broadcastTxid}): ${e.message} — holding the batch against ` +
+                'that txid and halting payouts. Nobody is credited until an operator ' +
+                'reconciles (payout/README.md -> Reconciling by hand).');
+            return { attempted: due.length, paid: 0, failed: 0, settled,
+                     waiting_on: e.broadcastTxid, reason: 'broadcast-unintended' };
         }
-        return { attempted: due.length, paid: 0, failed: due.length, settled,
-                 ambiguous: !clean };
+
+        /* The whole batch fails together, which is the point: no worker is
+         * credited for a transaction that did not go out. */
+        abortBatch(db, rowIds);
+        log.warn(`payout: batch of ${batch.length} ${e.stage || 'transfer'} failed: ${e.message}`);
+        return { attempted: due.length, paid: 0, failed: due.length, settled };
     }
+
+    /* What this transfer proved about the node, for the next tick's batching
+     * decision. `broadcastByNode` is set only on the create-and-broadcast
+     * path; an unsigned transaction that we spliced, signed and submitted
+     * leaves it undefined, and that is the node that can batch. */
+    ctx._nodeBroadcastsOnCreate = res.broadcastByNode === true;
 
     recordTxAttempt(db, {
         kind: 'payout', status: 'broadcast', stage: 'submit',
@@ -437,6 +542,12 @@ export function nextDelayMs(cfg, res) {
     if (res?.reason === 'undetermined')       return cfg.retryIntervalMs;
     if (res?.waiting_on || res?.txid)         return cfg.settleIntervalMs;
     if (res?.failed > 0 || res?.reserve_short) return cfg.retryIntervalMs;
+    /* Blocked on someone else's unmined transaction: nothing was broadcast and
+     * nobody was credited, so this is a tick that got nowhere, not a completed
+     * run. It comes back on the retry clock — sleeping off a daily interval
+     * would strand the queue for a day behind a mempool that clears in
+     * minutes. */
+    if (res?.mempool_blocked)                 return cfg.retryIntervalMs;
     return cfg.intervalMs;
 }
 

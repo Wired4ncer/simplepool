@@ -260,9 +260,10 @@ What it does (idempotent — re-run after every code change):
    right `USER` / `ROOT` substitutions, install to
    `/etc/systemd/system/`, `enable --now` each.
 7. Drop the nginx vhost from `deploy/nginx/` into `sites-available`
-   and enable it, open ports 80 / 443 / 3334 via `ufw` if active. If
-   `rental_listen_port` is configured (see RENTED_HASHRATE.md), open that
-   port too — it is a second listener, not a redirect of the first.
+   and enable it, open ports 80 / 443 / 3334 via `ufw` if active —
+   plus any extra stratum ports declared with `listener` lines in
+   `proxy.conf`. The installer reads those back from the finished
+   config and opens them too; if you add one later, open it yourself.
 
 After that runs cleanly, jump to **Part D** (configuring `proxy.conf`
 for your chosen mode) — everything else is already up.
@@ -449,15 +450,18 @@ vardiff_min        = 1
 vardiff_max        = 1e12
 vardiff_window_sec = 30
 
-# Optional second stratum listener for hashrate marketplaces (Braiins
-# Hashpower, NiceHash), serving a fixed high share difficulty. Off unless
-# rental_listen_port is set. Shares from both ports feed the same PPLNS
-# window and the same coinbase. See RENTED_HASHRATE.md — in particular the
-# note that a minimum-difficulty window (a fork) clamps this port below the
-# marketplace floor and orders will reject-flood until difficulty ramps back.
-# rental_listen_port = 3335
-# rental_min_diff    = 500000     # clears Braiins (>=1024) and NiceHash (500000)
-# rental_max_conns   = 0          # 0 = inherit max_conns
+# Rented hashrate needs its own port and its own floor. min_diff is kept even
+# where the chain is easier, which costs blocks on that port — see
+# proxy.conf.example.
+# listener = port=3335 min_diff=65536 label=braiins
+
+idle_timeout_sec            = 600    # socket that never authorized
+idle_timeout_authorized_sec = 7200   # a working miner between shares
+
+# Per-connection ceiling on mining.submit. Far above anything a correctly
+# configured miner reaches; it bounds what one badly mismatched connection
+# (a fleet on a home-miner port) can cost. 0 disables.
+max_submits_per_sec = 20000
 
 db_path = /home/simplepool/data/shares.db
 log_level = info
@@ -621,11 +625,6 @@ Then check:
 1. **Pool is listening**:
    ```sh
    ss -tlnp | grep :3334
-   # with a rental port configured, BOTH must be present:
-   ss -tlnp | grep -E ':3334|:3335'
-   # and the advertised extranonce2 width must be >= 7 on each:
-   (echo '{"id":1,"method":"mining.subscribe","params":[]}'; sleep 1) \
-     | nc 127.0.0.1 3334 | head -1 | jq -r '.result[2]'
    ```
 2. **Pool talks to bitcoind / enforcer**:
    ```sh
@@ -689,6 +688,18 @@ Install-time trouble usually falls into one of these:
   Thunder unit; if running by hand, sleep 2s.
 - **`config error: 'pool_btc_address' is required when pool_mode=pps-classic`** —
   self-explanatory; set it.
+- **The pool logs `stratum listening on 0.0.0.0:3335` but miners are
+  refused** — the port is bound and the firewall is dropping it. Nothing
+  in the pool's log can tell you this, because from the pool's side
+  everything worked. Adding a `listener` to `proxy.conf` does not open a
+  port in `ufw`:
+  ```sh
+  sudo ufw allow 3335/tcp
+  sudo simplepoolctl doctor     # checks every configured port, and ufw
+  ```
+  `doctor` reports listening and allowed separately for each port, which
+  is the distinction that matters: a marketplace measuring a firewalled
+  port reads the pool as down.
 - **`stratum bind 0.0.0.0:3334: Address already in use`** — an old
   simplepool is still running. Match it by **exact process name**,
   not by pattern (a `pkill -f simplepool` from an SSH session will

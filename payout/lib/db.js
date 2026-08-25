@@ -211,6 +211,22 @@ export function abortBatch(db, rowIds) {
     db.transaction(() => { for (const id of rowIds) del.run(id); })();
 }
 
+/* How many payout rows are in flight at all, txid or not.
+ *
+ * pendingBatch() answers a narrower question — which batch can be settled —
+ * and deliberately ignores rows with txid='', because those cannot be settled
+ * from here. But "cannot be settled" is not "not outstanding": such a row is a
+ * crash around a broadcast, so a transfer may well be sitting on the wallet's
+ * UTXOs. listDue only excludes the workers named in those rows, so a DIFFERENT
+ * worker coming due would start a second payout against the same inputs — and
+ * that is the one-transaction-at-a-time invariant broken, from the one state
+ * where we least understand what is already out there.
+ *
+ * So the loop blocks on this, not just on pendingBatch(). */
+export function inFlightCount(db) {
+    return db.prepare('SELECT COUNT(*) AS n FROM payouts_in_flight').get().n;
+}
+
 /* In-flight rows older than `staleAfterSec` that need a human.
  *
  * Only rows with txid='' qualify. Since payouts settle on confirmation

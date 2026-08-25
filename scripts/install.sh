@@ -156,6 +156,9 @@ SOURCE=""
 RELEASE_TAG=""          # empty = whatever the latest release is
 MODE=""
 STRATUM_PORT="3334"
+# Extra stratum ports, filled in from proxy.conf once it is final (section 8).
+# Declared here so the firewall section can reference it on every path.
+LISTENER_PORTS=()
 BITCOIND_URL=""
 BITCOIND_USER=""
 BITCOIND_PASS=""
@@ -453,7 +456,7 @@ fi
 ask_yn DO_DEPS   "install system packages (build tools, node 20, sqlite, nginx)?"
 ask_yn RUN_TESTS "run the C test suite after building?"
 if command -v ufw >/dev/null 2>&1; then
-    ask_yn DO_UFW "add ufw rules (OpenSSH, 80, 443, $STRATUM_PORT)?"
+    ask_yn DO_UFW "add ufw rules (OpenSSH, 80, 443, $STRATUM_PORT + any listener ports)?"
     if [[ "$DO_UFW" == "1" ]] && ! ufw status 2>/dev/null | grep -q 'Status: active'; then
         ask_yn ENABLE_UFW "ufw is inactive — enable it? (OpenSSH is allowed first)"
     fi
@@ -905,6 +908,20 @@ install -o "$SVC_USER" -g "$SVC_USER" -m 0640 "$TMP_CONF" "$ROOT/proxy.conf"
 rm -f "$TMP_CONF"
 say "wrote $ROOT/proxy.conf (mode=$MODE)"
 
+# Extra stratum ports declared with `listener` lines. Read back from the
+# finished config rather than from the install answers, because an operator
+# who added a rental port by hand never told the installer about it — and a
+# port the pool binds but the firewall drops is the worst shape this can take:
+# the log says "stratum listening on :3335" while every miner is refused.
+LISTENER_PORTS=()
+while read -r p; do
+    [[ -n "$p" ]] && LISTENER_PORTS+=("$p")
+done < <(grep -E '^[[:space:]]*listener[[:space:]]*=' "$ROOT/proxy.conf" 2>/dev/null \
+         | grep -oE 'port=[0-9]+' | cut -d= -f2 | sort -un)
+if (( ${#LISTENER_PORTS[@]} )); then
+    say "extra stratum ports from proxy.conf: ${LISTENER_PORTS[*]}"
+fi
+
 CONF_OK=1
 if [[ -z "$OPERATOR_ADDRESS" || "$OPERATOR_ADDRESS" == *REPLACEME* ]]; then
     warn "operator_address is unset — the proxy will refuse to start"
@@ -1053,6 +1070,9 @@ if [[ "$DO_UFW" == "1" ]]; then
     step "firewall rules"
     ufw allow OpenSSH               >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
     ufw allow "${STRATUM_PORT}/tcp" >/dev/null 2>&1 || true
+    for _p in "${LISTENER_PORTS[@]:-}"; do
+        [[ -n "$_p" ]] && ufw allow "${_p}/tcp" >/dev/null 2>&1 || true
+    done
     if [[ "$DO_NGINX" == "1" ]]; then
         ufw allow 80/tcp  >/dev/null 2>&1 || true
         ufw allow 443/tcp >/dev/null 2>&1 || true
@@ -1060,7 +1080,9 @@ if [[ "$DO_UFW" == "1" ]]; then
     if [[ "$ENABLE_UFW" == "1" ]] && ! ufw status | grep -q 'Status: active'; then
         ufw --force enable
     fi
-    say "$(ufw status | head -1)  (allowed: OpenSSH, ${STRATUM_PORT}$([[ $DO_NGINX == 1 ]] && echo ', 80, 443'))"
+    _extra=""
+    (( ${#LISTENER_PORTS[@]} )) && _extra="$(printf ', %s' "${LISTENER_PORTS[@]}")"
+    say "$(ufw status | head -1)  (allowed: OpenSSH, ${STRATUM_PORT}${_extra}$([[ $DO_NGINX == 1 ]] && echo ', 80, 443'))"
     say "${DASH_PORT}/tcp deliberately NOT opened — nginx fronts the dashboard"
 fi
 

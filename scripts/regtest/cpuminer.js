@@ -10,6 +10,9 @@
  * a few thousand nonces are enough.
  *
  * Required pool config to make this work quickly:
+ *   (no `listener` line)             # a port's min_diff overrides the
+ *                                    # network-difficulty clamp and would
+ *                                    # put every share out of CPU reach
  *   initial_diff       = 0.0000001   # share target > network target so
  *   vardiff_enabled    = 0           # any block-finding nonce also
  *                                    # satisfies the share check

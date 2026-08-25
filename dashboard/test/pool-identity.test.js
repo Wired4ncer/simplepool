@@ -32,17 +32,19 @@ function makeDb(identity = {}) {
     const row = {
         network: 'signet', network_source: 'node', coinbase_tag: '/simplepool/',
         operator_address: OPERATOR, pool_btc_address: POOL_BTC,
-        pool_mode: 'pps-classic', fee_bps: 100,
+        pool_mode: 'pps-classic', fee_bps: 100, listeners: null,
         ...identity,
     };
     db.prepare(`INSERT INTO pool_meta
                   (id, network, network_source, coinbase_tag, operator_address,
                    pool_btc_address, pool_mode, fee_bps, rate_source,
                    rate_sats_per_diff, gross_sats_per_diff, effective_fee_bps,
-                   network_difficulty, block_value_sats, credited_from, updated_at)
+                   network_difficulty, block_value_sats, credited_from,
+                   listeners, updated_at)
                 VALUES (1, @network, @network_source, @coinbase_tag,
                         @operator_address, @pool_btc_address, @pool_mode,
-                        @fee_bps, 'derived', 990, 1000, 100, 1, 312500000, 1, 1)`)
+                        @fee_bps, 'derived', 990, 1000, 100, 1, 312500000, 1,
+                        @listeners, 1)`)
       .run(row);
     return db;
 }
@@ -114,4 +116,51 @@ test('a DB predating the identity columns says unknown, not a guess', async () =
 test('no pool_meta row at all still renders', async () => {
     const html = await render('partial/pool-identity.ejs', { pool: null });
     assert.match(html, /pool identity unknown/);
+});
+
+/* Which port to point which machine at.
+ *
+ * The strip exists because a stratum URL hides everything that matters, and
+ * the port is now part of that: nothing about `:3334` versus `:3335` says one
+ * expects a single ASIC and the other a rented fleet. Sending a fleet to the
+ * low-difficulty port is not a subtle failure — it floods the pool and gets
+ * the order cancelled — so the difference has to be stated. */
+const TWO_PORTS = JSON.stringify([
+    { port: 3334, label: '',        min_diff: 1,     initial_diff: 1 },
+    { port: 3335, label: 'braiins', min_diff: 65536, initial_diff: 65536 },
+]);
+
+test('the strip names each port and what it is for', async () => {
+    const html = await strip(makeDb({ listeners: TWO_PORTS }));
+    assert.match(html, /3334/);
+    assert.match(html, /3335/);
+    assert.match(html, /braiins/);
+    /* Not just the numbers — the guidance is the point. */
+    assert.match(html, /for individual miners/);
+    assert.match(html, /for rented or aggregated hashrate/);
+    assert.match(html, /65,536/, 'difficulty is readable, not raw');
+});
+
+test('a single-port pool is not told to choose', async () => {
+    /* There is no decision to explain, and a "ports" row on a pool with one
+     * port is noise in a strip whose whole discipline is being quiet. */
+    const one = JSON.stringify([{ port: 3334, label: '', min_diff: 1, initial_diff: 1 }]);
+    const html = await strip(makeDb({ listeners: one }));
+    assert.doesNotMatch(html, /poolid-ports/);
+});
+
+test('a proxy that has not published its ports says nothing about them', async () => {
+    /* An upgraded DB whose proxy has not restarted. Inventing "3334" here
+     * would be a guess, and a miner acting on a wrong port gets a refused
+     * connection. */
+    const html = await strip(makeDb({ listeners: null }));
+    assert.doesNotMatch(html, /poolid-ports/);
+});
+
+test('malformed listener JSON does not take the strip down', async () => {
+    const html = await strip(makeDb({ listeners: '{not json' }));
+    assert.doesNotMatch(html, /poolid-ports/);
+    /* The rest of the strip still renders — a pool that cannot describe its
+     * ports must still say where the money goes. */
+    assert.ok(html.includes(OPERATOR));
 });

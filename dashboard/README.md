@@ -240,8 +240,24 @@ server {
 ## How hashrate is estimated
 
 ```
-H/s ≈ sum(difficulty over window) * 2^32 / window_seconds
+H/s ≈ sum(difficulty over window) * 2^32 / seconds_the_shares_span
 ```
 
-This is the standard pool estimator. It converges quickly for healthy
-workers and is meaningless for workers with very few shares in-window.
+This is the standard pool estimator, with one correction. The divisor is
+the span the shares actually cover — first share in the window to now —
+not the nominal width of the window. Dividing by time nothing was mined
+in reports a rate nobody ran at, and it goes wrong exactly when someone
+is most likely to be looking: a pool eleven hours old reads half its true
+rate against a 24 h window, and a rig ten minutes into a rented contract
+reads 1/144th of what it is doing. Both heal on their own as the window
+fills, which is why it survived so long — by the time anyone doubts the
+number it is right again.
+
+The span is clamped at both ends: never longer than the nominal window,
+and never shorter than a minute, so a single share a few seconds old
+cannot divide by ~0 and report a gigahash spike. With no shares at all it
+falls back to the nominal window, so an idle pool reports zero rather
+than a clamped fraction of nothing.
+
+It still converges slowly for workers with very few shares in-window —
+that is variance, not a divisor problem.

@@ -2150,46 +2150,39 @@ static unsigned subscribe_get_en1(stratum_server_t *s, stratum_conn_t **out_c) {
     return v;
 }
 
-/* Two servers sharing a stratum_shared_t must draw extranonce1 from ONE
- * sequence.
+/* extranonce1 must come from ONE sequence for every connection the pool
+ * serves, whichever port it arrived on.
  *
  * This is the invariant the rental port rests on. Two connections handed the
  * same extranonce1 render identical coinbases, mine identical headers, and
  * find the same hash from the same nonce — the share is credited twice and
- * half the hashrate is wasted. Each server left to allocate its own counter
- * seeds it from the clock at startup, so two started in the same process seed
- * within a millisecond of each other and their sequences overlap almost
- * entirely.
+ * half the hashrate is wasted.
  *
- * Asserting only "the values differ" would pass by luck whenever the two
- * clock seeds happened to differ, so this asserts the stronger and fully
- * deterministic property: consecutive subscribes across the two servers are
- * CONSECUTIVE, which can only hold if one counter is feeding both. */
-static void test_shared_extranonce1_sequence_across_servers(void) {
-    stratum_shared_t *shared = stratum_shared_new();
-    CHECK(shared != NULL);
-    if (!shared) return;
+ * ⓘ This test used to start TWO servers sharing a stratum_shared_t, because
+ * that was the only way to have two ports. Under the one-server/N-listener
+ * model the hazard is architecturally impossible: every listener accepts into
+ * the same server, so there is exactly one counter and exactly one dedupe
+ * ring because there is exactly one server. What is left to assert is that
+ * the counter really is per-server and really does advance — the property the
+ * shared object existed to provide.
+ *
+ * Asserting only "the values differ" would pass by luck, so this asserts the
+ * stronger, fully deterministic property: consecutive subscribes yield
+ * CONSECUTIVE extranonce1 values. */
+static void test_extranonce1_is_one_sequence_per_server(void) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 8, .initial_diff = 1.0 };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
 
-    stratum_cfg_t cfg_a = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
-                            .shared = shared };
-    stratum_cfg_t cfg_b = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
-                            .shared = shared };
-    snprintf(cfg_a.bind_addr, sizeof(cfg_a.bind_addr), "127.0.0.1");
-    snprintf(cfg_b.bind_addr, sizeof(cfg_b.bind_addr), "127.0.0.1");
-
-    stratum_server_t *a = NULL, *b = NULL;
-    CHECK(stratum_server_start(&cfg_a, &a) == 0);
-    CHECK(stratum_server_start(&cfg_b, &b) == 0);
-    if (!a || !b) { stratum_shared_free(shared); return; }
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
 
     stratum_conn_t *c1, *c2, *c3, *c4;
-    unsigned e1 = subscribe_get_en1(a, &c1);   /* public port  */
-    unsigned e2 = subscribe_get_en1(b, &c2);   /* rental port  */
-    unsigned e3 = subscribe_get_en1(a, &c3);
-    unsigned e4 = subscribe_get_en1(b, &c4);
+    unsigned e1 = subscribe_get_en1(s, &c1);
+    unsigned e2 = subscribe_get_en1(s, &c2);
+    unsigned e3 = subscribe_get_en1(s, &c3);
+    unsigned e4 = subscribe_get_en1(s, &c4);
 
-    /* One counter, so the four are strictly consecutive regardless of which
-     * server each subscribe landed on. */
     CHECK(e2 == e1 + 1);
     CHECK(e3 == e1 + 2);
     CHECK(e4 == e1 + 3);
@@ -2200,29 +2193,44 @@ static void test_shared_extranonce1_sequence_across_servers(void) {
 
     stratum_conn_free_for_test(c1); stratum_conn_free_for_test(c2);
     stratum_conn_free_for_test(c3); stratum_conn_free_for_test(c4);
-    stratum_server_free(a);
-    stratum_server_free(b);
-    /* Freeing the servers must not have freed state they only borrowed. */
-    stratum_shared_free(shared);
-    printf("ok: extranonce1 is one sequence across both servers\n");
+    stratum_server_free(s);
+    printf("ok: extranonce1 is one sequence for the whole server\n");
 }
 
-/* A server given no shared state allocates its own, so the single-server
- * case and every other test keep working unchanged. */
-static void test_server_without_shared_still_allocates_one(void) {
+/* A listener's difficulty policy must reach the connection that arrived on
+ * it. Exercised through the accept path's own helper rather than by binding a
+ * fixed port, which in CI races whatever else is on the box.
+ *
+ * The distinction under test is the one the rental port depends on:
+ * `min_diff` is what the port PROMISED a marketplace and is recorded
+ * separately from the rate-loop bound, because only the promise survives the
+ * network-difficulty ceiling. */
+static void test_listener_policy_reaches_the_connection(void) {
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1.0 };
     snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
     stratum_server_t *s = NULL;
     CHECK(stratum_server_start(&cfg, &s) == 0);
     if (!s) return;
-    stratum_conn_t *c1, *c2;
-    unsigned e1 = subscribe_get_en1(s, &c1);
-    unsigned e2 = subscribe_get_en1(s, &c2);
-    CHECK(e2 == e1 + 1);
-    stratum_conn_free_for_test(c1);
-    stratum_conn_free_for_test(c2);
-    stratum_server_free(s);   /* must free the counter it owns */
-    printf("ok: a lone server allocates its own shared state\n");
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(c != NULL);
+    if (!c) { stratum_server_free(s); return; }
+
+    /* Born on the server-wide default. */
+    CHECK(stratum_conn_difficulty_for_test(c) == 1.0);
+
+    stratum_listener_t pol = { .port = 3335, .initial_diff = 500000.0,
+                               .vardiff_min = 500000.0, .min_diff = 500000.0 };
+    snprintf(pol.label, sizeof pol.label, "rental");
+    stratum_conn_apply_listener_for_test(c, &pol);
+
+    /* A miner that only subscribed still reports its port's difficulty,
+     * rather than the default it was constructed with. */
+    CHECK(stratum_conn_difficulty_for_test(c) == 500000.0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a listener's difficulty policy reaches its connections\n");
 }
 
 static double hint_low(void *ctx, const char *worker) {
@@ -2950,8 +2958,8 @@ int main(void) {
     test_authorize_without_hint_uses_initial();
     test_proportional_shared_coinbase();
     test_proportional_falls_back_without_window();
-    test_shared_extranonce1_sequence_across_servers();
-    test_server_without_shared_still_allocates_one();
+    test_extranonce1_is_one_sequence_per_server();
+    test_listener_policy_reaches_the_connection();
     test_hint_below_vardiff_min_is_floored();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();

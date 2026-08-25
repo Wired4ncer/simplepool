@@ -53,7 +53,7 @@ BIN       := $(BUILD_DIR)/simplepool
 # different question: a tree gets patched or moves on past the last `make`,
 # and from then on its HEAD is not what the running process was built from.
 # Empty outside a git checkout (release tarball) — reported as "unknown".
-VERSION    := 0.2.0
+VERSION    := 0.3.0
 GIT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
 GIT_DIRTY  := $(shell git status --porcelain --untracked-files=no 2>/dev/null | head -1)

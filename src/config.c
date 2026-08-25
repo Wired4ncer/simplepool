@@ -63,6 +63,13 @@ void proxy_config_defaults(proxy_config_t *cfg) {
 
     /* Rental port off unless configured. 500000 clears both Braiins (>=1024,
      * recommends 65536) and NiceHash (500000) with one listener. */
+    /* ⛔ OFF, deliberately — upstream defaults this to 20000. Refusing a
+     * submit is a miner-visible action, and no real miner's burst rate has
+     * been measured against a ceiling here yet. It gets opened like every
+     * other gate key: written explicitly, one stage at a time, after
+     * measurement. */
+    cfg->max_submits_per_sec = 0;
+    cfg->listener_count = 0;
     cfg->rental_listen_port = 0;
     cfg->rental_min_diff    = 500000.0;
     cfg->rental_max_conns   = 0;      /* 0 → inherit max_conns */
@@ -137,6 +144,73 @@ static void copy_str(char *dst, size_t cap, const char *src) {
     snprintf(dst, cap, "%s", src);
 }
 
+/* Parse one `listener = port=3335 min_diff=65536 label=braiins` line into
+ * `out`. Fields are separated by whitespace or commas and may appear in any
+ * order; `port` is the only required one, and anything left unset falls back
+ * to the server-wide default at accept time.
+ *
+ * min_diff sets the vardiff floor and, unless initial_diff says otherwise,
+ * the starting difficulty too. That pairing is the whole point of a rental
+ * port: the miner has to arrive already at the floor, because vardiff cannot
+ * climb to it fast enough to matter. Returns 0 on success. */
+static int parse_listener(const char *v, stratum_listener_t *out,
+                          char *errbuf, size_t errlen) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", v);
+    memset(out, 0, sizeof *out);
+
+    double min_diff = 0.0, initial = 0.0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t,", &save); tok;
+         tok = strtok_r(NULL, " \t,", &save)) {
+        char *eq = strchr(tok, '=');
+        if (!eq) {
+            set_err(errbuf, errlen, "listener field '%s' is not key=value", tok);
+            return -1;
+        }
+        *eq = '\0';
+        const char *fk = tok, *fv = eq + 1;
+        if      (strcmp(fk, "port")         == 0) out->port = atoi(fv);
+        else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
+        else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
+        else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
+        else {
+            set_err(errbuf, errlen, "unknown listener field '%s'", fk);
+            return -1;
+        }
+    }
+    if (out->port <= 0 || out->port > 65535) {
+        set_err(errbuf, errlen, "listener needs a port between 1 and 65535");
+        return -1;
+    }
+    /* The label is published to the DB inside a JSON blob and rendered into
+     * the dashboard. Constraining it here means neither of those has to
+     * escape it, and an operator typo fails at startup rather than producing
+     * a banner that silently breaks. */
+    for (const char *q = out->label; *q; ++q) {
+        if (!isalnum((unsigned char)*q) && *q != '-' && *q != '_') {
+            set_err(errbuf, errlen,
+                    "listener port %d: label may only contain letters, "
+                    "digits, '-' and '_'", out->port);
+            return -1;
+        }
+    }
+    out->vardiff_min  = min_diff;
+    /* Recorded separately from vardiff_min so the server can tell "this port
+     * promised a floor" from "this port inherited the server-wide rate-loop
+     * bound". Only the former survives the network-difficulty ceiling. */
+    out->min_diff     = min_diff;
+    out->initial_diff = initial > 0.0 ? initial : min_diff;
+    if (out->vardiff_max > 0.0 && out->initial_diff > out->vardiff_max) {
+        set_err(errbuf, errlen,
+                "listener port %d: initial difficulty %g is above max_diff %g",
+                out->port, out->initial_diff, out->vardiff_max);
+        return -1;
+    }
+    return 0;
+}
+
 int proxy_config_load(const char *path, proxy_config_t *cfg,
                       char *errbuf, size_t errlen) {
     proxy_config_defaults(cfg);
@@ -198,6 +272,23 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_idle_step")         == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "clean_jobs_on_refresh")     == 0) cfg->clean_jobs_on_refresh = atoi(v);
         else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);
+        else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
+        else if (strcmp(k, "listener")                  == 0) {
+            char lerr[160];
+            if (cfg->listener_count >= STRATUM_MAX_LISTENERS) {
+                set_err(errbuf, errlen, "config: line %d: at most %d listeners",
+                        lineno, STRATUM_MAX_LISTENERS);
+                fclose(f);
+                return -1;
+            }
+            stratum_listener_t l;
+            if (parse_listener(v, &l, lerr, sizeof lerr) != 0) {
+                set_err(errbuf, errlen, "config: line %d: %s", lineno, lerr);
+                fclose(f);
+                return -1;
+            }
+            cfg->listeners[cfg->listener_count++] = l;
+        }
         else if (strcmp(k, "rental_listen_port")        == 0) cfg->rental_listen_port = atoi(v);
         else if (strcmp(k, "rental_min_diff")           == 0) cfg->rental_min_diff = atof(v);
         else if (strcmp(k, "rental_max_conns")          == 0) cfg->rental_max_conns = atoi(v);
@@ -319,6 +410,58 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     "(0 disables the floor, which collapses the window at a "
                     "difficulty reset — see config.h)");
             return -13;
+        }
+    }
+    if (cfg->max_submits_per_sec < 0) {
+        set_err(errbuf, errlen,
+                "config: 'max_submits_per_sec' cannot be negative "
+                "(0 disables the ceiling)");
+        return -14;
+    }
+    /* Two listeners on one port, or a listener on listen_port. Caught here
+     * because the alternative is a bind() that fails at startup with EADDRINUSE
+     * and no indication of which of the operator's two lines was the mistake. */
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        if (cfg->listeners[i].port == cfg->listen_port) {
+            set_err(errbuf, errlen,
+                    "config: listener port %d is already listen_port — give "
+                    "the extra listener a different port",
+                    cfg->listeners[i].port);
+            return -15;
+        }
+        if (cfg->rental_listen_port > 0 &&
+            cfg->listeners[i].port == cfg->rental_listen_port) {
+            set_err(errbuf, errlen,
+                    "config: listener port %d is already rental_listen_port — "
+                    "use one or the other, not both",
+                    cfg->listeners[i].port);
+            return -15;
+        }
+        for (int j = 0; j < i; ++j) {
+            if (cfg->listeners[i].port == cfg->listeners[j].port) {
+                set_err(errbuf, errlen,
+                        "config: two listeners both use port %d",
+                        cfg->listeners[i].port);
+                return -16;
+            }
+        }
+    }
+    /* A rental port whose floor is under the marketplace threshold is legal —
+     * an operator may have a private customer with other requirements — but
+     * it is the setting that gets a public port refused, so name it rather
+     * than let it pass unremarked. Braiins wants 1024 minimum and 65536
+     * recommended; NiceHash wants 500000. */
+    for (int i = 0; i < cfg->listener_count; ++i) {
+        if (cfg->listeners[i].min_diff > 0.0 &&
+            cfg->listeners[i].min_diff < 1024.0) {
+            /* %g, not %.0f: a difficulty is not necessarily >= 1. On a
+             * forknet these are values like 3e-10, and %.0f renders every
+             * one of them as "0" — a warning naming the wrong number is
+             * worse than no warning. */
+            LOG_WARN("config: listener port %d promises min_diff %g, below "
+                     "the 1024 floor rented-hashrate marketplaces require; a "
+                     "port advertised for rental at this level can be refused",
+                     cfg->listeners[i].port, cfg->listeners[i].min_diff);
         }
     }
     return 0;

@@ -153,10 +153,6 @@ typedef struct {
     store_t           *store;
     broadcast_t       *bcast;
     stratum_server_t  *srv;
-    /* Optional second listener for hashrate marketplaces (config
-     * rental_listen_port). NULL when disabled. Same job, same callbacks, same
-     * PPLNS window — it differs only in the share difficulty it serves. */
-    stratum_server_t  *srv_rental;
     proxy_config_t    *cfg;
 
     pthread_mutex_t lock;
@@ -1235,14 +1231,11 @@ static void *tip_watcher(void *arg) {
                 bitcoind_template_free(t);
                 continue;
             }
-            /* Publish to the rental port first, taking the extra reference
-             * set_job consumes. Both listeners serve the SAME job object, so
-             * they agree on job_id, payout plan and merkle branches — a submit
-             * on either port settles against the same window. */
-            if (s->srv_rental) {
-                stratum_server_set_job(s->srv_rental, stratum_job_ref(job),
-                                       clean);
-            }
+            /* One server, one publish: every listener broadcasts from the
+             * same connection list, so all ports necessarily agree on job_id,
+             * payout plan and merkle branches. Under the two-server model this
+             * agreement had to be arranged by hand, by passing an extra
+             * reference to the second server. */
             stratum_server_set_job(s->srv, job, clean);
             /* Difficulty and block value move with the template, so the
              * rate has to move with it too. */
@@ -1436,6 +1429,52 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* ⓘ THE COMPATIBILITY SHIM — this is what makes the architecture swap
+     * config-neutral.
+     *
+     * The rental port used to be a second stratum_server_t. It is now a second
+     * listener inside the one server, which is the whole point: two servers
+     * seeded extranonce1 from the clock milliseconds apart, handed out
+     * colliding values, rendered identical coinbases, and deduped against
+     * per-server rings blind to each other. One server cannot reach that state.
+     *
+     * ⛔ The PRODUCTION CONFIG IS NOT TOUCHED. rental_listen_port /
+     * rental_min_diff / rental_max_conns keep working exactly as they do
+     * today by being mapped onto a listener here. Migrating the config to
+     * `listener = port=... min_diff=...` is a SEPARATE decision (U2), not a
+     * hostage to installing this binary. An operator who has already written
+     * a `listener` line gets that and the rental keys are ignored — the config
+     * validator refuses the two naming the same port.
+     *
+     * ⚠️ One behaviour DOES change, deliberately: a listener's min_diff is
+     * kept even when the chain's difficulty is lower, where the old rental
+     * port was clamped down to it. That is the marketplace-facing fix — an
+     * order arriving under the difficulty the port advertised gets cancelled.
+     * Our own rental note recorded the old behaviour as a limitation. */
+    if (cfg.rental_listen_port > 0 && cfg.listener_count == 0) {
+        stratum_listener_t *l = &cfg.listeners[cfg.listener_count++];
+        memset(l, 0, sizeof *l);
+        l->port         = cfg.rental_listen_port;
+        l->initial_diff = cfg.rental_min_diff;
+        l->vardiff_min  = cfg.rental_min_diff;
+        l->min_diff     = cfg.rental_min_diff;
+        if (cfg.vardiff_max < cfg.rental_min_diff) {
+            cfg.vardiff_max = cfg.rental_min_diff;
+        }
+        snprintf(l->label, sizeof l->label, "rental");
+        /* ⚠️ rental_max_conns has no per-listener equivalent: max_conns is
+         * server-wide now. Raise the server cap to whichever is larger rather
+         * than silently lowering the rental port's headroom — the cap refuses
+         * SILENTLY, and this one peaked at 1,975 of 2,000 during order 4. */
+        if (cfg.rental_max_conns > cfg.max_conns) {
+            LOG_INFO("stratum: max_conns raised %d -> %d to preserve "
+                     "rental_max_conns under the single-server model",
+                     cfg.max_conns, cfg.rental_max_conns);
+            cfg.max_conns = cfg.rental_max_conns;
+        }
+    }
+
+
     /* Pool identity into the DB, before anything else can read the table.
      * The dashboard shows this to miners; see store.h for why it lives in
      * the DB rather than in the dashboard's own environment. */
@@ -1449,9 +1488,50 @@ int main(int argc, char **argv) {
                  network, network_src, cfg.pool_mode, cfg.fee_bps,
                  cfg.coinbase_tag, cfg.operator_address,
                  pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        /* Publish the ports so the dashboard can tell a miner which one to
+         * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
+         * so this needs no escaping.
+         *
+         * promised_min_diff is published alongside min_diff because the two
+         * now behave differently and a consumer has to tell them apart:
+         * min_diff is the rate-loop bound, which the network difficulty still
+         * overrides, while promised_min_diff is kept even when the chain is
+         * easier. A port over the chain on the first is quietly served less
+         * than it asked for; a port over the chain on the second gets what it
+         * asked for and discards blocks paying for it. Opposite findings,
+         * opposite advice. listen_port never promises one. */
+        char lj[4096];
+        size_t lo = 0;
+        int dropped = 0;
+        lo += (size_t)snprintf(lj + lo, sizeof lj - lo,
+                               "[{\"port\":%d,\"label\":\"\",\"min_diff\":%.10g,"
+                               "\"promised_min_diff\":0,\"initial_diff\":%.10g}",
+                               cfg.listen_port, cfg.vardiff_min,
+                               cfg.initial_diff);
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            const stratum_listener_t *l = &cfg.listeners[i];
+            char one[256];
+            int n = snprintf(one, sizeof one,
+                             ",{\"port\":%d,\"label\":\"%s\","
+                             "\"min_diff\":%.10g,\"promised_min_diff\":%.10g,"
+                             "\"initial_diff\":%.10g}",
+                             l->port, l->label,
+                             l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min,
+                             l->min_diff,
+                             l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff);
+            if (n < 0 || lo + (size_t)n >= sizeof lj - 2) { dropped++; continue; }
+            memcpy(lj + lo, one, (size_t)n);
+            lo += (size_t)n;
+        }
+        lj[lo++] = ']';
+        lj[lo] = '\0';
+        if (dropped) {
+            LOG_WARN("pool identity: %d listener(s) did not fit the published "
+                     "port list — the dashboard will not show them", dropped);
+        }
         store_record_pool_identity(store, network, network_src,
                                    cfg.coinbase_tag, cfg.operator_address,
-                                   pps ? cfg.pool_btc_address : NULL);
+                                   pps ? cfg.pool_btc_address : NULL, lj);
     }
 
     /* Broadcast (optional). */
@@ -1552,6 +1632,11 @@ int main(int argc, char **argv) {
     stcfg.max_conns    = cfg.max_conns;
     /* rcfg is a copy of stcfg, so the rental listener inherits this too. */
     stcfg.listen_backlog = cfg.listen_backlog;
+    /* The listener table, already carrying the rental shim's entry if the
+     * operator is still on the rental_* keys. */
+    memcpy(stcfg.listeners, cfg.listeners, sizeof stcfg.listeners);
+    stcfg.listener_count  = cfg.listener_count;
+    stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
     stcfg.initial_diff = cfg.initial_diff;
     snprintf(stcfg.operator_address, sizeof stcfg.operator_address, "%s",
              cfg.operator_address);
@@ -1629,27 +1714,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Allocated before either server so both draw extranonce1 from one
-     * sequence and dedupe shares against one ring. Two servers left to
-     * allocate their own would seed the counter from the clock within a
-     * millisecond of each other, hand out colliding extranonce1 values, and
-     * have no cross-port guard to catch the duplicate shares that produces. */
-    stratum_shared_t *shared = stratum_shared_new();
-    if (!shared) {
-        fprintf(stderr, "stratum_shared_new failed\n");
-        stratum_job_free(initial_job);
-        bitcoind_template_free(tmpl);
-        store_close(store);
-        bitcoind_client_free(&btc);
-        bitcoind_client_free(&btc_lp);
-        return 7;
-    }
-    stcfg.shared = shared;
-
     stratum_server_t *srv = NULL;
     if (stratum_server_start(&stcfg, &srv) < 0) {
         fprintf(stderr, "stratum_server_start failed\n");
-        stratum_shared_free(shared);
         stratum_job_free(initial_job);
         bitcoind_template_free(tmpl);
         store_close(store);
@@ -1658,47 +1725,19 @@ int main(int argc, char **argv) {
         return 7;
     }
     sctx.srv = srv;
-    /* Take the rental server's reference before set_job consumes ours. */
-    stratum_job_t *initial_for_rental =
-        cfg.rental_listen_port > 0 ? stratum_job_ref(initial_job) : NULL;
     stratum_server_set_job(srv, initial_job, 1);
 
     LOG_INFO("stratum listening on %s:%d", cfg.listen_addr, cfg.listen_port);
-
-    /* The rental port: same callbacks, same shared state, same job — it
-     * differs only in the difficulty it serves. rental_min_diff is both the
-     * starting difficulty and the vardiff floor, because a marketplace order
-     * that starts below its minimum and ramps up is cancelled for invalid
-     * shares before the ramp finishes. */
-    stratum_server_t *srv_rental = NULL;
-    if (cfg.rental_listen_port > 0) {
-        stratum_cfg_t rcfg = stcfg;   /* inherit every payout-relevant field */
-        rcfg.bind_port    = cfg.rental_listen_port;
-        rcfg.initial_diff = cfg.rental_min_diff;
-        rcfg.vardiff_min  = cfg.rental_min_diff;
-        if (rcfg.vardiff_max < cfg.rental_min_diff) {
-            rcfg.vardiff_max = cfg.rental_min_diff;
+    if (cfg.listener_count > 0) {
+        /* Logged from stcfg, not cfg: after the shim above this is the list
+         * the server actually bound, whichever config spelling produced it. */
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            LOG_INFO("stratum listening on %s:%d [%s] at difficulty %.0f "
+                     "(promised floor, kept even below network difficulty)",
+                     cfg.listen_addr, cfg.listeners[i].port,
+                     cfg.listeners[i].label[0] ? cfg.listeners[i].label : "-",
+                     cfg.listeners[i].min_diff);
         }
-        rcfg.max_conns = cfg.rental_max_conns > 0 ? cfg.rental_max_conns
-                                                  : cfg.max_conns;
-        if (stratum_server_start(&rcfg, &srv_rental) < 0) {
-            fprintf(stderr, "rental stratum_server_start failed on port %d\n",
-                    cfg.rental_listen_port);
-            stratum_job_free(initial_for_rental);
-            stratum_server_stop(srv);
-            stratum_server_free(srv);
-            stratum_shared_free(shared);
-            bitcoind_template_free(tmpl);
-            store_close(store);
-            bitcoind_client_free(&btc);
-            bitcoind_client_free(&btc_lp);
-            return 7;
-        }
-        sctx.srv_rental = srv_rental;
-        stratum_server_set_job(srv_rental, initial_for_rental, 1);
-        LOG_INFO("rental stratum listening on %s:%d at fixed difficulty %.0f "
-                 "(vardiff floor; network difficulty still clamps it down)",
-                 cfg.listen_addr, cfg.rental_listen_port, cfg.rental_min_diff);
     }
 
     bitcoind_template_free(tmpl);
@@ -1723,10 +1762,8 @@ int main(int argc, char **argv) {
                 strerror(watcher_rc));
         LOG_ERROR("fatal: could not start the tip watcher: %s",
                   strerror(watcher_rc));
-        if (srv_rental) { stratum_server_stop(srv_rental); stratum_server_free(srv_rental); }
         stratum_server_stop(srv);
         stratum_server_free(srv);
-        stratum_shared_free(shared);
         store_close(store);
         if (bcast) broadcast_close(bcast);
         bitcoind_client_free(&btc);
@@ -1744,13 +1781,10 @@ int main(int argc, char **argv) {
 
     pthread_join(watcher, NULL);
 
-    /* Stop the rental port first: it holds no state the primary needs, and
-     * stopping it early stops new marketplace connections landing mid-teardown. */
-    if (srv_rental) { stratum_server_stop(srv_rental); stratum_server_free(srv_rental); }
+    /* One server: stopping it joins every listener thread and drains every
+     * connection, so there is no ordering between ports to get right. */
     stratum_server_stop(srv);
     stratum_server_free(srv);
-    /* Both servers are gone, so nothing can touch the shared state again. */
-    stratum_shared_free(shared);
 
     store_flush(store);
     store_stats_t stats;

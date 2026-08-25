@@ -200,6 +200,103 @@ export function health(handle) {
         };
     }));
 
+    /* Is every stratum port actually able to serve the difficulty it was
+     * configured for?
+     *
+     * The pool never assigns a share difficulty above the network difficulty:
+     * a miner filters locally against the stratum target, so a share target
+     * harder than the network target throws away valid blocks before the pool
+     * ever sees them. The clamp is right, and it is silent.
+     *
+     * That silence is the problem for a high-difficulty port. An operator
+     * configures 500000 to satisfy a marketplace floor, the chain is at 1200,
+     * and the port serves 1200 while every dashboard reads normal. The
+     * marketplace then measures the difficulty it was actually given, decides
+     * the pool cannot hold its floor, and cancels the order -- and nothing in
+     * the pool ever said why. Binary, actionable, and invisible to every other
+     * query, which is what this banner is for.
+     *
+     * Only ports asking for more than the default are checked. A home-miner
+     * port sitting under the network difficulty is the normal case, not a
+     * finding. */
+    checks.push(guard('listener_difficulty', 'Stratum ports can hold their difficulty', () => {
+        const meta = one(d, 'SELECT network_difficulty, listeners FROM pool_meta WHERE id = 1');
+        const actual = Number(meta?.network_difficulty || 0);
+        if (!meta || !meta.listeners || actual <= 0) {
+            return { ok: true, value: null, detail: 'no ports published yet' };
+        }
+        let ls;
+        try { ls = JSON.parse(meta.listeners); } catch { ls = null; }
+        if (!Array.isArray(ls) || ls.length === 0) {
+            return { ok: true, value: null, detail: 'no ports published yet' };
+        }
+        /* What the port is actually asking the chain for is the higher of the
+         * two: the starting difficulty and the vardiff floor are both clamped
+         * to the network, so a port that starts at 1 but is floored at 500000
+         * cannot hold its floor either — and that configuration is the more
+         * confusing one to debug, because the miner connects at a difficulty
+         * that looks fine. */
+        const asks = l => Math.max(Number(l?.initial_diff || 0),
+                                   Number(l?.min_diff || 0));
+        const promised = l => Number(l?.promised_min_diff || 0);
+        /* A difficulty is not necessarily >= 1 — on a forknet these are
+         * values like 3e-10, and toFixed(0) renders every one as "0". Print
+         * whole numbers plainly and small ones in the exponent form they are
+         * actually configured with. */
+        const fmt = x => (x >= 1 ? x.toFixed(0) : String(Number(x.toPrecision(3))));
+
+        /* Two findings, not one, and they point opposite ways.
+         *
+         * A port that PROMISED a floor (min_diff on its listener line) keeps
+         * it: the pool serves that difficulty even though the chain is
+         * easier, because a marketplace measures the wire and cancels an
+         * order that comes in under what the port advertised. The port works;
+         * what it costs is blocks, since the miner filters locally at the
+         * assigned difficulty and throws away solutions the chain would have
+         * taken. That is a deliberate trade and the operator should see its
+         * size, so report it first — it is the one losing money.
+         *
+         * A port merely CONFIGURED high (initial_diff or vardiff_min, no
+         * promise) is clamped down to the chain and quietly serves less than
+         * it says. Nothing is lost, but rented hashrate pointed at it will
+         * read the pool as below its floor. */
+        const kept = ls.filter(l => promised(l) > actual);
+        if (kept.length > 0) {
+            const worst = kept.reduce((a, b) => (promised(a) > promised(b) ? a : b));
+            const ratio = promised(worst) / actual;
+            return {
+                ok: false,
+                value: kept.length,
+                detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
+                        `promises min_diff ${fmt(promised(worst))} and the ` +
+                        `pool is holding it, but network difficulty is only ` +
+                        `${fmt(actual)}. Miners there filter locally at the ` +
+                        `promised difficulty, so they discard roughly ` +
+                        `${(ratio - 1).toFixed(0)} of every ${ratio.toFixed(0)} ` +
+                        `blocks they solve. Drop min_diff on this port if keeping ` +
+                        `every block matters more than serving rented hashrate on it`,
+            };
+        }
+
+        const over = ls.filter(l => asks(l) > actual);
+        if (over.length === 0) {
+            return { ok: true, value: ls.length, detail: null };
+        }
+        const worst = over.reduce((a, b) => (asks(a) > asks(b) ? a : b));
+        return {
+            ok: false,
+            value: over.length,
+            detail: `port ${worst.port}${worst.label ? ` (${worst.label})` : ''} ` +
+                    `is configured for difficulty ` +
+                    `${fmt(asks(worst))} but network ` +
+                    `difficulty is only ${fmt(actual)}, so miners there ` +
+                    `are served ${fmt(actual)} instead. It sets no ` +
+                    `min_diff, so nothing is holding the difficulty up — ` +
+                    `rented hashrate measuring this port will read it as ` +
+                    `below its floor`,
+        };
+    }));
+
     /* Does the block value the pool is being told make arithmetic sense?
      *
      * A template reports the coinbase value in one field and the per-transaction

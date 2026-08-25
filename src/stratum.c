@@ -70,45 +70,7 @@
  * applied to every submitted version. */
 #define VERSION_ROLLING_MASK 0x1fffe000u
 
-/* ========================================================== shared ====== */
-
 static uint64_t now_ms(void);   /* defined below; used to seed the counter */
-
-/* State every stratum server in the process must draw from in common. The
- * rationale for each field — and why a per-server copy is a double-credit bug
- * once a second port exists — is on stratum_shared_t in stratum.h. */
-struct stratum_shared {
-    /* Seeded from the clock at construction (so values differ across
-     * restarts) and incremented per subscribe, which is what makes each
-     * connection's extranonce1 distinct. Do not mix it with the clock again
-     * at use. */
-    atomic_uint extranonce1_seq;
-
-    /* Share dedupe, keyed on the resulting block-header hash. The
-     * per-connection ring in stratum_conn cannot catch a duplicate that
-     * arrives on a *different* connection, and two connections handed the
-     * same extranonce1 render identical coinbases — so the same nonce yields
-     * the same hash on both, and it would be credited twice. Keying on the
-     * final hash makes the check independent of how the submission was framed
-     * (job id, extranonce2, version rolling). */
-    pthread_mutex_t dedupe_lock;
-    uint64_t        dedupe[SHARE_DEDUPE_RING];
-    size_t          dedupe_head;
-};
-
-stratum_shared_t *stratum_shared_new(void) {
-    stratum_shared_t *sh = calloc(1, sizeof(*sh));
-    if (!sh) return NULL;
-    pthread_mutex_init(&sh->dedupe_lock, NULL);
-    atomic_init(&sh->extranonce1_seq, (unsigned)now_ms());
-    return sh;
-}
-
-void stratum_shared_free(stratum_shared_t *sh) {
-    if (!sh) return;
-    pthread_mutex_destroy(&sh->dedupe_lock);
-    free(sh);
-}
 
 /* ============================================================== job ===== */
 
@@ -313,19 +275,39 @@ struct stratum_server {
      * per share. Mirrors cfg.pps_enabled, which main.c derives the same way. */
     int prop_enabled;
 
-    int  listen_fd;
+    /* One entry per bound port. Each carries the difficulty policy the
+     * connections it accepts inherit, so the port a miner dials decides what
+     * difficulty it is served at. Slot 0 is always cfg.bind_port on the
+     * server-wide defaults. */
+    struct stratum_listener_slot {
+        stratum_server_t  *srv;
+        stratum_listener_t pol;
+        int                fd;
+        pthread_t          thr;
+        int                thr_started;
+    } listeners[STRATUM_MAX_LISTENERS];
+    int  listener_count;
+
     atomic_int  stop;
     atomic_int  conn_count;
-    /* Extranonce1 counter and share dedupe, shared with every other server in
-     * the process (see stratum_shared_t in stratum.h). Never per-server: two
-     * servers each with their own would hand out colliding extranonce1 values
-     * and be unable to detect the duplicate shares that result. `shared_owned`
-     * records whether this server allocated it and must free it. */
-    stratum_shared_t *shared;
-    int               shared_owned;
 
-    pthread_t   listener_thr;
-    int         listener_started;
+    /* Seeded from the clock at startup (so values differ across restarts) and
+     * incremented per subscribe, which is what makes each connection's
+     * extranonce1 distinct. Do not mix it with the clock again at use.
+     *
+     * Per-server again, and correct this time: there is exactly one server in
+     * the process now. It was hoisted into a shared object only because two
+     * servers each seeding from the clock handed out overlapping values. */
+    atomic_uint extranonce1_seq;
+
+    /* Share dedupe, keyed on the resulting block-header hash. The
+     * per-connection ring in stratum_conn cannot catch a duplicate that
+     * arrives on a *different* connection. Keying on the final hash makes the
+     * check independent of how the submission was framed (job id,
+     * extranonce2, version rolling). */
+    pthread_mutex_t share_dedupe_lock;
+    uint64_t        share_dedupe[SHARE_DEDUPE_RING];
+    size_t          share_dedupe_head;
 
     pthread_rwlock_t job_lock;
     stratum_job_t   *current_job;          /* protected by job_lock */
@@ -352,6 +334,23 @@ struct stratum_conn {
 
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
+
+    /* The difficulty policy of the listener this connection arrived on,
+     * copied at accept() so nothing downstream has to know which port it
+     * came from. Zero means "use the server-wide default". */
+    double   pol_initial_diff;
+    double   pol_vardiff_min;
+    double   pol_vardiff_max;
+    /* The floor this port *promises*, as distinct from pol_vardiff_min, which
+     * merely bounds the rate loop. Only a listener that spelled out min_diff
+     * sets it, and unlike every other floor it survives the network-difficulty
+     * ceiling: a marketplace measures the difficulty on the wire and cancels
+     * an order that arrives under what the port advertised. See
+     * clamp_assigned_difficulty. */
+    double   pol_min_diff;
+    int      pol_port;
+    char     pol_label[32];
+
     int      subscribed;
     int      authorized;
     uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
@@ -1230,7 +1229,7 @@ static int handle_subscribe(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * leaving the high bytes of a wider field uninitialised. */
     _Static_assert(STRATUM_EXTRANONCE1_SIZE == 4,
                    "extranonce1 packing below assumes a 4-byte field");
-    unsigned seq = atomic_fetch_add(&s->shared->extranonce1_seq, 1);
+    unsigned seq = atomic_fetch_add(&s->extranonce1_seq, 1);
     uint32_t mix = (uint32_t)seq;
     c->extranonce1[0] = (uint8_t)(mix >> 24);
     c->extranonce1[1] = (uint8_t)(mix >> 16);
@@ -1601,18 +1600,17 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
  * id. Two identical hashes represent one solution and must be paid once. */
 static int share_dedupe_check_and_add(stratum_server_t *s,
                                       const uint8_t hash_be[32]) {
-    stratum_shared_t *sh = s->shared;
     uint64_t h = fnv1a_bytes(hash_be, 32);
     int dup = 0;
-    pthread_mutex_lock(&sh->dedupe_lock);
+    pthread_mutex_lock(&s->share_dedupe_lock);
     for (size_t i = 0; i < SHARE_DEDUPE_RING; ++i) {
-        if (sh->dedupe[i] == h) { dup = 1; break; }
+        if (s->share_dedupe[i] == h) { dup = 1; break; }
     }
     if (!dup) {
-        sh->dedupe[sh->dedupe_head] = h;
-        sh->dedupe_head = (sh->dedupe_head + 1) % SHARE_DEDUPE_RING;
+        s->share_dedupe[s->share_dedupe_head] = h;
+        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
     }
-    pthread_mutex_unlock(&sh->dedupe_lock);
+    pthread_mutex_unlock(&s->share_dedupe_lock);
     return dup;
 }
 
@@ -2427,12 +2425,132 @@ static void peer_ip_from_sockaddr(const struct sockaddr_storage *ss,
     snprintf(out, cap, "?");
 }
 
+/* Bind one listener slot, carrying the whole dual-stack decision. Split out of
+ * stratum_server_start when the server grew from one listening socket to N:
+ * the address family, the V6ONLY decision and the backlog are properties of
+ * the server, and only the port varies per slot.
+ *
+ * Address family is chosen from cfg.bind_addr, and "0.0.0.0" keeps meaning
+ * exactly what it says.
+ *
+ *   ""  / "0.0.0.0"  -> IPv4 wildcard          (unchanged; the default)
+ *   "::"             -> DUAL-STACK wildcard    (IPv6 + IPv4-mapped)
+ *   IPv4 literal     -> that IPv4 address
+ *   IPv6 literal     -> that IPv6 address only (V6ONLY on)
+ *
+ * ⚠️ Deliberately NOT making "0.0.0.0" dual-stack, even though that is what
+ * production runs and would have made this arrive for free. Overloading a
+ * wildcard that has one obvious meaning is how a binary install changes
+ * behaviour nobody asked it to. IPv6 stays CONFIG-GATED: install the binary
+ * and nothing moves; set listen_addr = :: and it turns on; revert is one
+ * config line and no rebuild.
+ *
+ * Why dual-stack at all: both hostnames publish AAAA records and nginx answers
+ * on [::], so the site looks healthy over IPv6 while stratum, bound IPv4-only,
+ * refuses the connection. A miner whose client prefers AAAA -- the RFC 6724
+ * default -- never starts mining, and unlike a browser most mining firmware
+ * has no Happy Eyeballs fallback to recover with. */
+static int listener_bind(stratum_server_t *s, struct stratum_listener_slot *ls) {
+    const char *ba = s->cfg.bind_addr;
+    int family = AF_INET;
+    int dual_stack = 0;
+    struct in_addr  v4 = {0};
+    struct in6_addr v6;
+
+    if (ba[0] == '\0' || strcmp(ba, "0.0.0.0") == 0) {
+        v4.s_addr = htonl(INADDR_ANY);
+    } else if (strcmp(ba, "::") == 0) {
+        family = AF_INET6; dual_stack = 1; v6 = in6addr_any;
+    } else if (inet_pton(AF_INET, ba, &v4) == 1) {
+        /* explicit IPv4 literal — keeps its own family, so a test binding
+         * 127.0.0.1 is completely untouched by any of this */
+    } else if (inet_pton(AF_INET6, ba, &v6) == 1) {
+        family = AF_INET6;
+    } else {
+        LOG_ERROR("stratum: listen_addr '%s' is not an IPv4 or IPv6 address", ba);
+        return -1;
+    }
+
+    ls->fd = socket(family, SOCK_STREAM, 0);
+    if (ls->fd < 0) return -1;
+    int one = 1;
+    setsockopt(ls->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (family == AF_INET6) {
+        /* 0 = accept IPv4-mapped connections too; 1 = this family only.
+         * Set EXPLICITLY in both directions: the default is a sysctl
+         * (net.ipv6.bindv6only) and inheriting it means the pool's listening
+         * behaviour depends on a host setting nobody here records. */
+        int v6only = dual_stack ? 0 : 1;
+        if (setsockopt(ls->fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                       &v6only, sizeof(v6only)) < 0) {
+            LOG_ERROR("stratum: IPV6_V6ONLY=%d: %s", v6only, strerror(errno));
+            return -1;
+        }
+    }
+
+    struct sockaddr_storage ss;
+    socklen_t sslen;
+    memset(&ss, 0, sizeof ss);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)(void *)&ss;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons((uint16_t)ls->pol.port);
+        a6->sin6_addr = v6;
+        sslen = sizeof(*a6);
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)(void *)&ss;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons((uint16_t)ls->pol.port);
+        a4->sin_addr = v4;
+        sslen = sizeof(*a4);
+    }
+    if (bind(ls->fd, (struct sockaddr *)&ss, sslen) < 0) {
+        LOG_ERROR("stratum bind %s:%d: %s", ba[0] ? ba : "0.0.0.0",
+                  ls->pol.port, strerror(errno));
+        return -1;
+    }
+    LOG_INFO("stratum: listening on %s:%d%s%s (%s)", ba[0] ? ba : "0.0.0.0",
+             ls->pol.port,
+             ls->pol.label[0] ? " " : "", ls->pol.label,
+             dual_stack ? "dual-stack, IPv4 clients un-mapped to dotted quad"
+                        : (family == AF_INET6 ? "IPv6 only" : "IPv4 only"));
+    /* Clamped by net.core.somaxconn, so asking for more than the kernel
+     * allows is harmless -- asking for less than it allows is not. */
+    int backlog = s->cfg.listen_backlog > 0 ? s->cfg.listen_backlog
+                                            : STRATUM_DEFAULT_BACKLOG;
+    if (listen(ls->fd, backlog) < 0) return -1;
+    return 0;
+}
+
+/* Apply a listener's difficulty policy to a connection. Everything after this
+ * point reads the policy off the connection and never looks at the listener. */
+static void conn_apply_listener(stratum_conn_t *c,
+                                const stratum_listener_t *pol) {
+    if (!c || !pol) return;
+    if (pol->initial_diff > 0.0) c->pol_initial_diff = pol->initial_diff;
+    if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
+    if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
+    c->pol_min_diff = pol->min_diff;   /* 0 unless the port promised one */
+    c->pol_port = pol->port;
+    snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
+    /* Before authorize the connection has no assigned difficulty yet, so
+     * seeding it here keeps a subscribe-only conn reporting its port's value
+     * rather than the default it was born with. */
+    if (c->pol_initial_diff > 0.0) c->difficulty = c->pol_initial_diff;
+}
+
+void stratum_conn_apply_listener_for_test(stratum_conn_t *c,
+                                          const stratum_listener_t *pol) {
+    conn_apply_listener(c, pol);
+}
+
 static void *listener_thread(void *arg) {
-    stratum_server_t *s = arg;
+    struct stratum_listener_slot *ls = arg;
+    stratum_server_t *s = ls->srv;
     while (!atomic_load(&s->stop)) {
         struct sockaddr_storage cli;
         socklen_t cl = sizeof(cli);
-        int fd = accept(s->listen_fd, (struct sockaddr *)&cli, &cl);
+        int fd = accept(ls->fd, (struct sockaddr *)&cli, &cl);
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (atomic_load(&s->stop)) break;
@@ -2443,7 +2561,14 @@ static void *listener_thread(void *arg) {
             close(fd);
             continue;
         }
-        if (conn_socket_setup(fd, s->cfg.idle_timeout_sec) < 0) {
+        /* The recv timeout only paces the reaper's wake-ups, so it has to be
+         * armed whenever *either* budget is live — an operator who disabled
+         * the unauthorized timeout but left the authorized one on would
+         * otherwise block in recv() forever and never check it. */
+        int poll_budget = s->cfg.idle_timeout_sec > 0
+                              ? s->cfg.idle_timeout_sec
+                              : s->cfg.idle_timeout_authorized_sec;
+        if (conn_socket_setup(fd, poll_budget) < 0) {
             LOG_WARN("stratum: socket setup failed for accepted fd: %s",
                      strerror(errno));
             close(fd);
@@ -2453,6 +2578,8 @@ static void *listener_thread(void *arg) {
         if (!c) { close(fd); continue; }
         c->fd = fd;
         peer_ip_from_sockaddr(&cli, c->peer_ip, sizeof c->peer_ip);
+        /* The port decides the difficulty. */
+        conn_apply_listener(c, &ls->pol);
         atomic_fetch_add(&s->conn_count, 1);
         conn_register(s, c);
         if (pthread_create(&c->thr, NULL, conn_thread, c) != 0) {
@@ -2485,121 +2612,55 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
 
-    /* A lone server (and every test) allocates its own; main.c passes one in
-     * so the rental port draws extranonce1 from the same sequence and dedupes
-     * against the same ring as the public port. */
-    if (s->cfg.shared) {
-        s->shared = s->cfg.shared;
-        s->shared_owned = 0;
-    } else {
-        s->shared = stratum_shared_new();
-        if (!s->shared) { free(s); return -1; }
-        s->shared_owned = 1;
+    atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
+    pthread_mutex_init(&s->share_dedupe_lock, NULL);
+
+    /* ⛔ Every slot's fd starts at -1, not the 0 calloc leaves behind. The
+     * teardown path below closes `fd >= 0` for every slot up to
+     * listener_count, so a slot that never got as far as socket() would
+     * otherwise close descriptor 0 -- the process's stdin -- on any bind
+     * failure with three or more listeners configured. */
+    for (int i = 0; i < STRATUM_MAX_LISTENERS; ++i) s->listeners[i].fd = -1;
+
+    /* Listener 0 is always bind_port on the server-wide defaults, so a config
+     * naming no extra listeners binds exactly what it always did. The rest
+     * come from cfg.listeners, each overriding the difficulty policy for the
+     * connections it accepts. */
+    s->listeners[0].srv = s;
+    s->listeners[0].pol.port = cfg->bind_port;
+    s->listener_count = 1;
+    for (int i = 0; i < cfg->listener_count &&
+                    s->listener_count < STRATUM_MAX_LISTENERS; ++i) {
+        if (cfg->listeners[i].port <= 0) continue;
+        s->listeners[s->listener_count].srv = s;
+        s->listeners[s->listener_count].pol = cfg->listeners[i];
+        s->listener_count++;
     }
 
-    /* Address family is chosen from bind_addr, and "0.0.0.0" keeps meaning
-     * exactly what it says.
-     *
-     *   ""  / "0.0.0.0"  -> IPv4 wildcard          (unchanged; the default)
-     *   "::"             -> DUAL-STACK wildcard    (IPv6 + IPv4-mapped)
-     *   IPv4 literal     -> that IPv4 address
-     *   IPv6 literal     -> that IPv6 address only (V6ONLY on)
-     *
-     * ⚠️ Deliberately NOT making "0.0.0.0" dual-stack, even though that is
-     * what production runs and would have made this fix arrive for free.
-     * Overloading a wildcard that has one obvious meaning is how a binary
-     * install changes behaviour nobody asked it to. Instead IPv6 is
-     * CONFIG-GATED like every other change in this series: install the binary
-     * and nothing moves; set listen_addr = :: and it turns on; revert is one
-     * config line and no rebuild.
-     *
-     * Why dual-stack at all: both hostnames publish AAAA records and nginx
-     * answers on [::], so the site looks healthy over IPv6 while stratum,
-     * bound IPv4-only, refuses the connection. A miner whose client prefers
-     * AAAA — the RFC 6724 default — never starts mining, and unlike a browser
-     * most mining firmware has no Happy Eyeballs fallback to recover with. */
-    int family = AF_INET;
-    int dual_stack = 0;
-    const char *ba = cfg->bind_addr;
-    struct in_addr  v4 = {0};
-    struct in6_addr v6;
-    if (ba[0] == '\0' || strcmp(ba, "0.0.0.0") == 0) {
-        v4.s_addr = htonl(INADDR_ANY);
-    } else if (strcmp(ba, "::") == 0) {
-        family = AF_INET6; dual_stack = 1; v6 = in6addr_any;
-    } else if (inet_pton(AF_INET, ba, &v4) == 1) {
-        /* explicit IPv4 literal — keeps its own family, so a test binding
-         * 127.0.0.1 is completely untouched by any of this */
-    } else if (inet_pton(AF_INET6, ba, &v6) == 1) {
-        family = AF_INET6;
-    } else {
-        LOG_ERROR("stratum: listen_addr '%s' is not an IPv4 or IPv6 address", ba);
-        if (s->shared_owned) stratum_shared_free(s->shared);
-        free(s);
-        return -1;
-    }
-
-    s->listen_fd = socket(family, SOCK_STREAM, 0);
-    if (s->listen_fd < 0) {
-        if (s->shared_owned) stratum_shared_free(s->shared);
-        free(s);
-        return -1;
-    }
-    int one = 1;
-    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    if (family == AF_INET6) {
-        /* 0 = accept IPv4-mapped connections too; 1 = this family only.
-         * Set EXPLICITLY in both directions: the default is a sysctl
-         * (net.ipv6.bindv6only) and inheriting it means the pool's listening
-         * behaviour depends on a host setting nobody here records. */
-        int v6only = dual_stack ? 0 : 1;
-        if (setsockopt(s->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY,
-                       &v6only, sizeof(v6only)) < 0) {
-            LOG_ERROR("stratum: IPV6_V6ONLY=%d: %s", v6only, strerror(errno));
-            close(s->listen_fd);
-            if (s->shared_owned) stratum_shared_free(s->shared);
-            free(s);
-            return -1;
+    for (int i = 0; i < s->listener_count; ++i) {
+        struct stratum_listener_slot *ls = &s->listeners[i];
+        if (listener_bind(s, ls) < 0) goto bind_failed;
+        if (pthread_create(&ls->thr, NULL, listener_thread, ls) != 0) {
+            goto bind_failed;
         }
+        ls->thr_started = 1;
     }
-
-    struct sockaddr_storage ss;
-    socklen_t sslen;
-    memset(&ss, 0, sizeof ss);
-    if (family == AF_INET6) {
-        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)(void *)&ss;
-        a6->sin6_family = AF_INET6;
-        a6->sin6_port = htons((uint16_t)cfg->bind_port);
-        a6->sin6_addr = v6;
-        sslen = sizeof(*a6);
-    } else {
-        struct sockaddr_in *a4 = (struct sockaddr_in *)(void *)&ss;
-        a4->sin_family = AF_INET;
-        a4->sin_port = htons((uint16_t)cfg->bind_port);
-        a4->sin_addr = v4;
-        sslen = sizeof(*a4);
-    }
-    if (bind(s->listen_fd, (struct sockaddr *)&ss, sslen) < 0) {
-        LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, cfg->bind_port, strerror(errno));
-        close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
-    }
-    LOG_INFO("stratum: listening on %s:%d (%s)", ba[0] ? ba : "0.0.0.0",
-             cfg->bind_port,
-             dual_stack ? "dual-stack, IPv4 clients un-mapped to dotted quad"
-                        : (family == AF_INET6 ? "IPv6 only" : "IPv4 only"));
-    /* Clamped by net.core.somaxconn, so asking for more than the kernel
-     * allows is harmless -- asking for less than it allows is not. */
-    int backlog = cfg->listen_backlog > 0 ? cfg->listen_backlog
-                                          : STRATUM_DEFAULT_BACKLOG;
-    if (listen(s->listen_fd, backlog) < 0) {
-        close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
-    }
-    if (pthread_create(&s->listener_thr, NULL, listener_thread, s) != 0) {
-        close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
-    }
-    s->listener_started = 1;
     *out = s;
     return 0;
+
+    /* A pool that came up on some of its ports is worse than one that did not
+     * come up: the operator sees a running process and a marketplace sees a
+     * refused connection. Tear down whatever bound and fail the start. */
+bind_failed:
+    atomic_store(&s->stop, 1);
+    for (int i = 0; i < s->listener_count; ++i) {
+        struct stratum_listener_slot *ls = &s->listeners[i];
+        if (ls->fd >= 0) { shutdown(ls->fd, SHUT_RDWR); close(ls->fd); ls->fd = -1; }
+        if (ls->thr_started) { pthread_join(ls->thr, NULL); ls->thr_started = 0; }
+    }
+    pthread_mutex_destroy(&s->share_dedupe_lock);
+    free(s);
+    return -1;
 }
 
 void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
@@ -2663,18 +2724,21 @@ void stratum_server_stop(stratum_server_t *s) {
     atomic_store(&s->stop, 1);
     /* shutdown() to break the listener out of accept(), then JOIN, and only
      * then close and clear the fd. Clearing it before the join raced the
-     * listener's own read of s->listen_fd (TSan flagged it 7x in the job
+     * listener's own read of the slot's fd (TSan flagged it 7x in the job
      * rotation stress test) and could have closed the fd while accept() was
      * still using it. After the join nothing else touches the field. */
-    int fd = s->listen_fd;
-    if (fd >= 0) shutdown(fd, SHUT_RDWR);
-    if (s->listener_started) {
-        pthread_join(s->listener_thr, NULL);
-        s->listener_started = 0;
-    }
-    if (fd >= 0) {
-        close(fd);
-        s->listen_fd = -1;
+    for (int i = 0; i < s->listener_count; ++i) {
+        struct stratum_listener_slot *ls = &s->listeners[i];
+        int fd = ls->fd;
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+        if (ls->thr_started) {
+            pthread_join(ls->thr, NULL);
+            ls->thr_started = 0;
+        }
+        if (fd >= 0) {
+            close(fd);
+            ls->fd = -1;
+        }
     }
 
     /* Then drain the connection threads, and do NOT return until they are gone.
@@ -2725,6 +2789,6 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_rwlock_destroy(&s->job_lock);
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
-    if (s->shared_owned) stratum_shared_free(s->shared);
+    pthread_mutex_destroy(&s->share_dedupe_lock);
     free(s);
 }

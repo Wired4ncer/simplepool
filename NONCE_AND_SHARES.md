@@ -54,25 +54,40 @@ coinbase scriptSig layout (assembled at share-check time):
   Each `mining.submit` carries an `en2` value; the miner sweeps it
   independently.
 
-Both widths come from `STRATUM_EXTRANONCE1_SIZE` / `STRATUM_EXTRANONCE2_SIZE`
-in `src/stratum.h`, and the submit path rejects any `en2` that is not exactly
-the advertised width — a mismatched width produces a coinbase whose scriptSig
-length prefix disagrees with its contents, which still hashes like a valid
-header but can never become a block.
+Both widths come from `STRATUM_EXTRANONCE1_SIZE` /
+`STRATUM_EXTRANONCE2_SIZE` in `src/stratum.h`; the `en2` size is what
+the pool reports as the third element of the `mining.subscribe` result.
 
-Together they give each connection **2⁹⁶ distinct coinbases** to try
-before it has to reconnect for a fresh `en1`. At any real hashrate,
-that's effectively unbounded.
+`en1` is fixed for the life of the connection, so each connection has
+**2⁶⁴ distinct coinbases** to try before it would need to reconnect for
+a fresh one; across the pool the `(en1, en2)` pair space is 2⁹⁶. At any
+real hashrate, both are effectively unbounded.
 
-**Why `en2` is 8 and not the classic 4.** Not search space — 4 was already
-unreachable. The reason is *subdivision*. Rented hashrate from a marketplace
-does not arrive as many small miners; it arrives as one aggregated worker
-behind a proxy that splits the `en2` it is handed into a downstream-miner id
-(high bytes) plus that miner's own `en2` (low bytes). At 4 bytes a proxy
-spending 3 on addressing leaves its miners one byte, and some firmware refuses
-to run that narrow — which is why Braiins Hashpower rejects a pool URL
-advertising fewer than 7 outright. At 8 a proxy can spend 3 and still hand
-down the conventional 4.
+#### Why extranonce2 is 8 bytes and not the classic 4
+
+Not for search space. Even at 4 bytes a single connection gets 2⁸⁰
+headers per job (see the version-rolling section below), which a 1 EH/s
+farm would take about two weeks to exhaust — and jobs rotate every
+template. Capacity was never the constraint.
+
+The reason is **subdivision**. A stratum proxy sitting between the pool
+and a farm fans one upstream connection out to many downstream miners
+by splitting the `en2` field it was given: high bytes become a
+downstream-miner id, low bytes are passed down as that miner's own
+`en2`. At 4 bytes upstream, a proxy spending 3 on addressing leaves its
+miners a single byte — 256 values — and some firmware refuses to run
+that narrow. At 8 the proxy can spend 3 and still hand down the
+conventional 4, so every downstream miner sees an ordinary pool.
+
+**Changing these widths is consensus-relevant, not cosmetic.** `cb1`
+ends with the scriptSig length varint, computed once from
+`en1_size + en2_size` when the coinbase is rendered. An `en2` of any
+other width produces a coinbase whose declared scriptSig length
+disagrees with the bytes that follow it — an invalid transaction whose
+header nonetheless hashes fine. `handle_submit` therefore rejects any
+submission whose `en2` is not exactly `job->en2_size`
+(`src/stratum.c`, error `wrong extranonce2 size`) rather than crediting
+a share for work that could never become a block.
 
 For each `en2` the miner picks, it then sweeps the header's 4-byte
 `nonce` field (2³² hashes) and, if version-rolling was negotiated,
@@ -81,9 +96,11 @@ also permutes the masked version bits. So each `en2` value gives
 
 ### Extranonce1 allocation — how uniqueness is guaranteed
 
+In `handle_subscribe` (`src/stratum.c`):
+
 ```c
-/* Straight from the counter — deliberately NOT mixed with the clock. */
-unsigned seq = atomic_fetch_add(&s->shared->extranonce1_seq, 1);
+/* Take extranonce1 straight from the server counter. */
+unsigned seq = atomic_fetch_add(&s->extranonce1_seq, 1);
 uint32_t mix = (uint32_t)seq;
 c->extranonce1[0] = (uint8_t)(mix >> 24);
 c->extranonce1[1] = (uint8_t)(mix >> 16);
@@ -91,27 +108,20 @@ c->extranonce1[2] = (uint8_t)(mix >> 8);
 c->extranonce1[3] = (uint8_t)mix;
 ```
 
-Two properties matter:
+**Uniqueness across concurrent connects** — `atomic_fetch_add` on
+`extranonce1_seq` guarantees that no two connections can read the same
+`seq` value even if they subscribe in the same nanosecond. The counter
+is seeded from the clock once at startup, so a restart doesn't hand out
+the same values to a fresh set of connections.
 
-1. **Uniqueness across concurrent connects** — `atomic_fetch_add` on
-   `extranonce1_seq` guarantees that no two connections can read the
-   same `seq` value even if they subscribe in the same nanosecond.
-   ⚠️ An earlier version XORed the counter with `now_ms()` to get
-   "freshness after wrap". That **destroyed** the guarantee it was
-   meant to strengthen: it collides whenever the delta in the clock
-   equals the delta in the counter, which a miner opening several
-   connections at once hits routinely. The counter is seeded from the
-   clock **once**, at construction, so values still differ across
-   restarts without the collisions.
-2. **Uniqueness across *servers*** — the counter lives in a
-   `stratum_shared_t` that every stratum server in the process shares,
-   not in the server itself. The pool runs two listeners when the
-   rental port is enabled, and two servers each seeding their own
-   clock-derived counter would seed within a millisecond of each other
-   and hand out overlapping `en1` values. Two connections with the same
-   `en1` render identical coinbases, mine identical headers, and find
-   the same hash from the same nonce — half the hashrate wasted and the
-   share credited twice.
+The counter is *not* mixed with the clock at use. An earlier version
+did (`seq ^ now_ms()`), and that destroyed the uniqueness guarantee it
+was meant to reinforce: the XOR collides whenever the delta in the
+clock equals the delta in the counter — an even `seq` at an even
+millisecond and the next `seq` one millisecond later land on the same
+value. A miner opening several connections at once hit that routinely,
+and two connections sharing an `en1` render identical coinbases, so
+both find the same hash from the same nonce.
 
 **No two miners on the pool are searching the same
 `(header, coinbase, nonce)` triple.** That's the fairness guarantee
@@ -142,7 +152,8 @@ into the header's `version` field.
 Current default mask: **`0x1fffe000`** — the 16 bits between position
 13 and 28. That expands the effective per-`(en1, en2)` search space by
 2¹⁶, so a single `en2` value covers 2³² × 2¹⁶ = 2⁴⁸ ≈ 280 trillion
-headers.
+headers, and one connection covers 2⁶⁴ × 2⁴⁸ = 2¹¹² over the full `en2`
+sweep.
 
 **The pool never re-uses a version-rolled header for share
 validation**: on submit, the miner tells us the exact rolled version
@@ -150,6 +161,34 @@ they used (`rolled=…` in the `[SUBMIT CHECK]` log lines), we
 reconstruct the header they hashed, we re-hash it ourselves, and we
 compare *that* hash against the worker/network targets. Any
 manipulation outside the mask is rejected as invalid.
+
+### Rolling ntime
+
+The third multiplier, and the only one that needs no negotiation at
+all. A miner may advance the header's `ntime` while it holds a job; the
+pool takes the value submitted, puts it in the header verbatim, and
+treats every distinct value as a distinct share. The per-connection
+dedupe key includes `ntime`, so rolling it produces genuinely new work
+rather than repeats of the same one.
+
+It is bounded, and the bound is there for the chain's sake rather than
+the pool's. Consensus refuses a block whose timestamp is more than two
+hours ahead of network-adjusted time — but such a header still hashes,
+still clears a share target, and looks like perfectly good work here.
+Without a check the pool credits it, and if it happens to beat the
+network target, assembles a block that `submitblock` then throws out: a
+solved block lost with nothing but a warning in the log.
+
+    job.ntime - 600  ≤  submitted ntime  ≤  job.ntime + 7200
+
+Measured from the job rather than the wall clock, which keeps it
+conservative: a job only gets older while the miner holds it, so
+anything inside this window is inside the consensus window too. The
+backward tolerance exists because a stratum proxy that rewrites the
+field, or a rig with a skewed clock, can land slightly behind — that is
+honest work and rejecting it would cost the miner shares. Both ends are
+deliberately loose. This catches a broken client; it does not police
+timestamps.
 
 ---
 
@@ -182,9 +221,26 @@ different `share_hash`, which then fails the target check → reject.
 
 Every share is checked against TWO thresholds:
 
-- **Worker target** — the difficulty the pool is currently holding
-  this connection at (set via `mining.set_difficulty` per vardiff).
-  A hash below this counts as an accepted share and earns PPS credit.
+- **Worker target** — the difficulty *the submitted job* went out
+  under, not whatever the connection has drifted to since. A hash
+  below this counts as an accepted share and earns PPS credit.
+
+  The distinction matters because `mining.set_difficulty` takes effect
+  on the *next* job the miner is notified of. A miner still working a
+  job it was handed before a retarget is mining to the difficulty that
+  job carried, and on a slow chain those shares keep arriving long
+  after the retarget. The pool records the difficulty each job was
+  notified under, per connection, and judges the submit against that —
+  so any number of retargets can happen in between without turning
+  honest work into rejects. A share is credited at the difficulty it
+  is judged under.
+
+  Some firmware applies a `set_difficulty` to work already in hand
+  rather than waiting for the next job. When that moves the difficulty
+  *down*, the resulting shares are below what the job was sent at but
+  are exactly what the miner was told to do, so they are accepted at
+  the lower value. A share is never credited at a difficulty it did
+  not actually meet.
 
 - **Network target** — the current chain difficulty from
   `getblocktemplate` / the enforcer. A hash below this is a valid
@@ -204,25 +260,57 @@ counts both as a paid share AND a block.
 
 ### The share validation flow
 
-`src/stratum.c` — the submit path:
+`src/stratum.c` — the submit path. The first four steps are refusals
+that cost nothing, deliberately placed before any hashing: each one
+describes a header that could never become a block, so validating it
+would be effort spent to reach the same answer more slowly.
 
-1. Look up the job by `job_id`. If unknown / expired → reject with
-   `stale share`.
-2. Reconstruct the coinbase from cached `cb1/cb2` + `(en1, en2)`.
-3. Compute the merkle root from `dsha256(coinbase) → branches`.
-4. Reconstruct the header with the miner's `version|ntime|nonce`.
-5. `dsha256(header)` → `sent_hash`.
-6. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
-   `network_target`, and version fields (this is what appears in
-   `logs/simplepool.log`).
-7. Compare against both targets:
-   - `sent_hash > worker_target` → reject with `low difficulty`,
-     insert a row into `rejects`.
-   - Otherwise → insert a row into `shares` with the SHA256 of the
-     header as `block_hash` (nullable elsewhere), the connection's
-     difficulty as the share's difficulty, and `is_block = 1` iff
-     `sent_hash ≤ network_target`.
-   - If block: also enqueue `submitblock` to the backend.
+1. **Submit ceiling.** If the connection is past
+   `max_submits_per_sec` for the current second → reject with
+   `submitting too fast`, before the parameters are even read. Reported
+   periodically with a count rather than once per refusal, so a flood
+   does not write itself into the table that exists to account for
+   shares.
+2. Look up the job by `job_id`. If unknown / expired → reject with
+   `stale or unknown job`.
+3. **Per-connection dedupe.** A repeat of
+   `(job_id, en2, ntime, nonce, version)` this connection already sent
+   → reject with `duplicate share`.
+4. **ntime bounds.** The submitted `ntime` must lie within
+   `-600 s … +7200 s` of the value this job went out with → otherwise
+   reject with `ntime out of range`. See *Rolling ntime* above for why
+   an unbounded timestamp costs blocks rather than shares.
+5. **extranonce2 width.** `len(en2)` must be exactly the 8 bytes
+   advertised on `mining.subscribe` → otherwise reject with
+   `wrong extranonce2 size`. The width is baked into `cb1`'s scriptSig
+   length varint, so any other width describes a transaction that
+   cannot be mined.
+6. Reconstruct the coinbase from cached `cb1/cb2` + `(en1, en2)`.
+7. Compute the merkle root from `dsha256(coinbase) → branches`.
+8. Reconstruct the header with the miner's `version|ntime|nonce`.
+9. `dsha256(header)` → `sent_hash`.
+10. **Global hash dedupe.** If this exact hash has already been
+    credited — on any connection, under any job id — → reject with
+    `duplicate share`. One solution is one solution regardless of how
+    the submission was framed.
+11. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
+    `network_target`, and version fields (this is what appears in
+    `logs/simplepool.log`).
+12. Compare against both targets:
+    - `sent_hash > worker_target` **and** `sent_hash > network_target`
+      → reject with `low difficulty`, insert a row into `rejects`.
+    - Otherwise → insert a row into `shares` with the SHA256 of the
+      header as `block_hash` (nullable elsewhere), **the difficulty
+      that job went out under** as the share's difficulty (see *The two
+      targets* — not whatever the connection has drifted to since), and
+      `is_block = 1` iff `sent_hash ≤ network_target`.
+    - If block: also enqueue `submitblock` to the backend.
+
+Note the order of the last comparison. The network verdict wins over
+the share verdict: on a low-difficulty chain a share target can be
+*harder* than the network target, so a hash may be a valid block while
+failing the share check. That one has to be submitted, never rejected —
+and it is credited at the difficulty it provably met.
 
 ### Vardiff
 
@@ -236,7 +324,60 @@ share-rate (`vardiff_target_spm` shares/minute, default 12). See
 - `vardiff_window_sec` — how often to retarget
 
 `mining.set_difficulty` fires whenever the connection's target changes.
-The active job stays valid — the target check is per-share.
+The active job stays valid — the target check is per-share, and every
+job already carries the difficulty it went out under (see *The two
+targets*), so work the miner is already holding stays acceptable at
+that difficulty for as long as the job itself lives.
+
+Two things bound the result, and on a low-difficulty chain they pull in
+opposite directions:
+
+- **The network ceiling.** Share difficulty is not raised above the
+  network difficulty, because a miner filters locally against the
+  stratum target — a share target harder than the network target makes
+  it discard valid blocks before the pool ever sees them.
+- **The port's promised floor.** A listener may state a `min_diff`, and
+  that floor is kept *even where the chain's own difficulty is lower*.
+
+Where they meet, the floor wins. A rented-hashrate marketplace measures
+the difficulty on the wire, not the one a port advertises, so a port
+that promised 65536 and quietly served 1200 has its order cancelled
+with nothing on the pool side recording why. What that costs is blocks:
+miners on such a port discard roughly `min_diff / network_difficulty`
+of the solutions they find. The pool warns at startup for every port in
+that position, and the dashboard reports it.
+
+This is affordable only because the floor is **per-port and opt-in**.
+`promised_min_diff` is recorded separately from `vardiff_min` precisely
+so the two can be told apart: a listener that never stated one — which
+includes `listen_port`, every regtest config, and any young forknet —
+is clamped exactly as it always was and keeps every block.
+
+### Per-port difficulty policy
+
+One difficulty cannot serve both a home ASIC and a rented fleet. A
+marketplace aggregates the whole fleet behind a *single* connection, so
+1 PH/s at difficulty 1024 is ~227 shares per second down one socket,
+and vardiff cannot bridge the gap — it moves at most 4x per window, so
+climbing from 1 to 65536 takes eight windows and the reject flood on
+the way is what gets the order cancelled. The miner has to *arrive* at
+the right difficulty:
+
+```
+listener = port=3335 min_diff=65536 label=braiins
+listener = port=3336 min_diff=500000 label=nicehash
+```
+
+Each listener binds its own port; connections accepted there start at
+that difficulty and never vardiff below it, while `listen_port` keeps
+serving home miners unchanged. A config naming no listeners binds
+exactly what it always did.
+
+A connection's share rate is also capped outright by
+`max_submits_per_sec` (default 20000, per connection). Nothing stops
+hashrate and assigned difficulty from being badly mismatched — a fleet
+pointed at a home-miner port is the usual cause — and past the ceiling
+a submit is refused before any validation work.
 
 ### Difficulty of a share
 
@@ -544,6 +685,10 @@ ORDER  BY ts DESC;
 | `blocks_found` rows stuck at `pending` | nothing can verify them: the backend does not serve `getblockhash` and no template has been observed at their height+1 | expected against the CUSF enforcer; they count as nothing until verified |
 | many `orphaned` candidates | the pool's blocks keep losing races — a slow or badly-peered node, or templates lagging the tip | check the "Blocks reaching the chain" health check and the node's peer count |
 | dashboard hashrate lower than the miner's own display | actual delivery is lower than the miner claims (thermal / net / firmware); nonce distribution is fine | see [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md) troubleshooting |
+| hashrate reads low for a rig that just connected, or a pool that just started | **no longer a thing.** Every rate is divided by the span the shares actually cover, not the nominal window, so a rig ten minutes into a 24h window is measured over ten minutes | if a pre-0.3.0 dashboard is reading a 0.3.0 DB, that is the version gap, not the data |
+| rejects reading `ntime out of range` | the rig rolled `ntime` outside `job.ntime - 600 … + 7200`; usually a badly wrong clock | compare the rig's clock to the pool host's |
+| rejects reading `submitting too fast` | the connection is past `max_submits_per_sec` — almost always a fleet on a port whose difficulty is far too low for it | move it to a port with a `min_diff`, or raise the ceiling if the low difficulty is deliberate |
+| a rental port serves a lower difficulty than configured | it set `vardiff_min` but not `min_diff`; only a promised floor survives the network-difficulty ceiling | add `min_diff=` to that `listener` line — and read what it costs in blocks first |
 | single share value looks tiny | vardiff pushed worker difficulty down; per-share reward compresses; but shares_per_minute is up so payout per minute stays the same | look at `Σ difficulty` per hour on the audit page — that number is invariant to vardiff |
 
 ---

@@ -314,9 +314,40 @@ cmd_doctor() {
         else fail "$s — journalctl -u ${u%.service} -n 50"; fi
     done
 
-    check "stratum port ${STRATUM_PORT} accepting connections"
-    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE ":${STRATUM_PORT}\b"; then pass
-    else fail "nothing is listening on :${STRATUM_PORT} — miners cannot connect"; fi
+    # Every port the pool is configured to bind, not just the main one. A
+    # rental port that never came up looks identical to a healthy pool from
+    # here, and identical to a dead one from the marketplace renting to it.
+    local _ports=("$STRATUM_PORT") _lp
+    while read -r _lp; do
+        [[ -n "$_lp" ]] && _ports+=("$_lp")
+    done < <(grep -E '^[[:space:]]*listener[[:space:]]*=' "$ROOT/proxy.conf" 2>/dev/null \
+             | grep -oE 'port=[0-9]+' | cut -d= -f2 | sort -un)
+
+    # ufw status needs root; without it this reports inactive and the firewall
+    # checks are skipped, which is the right way to be wrong here — a false
+    # "your firewall is blocking miners" is worse than no answer.
+    local _ufw=0
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        _ufw=1
+    fi
+
+    local _p
+    for _p in "${_ports[@]}"; do
+        check "stratum port ${_p} accepting connections"
+        if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE ":${_p}\b"; then pass
+        else fail "nothing is listening on :${_p} — miners cannot connect"; fi
+
+        # Listening and reachable are different questions, and only one of
+        # them is visible in the log. A port the pool bound while ufw drops
+        # every connection to it prints "stratum listening on :${_p}" and then
+        # refuses every miner, which is how an operator ends up debugging the
+        # pool instead of the firewall.
+        if [[ "$_ufw" == "1" ]]; then
+            check "firewall allows port ${_p}"
+            if ufw status 2>/dev/null | grep -qE "^${_p}(/tcp)?[[:space:]]+ALLOW"; then pass
+            else fail "ufw is active and :${_p} is not allowed — the pool is listening and every miner is refused: sudo ufw allow ${_p}/tcp"; fi
+        fi
+    done
 
     head_ "disk"
     check "free space on $(df -P "$ROOT" 2>/dev/null | awk 'NR==2{print $6}')"

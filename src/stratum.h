@@ -46,30 +46,54 @@ typedef struct stratum_job stratum_job_t;
 #define STRATUM_EXTRANONCE1_SIZE 4
 #define STRATUM_EXTRANONCE2_SIZE 8
 
-/* State that must be common to every stratum server in the process.
+/* A listening port and the difficulty policy for the miners that arrive on
+ * it. The pool serves one kind of miner badly if it serves only one policy:
+ * a home ASIC needs a difficulty low enough to report shares regularly, and
+ * an aggregated fleet from a hashrate marketplace needs one high enough that
+ * its share rate stays sane -- 1 PH/s at difficulty 1024 is ~227 shares per
+ * second down a single connection, and the marketplaces refuse to deliver
+ * below their own floor for exactly that reason.
  *
- * Two things in a server are only correct while there is exactly one of them,
- * and both silently produce double-credited shares once a second server
- * exists (the rental port):
+ * One difficulty cannot be both, and vardiff cannot bridge it: it moves by at
+ * most 4x per window, so climbing from 1 to 65536 takes eight windows -- four
+ * minutes at the default -- and the reject flood on the way there is what
+ * gets a rented order cancelled. Hence a port per policy, each one already at
+ * the right difficulty when the miner connects.
  *
- *   - the extranonce1 counter. It is seeded from the clock at startup, so two
- *     servers constructed in the same process seed within a millisecond of
- *     each other and hand out overlapping extranonce1 values. Two connections
- *     with the same extranonce1 render identical coinbases, mine identical
- *     headers, and find the same hash from the same nonce.
- *   - the share dedupe ring, which is what would otherwise catch exactly that.
- *     Per-server rings are blind to each other, so the collision happens *and*
- *     the guard against it is looking the wrong way.
+ * A field left at 0 falls back to the server-wide default.
  *
- * Servers sharing one of these draw extranonce1 from a single sequence and
- * dedupe against a single ring. Pass the same pointer to every
- * stratum_server_start() in the process; leave cfg.shared NULL and the server
- * allocates a private one, which is the correct behaviour for a lone server
- * and for every test. */
-typedef struct stratum_shared stratum_shared_t;
+ * ⓘ This replaces our two-`stratum_server_t` design and the `stratum_shared_t`
+ * that guarded it. Two servers in one process seeded extranonce1 from the
+ * clock milliseconds apart, handed out overlapping values, rendered identical
+ * coinbases, and deduped against per-server rings that were blind to each
+ * other -- so the collision happened AND its guard looked the wrong way. One
+ * server with N listener threads cannot reach that state at all: there is a
+ * single sequence and a single ring because there is a single server. The
+ * hazard class is deleted rather than defended. */
+typedef struct {
+    int    port;
+    double initial_diff;
+    double vardiff_min;
+    double vardiff_max;
+    /* The floor this port promises, set only when the operator wrote
+     * min_diff=. Unlike vardiff_min -- which merely bounds the rate loop, and
+     * which the network-difficulty ceiling overrides -- this one is kept even
+     * when the chain's own difficulty is lower, because a marketplace
+     * measures the difficulty on the wire and cancels an order that comes in
+     * under what the port advertised. Left 0 by any listener that did not ask
+     * for one, which is how the default port and every low-difficulty chain
+     * keep their existing behaviour. See clamp_assigned_difficulty.
+     *
+     * ⚠️ This is the one place a port policy outranks the chain. Our own
+     * rental-port note recorded the opposite behaviour as a limitation the
+     * network clamp forced on us; upstream's design fixes it. */
+    double min_diff;
+    /* Free-form, for logs and for the dashboard to tell miners which port to
+     * point which machine at. Empty for the default listener. */
+    char   label[32];
+} stratum_listener_t;
 
-stratum_shared_t *stratum_shared_new(void);
-void              stratum_shared_free(stratum_shared_t *sh);
+#define STRATUM_MAX_LISTENERS 8
 
 /* Create a job from template fields. The coinbase is *not* baked into the
  * job — each connection renders its own coinbase paying its miner address
@@ -237,11 +261,27 @@ typedef struct {
      * before anyone thought to read it. */
     int    listen_backlog;
 
-    /* Shared across every server in the process; NULL = allocate a private
-     * one. See stratum_shared_t above — this is not optional when more than
-     * one server runs, it is what keeps extranonce1 unique and share dedupe
-     * effective across ports. */
-    stratum_shared_t *shared;
+    /* Extra listeners beyond bind_port, each with its own difficulty policy.
+     * bind_port is always served, using the server-wide defaults, so a config
+     * that names none of these behaves exactly as before. */
+    stratum_listener_t listeners[STRATUM_MAX_LISTENERS];
+    int    listener_count;
+
+    /* Ceiling on mining.submit per second, per connection. 0 disables.
+     *
+     * A connection's share rate is its hashrate divided by the difficulty it
+     * was assigned, and nothing stops those from being wildly mismatched: an
+     * aggregated fleet pointed at a home-miner port is 1 PH/s against
+     * difficulty 1, which is ~232,000 submits per second down one socket.
+     * Validating a submit costs about 9 microseconds, so that single
+     * connection asks for more than two cores -- and every share it lands
+     * goes through the store's ring, which drops events once full. Work the
+     * miner was told was accepted then never gets credited.
+     *
+     * ⛔ Ships OFF (0) and stays off until real miner behaviour has been
+     * measured against it -- same discipline as the five gate keys. Refusing
+     * a submit is a miner-visible action; it does not get a default. */
+    int    max_submits_per_sec;
 
     void  *ctx;
     share_observer_fn  on_share;
@@ -292,6 +332,12 @@ int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
                                    const uint8_t **cb2, size_t *cb2_len,
                                    const uint8_t **en1);
 double      stratum_conn_difficulty_for_test(const stratum_conn_t *c);
+/* Apply a listener's difficulty policy to a connection, exactly as the accept
+ * path does when a miner arrives on that port. Exposed so per-port policy can
+ * be tested without binding a fixed port, which in CI is a race with whatever
+ * else is on the box. */
+void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
+                                                 const stratum_listener_t *pol);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);

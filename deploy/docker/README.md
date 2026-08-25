@@ -9,7 +9,9 @@ compose stack (typically on the same host).
 - Docker Engine 24+ with the `compose` plugin
 - A running Bitcoin Core (mainnet / forknet) reachable from this host
 - A running Thunder daemon with JSON-RPC exposed on some host:port
-- Ports **3334** (stratum) and **8081** (dashboard, override via env) free
+- Ports **3334** (stratum) and **8081** (dashboard, override via env) free,
+  plus any extra stratum ports you declare with `listener` lines in
+  `proxy.conf`
 
 ## First run
 
@@ -51,7 +53,9 @@ Everything reads/writes the same SQLite file via a shared bind mount:
 
 - **simplepool** uses `network_mode: host` so miners hit `:3334` without NAT
   and so `bitcoind_url = http://127.0.0.1:8332` in `proxy.conf` works
-  unchanged from bare-metal setups.
+  unchanged from bare-metal setups. Host networking also means extra
+  `listener` ports need no compose change to be reachable — but they do need
+  opening in the host firewall, which nothing here does for you.
 - **dashboard** and **payout** use the default bridge; they reach Thunder via
   `host.docker.internal:6009` (which `extra_hosts` maps to the host gateway
   on Linux, native on macOS/Windows). If Thunder lives on a different box,

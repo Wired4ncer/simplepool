@@ -50,6 +50,15 @@ test('a short reserve retries well before tomorrow', () => {
     assert.equal(nextDelayMs(cfg, res), cfg.retryIntervalMs);
 });
 
+test('a tick blocked on an unmined mempool retries in minutes, not tomorrow', () => {
+    /* Nothing was broadcast and nobody was credited, so this is a tick that
+     * got nowhere rather than a completed run. The mempool it is waiting on
+     * clears in one Thunder block; sleeping off the daily interval would
+     * strand the queue for a day behind it. */
+    const res = { attempted: 0, paid: 0, failed: 0, settled: 0, mempool_blocked: 1 };
+    assert.equal(nextDelayMs(cfg, res), cfg.retryIntervalMs);
+});
+
 test('an undetermined settlement backs off to the retry clock, not the settle clock', () => {
     /* Terminal until an operator reconciles it — re-logging the CANNOT
      * DETERMINE error every 30s for a day would bury everything else. */

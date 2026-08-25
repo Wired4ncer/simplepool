@@ -49,17 +49,7 @@ export class ThunderClient {
         const body = await res.json();
         if (body.error) {
             const e = body.error;
-            const err = new Error(`thunder rpc ${method}: ${e.code} ${e.message}`);
-            /* The node ran the method and answered with an error. For
-             * submit_transaction that is a definitive "not broadcast" — the
-             * ordinary case being a mempool rejection — which lets the payout
-             * loop release the batch and retry instead of parking it for a
-             * human. Everything else that can throw here (transport failure,
-             * abort/timeout, a non-JSON or non-200 reply) means we never got an
-             * answer, carries no such flag, and must be treated as "it may have
-             * gone out". See runOnce in payout.js. */
-            err.rpcRejected = true;
-            throw err;
+            throw new Error(`thunder rpc ${method}: ${e.code} ${e.message}`);
         }
         return body.result;
     }
@@ -92,6 +82,31 @@ export class ThunderClient {
             return { known: tx !== null, confirmed: blockHash !== null, blockHash };
         } catch (e) {
             return { known: false, confirmed: false, blockHash: null, error: e.message };
+        }
+    }
+
+    /* How many transactions Thunder is holding but has not mined.
+     *
+     * `get_block_template` assembles the block Thunder WOULD blind-merge-mine
+     * right now, so its body is the mempool. Nothing is requested and no BMM
+     * bid is spent by asking.
+     *
+     * The payout loop uses this as a pre-flight check, and the reason it is
+     * meaningful there is that settlePending() runs first: once that reports
+     * nothing outstanding, anything still in the mempool is a transaction the
+     * ledger has no record of — and it is spending the same wallet UTXOs the
+     * next transfer would. See the gate in runOnce().
+     *
+     * Never throws. An unreachable node reports { ok: false }, which callers
+     * must read as "cannot tell", never as "blocked": refusing to pay because
+     * a diagnostic RPC is down would be an outage of its own. */
+    async mempool() {
+        try {
+            const t = await this._call('get_block_template', []);
+            const txs = t?.block?.body?.transactions;
+            return { ok: true, count: Array.isArray(txs) ? txs.length : 0 };
+        } catch (e) {
+            return { ok: false, count: 0, error: e.message };
         }
     }
 
@@ -165,11 +180,15 @@ export class ThunderClient {
                     `full ${total} sats to ${recipients[0].address}, but this batch has ` +
                     `${distinct.size} distinct addresses. Funds are on the network -- ` +
                     `reconcile by hand (payout/README.md).`));
-                /* The txid is known here even though this is an error path, and it
-                 * is the one thing reconciliation cannot proceed without. Carry it
-                 * so the caller records it in tx_attempts rather than leaving the
-                 * operator to find the transaction themselves. */
-                err.txid = nodeTxid;
+                /* Hand the txid back. This is not a clean abort: a live
+                 * transaction is holding the wallet's UTXOs, and a caller that
+                 * drops its in-flight rows here has no record that anything went
+                 * out — so it retries into `utxo double spent` on every tick
+                 * from then on. avonpool did that 216 times over 24h. Keeping
+                 * the rows against this txid makes settlePending() block the
+                 * queue instead, which is the correct response to funds on the
+                 * network that we did not intend to send. */
+                err.broadcastTxid = nodeTxid;
                 throw err;
             }
             return { txid: nodeTxid, unsigned: null, signed: null,

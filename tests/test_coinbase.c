@@ -1,4 +1,5 @@
 #include "coinbase.h"
+#include "stratum.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -725,6 +726,114 @@ static void test_address_network(void) {
     printf("ok: address -> network\n");
 }
 
+/* The scriptSig length varint lives in cb1, and is computed from
+ * en1_size + en2_size at render time. If the extranonces spliced in later
+ * are not exactly that wide, the varint disagrees with the bytes that follow
+ * and the transaction is malformed -- valid-looking to a hasher, rejected by
+ * the network. Pin the agreement at the width the pool actually advertises,
+ * so a change to STRATUM_EXTRANONCE2_SIZE that misses a call site fails here
+ * rather than on a found block. */
+static void test_scriptsig_length_matches_advertised_extranonce(void) {
+    const size_t en1 = STRATUM_EXTRANONCE1_SIZE;
+    const size_t en2 = STRATUM_EXTRANONCE2_SIZE;
+
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
+                                "6a24aa21a9ed2222222222222222222222222222"
+                                "222222222222222222222222222222222222",
+                                "/simplepool/",
+                                en1, en2, &parts, NULL, NULL,
+                                err, sizeof err) == 0);
+
+    /* Assemble the coinbase exactly as handle_submit does. */
+    size_t total = parts.cb1_len + en1 + en2 + parts.cb2_len;
+    uint8_t *tx = (uint8_t *)malloc(total);
+    assert(tx);
+    size_t o = 0;
+    memcpy(tx + o, parts.cb1, parts.cb1_len); o += parts.cb1_len;
+    memset(tx + o, 0xaa, en1);                o += en1;
+    memset(tx + o, 0xbb, en2);                o += en2;
+    memcpy(tx + o, parts.cb2, parts.cb2_len);
+
+    /* Walk to the scriptSig varint: version(4) | varint(vin) | prevout(36). */
+    size_t off = 4;
+    uint64_t vin = 0;
+    assert(read_varint(tx, total, &off, &vin) == 0 && vin == 1);
+    off += 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(tx, total, &off, &ss_len) == 0);
+
+    /* The declared length must cover the real scriptSig contents, and the
+     * extranonce bytes must be the last thing inside it. */
+    assert(ss_len <= 100);
+    size_t ss_end = off + (size_t)ss_len;
+    assert(ss_end <= total);
+    for (size_t i = 0; i < en1; i++) assert(tx[ss_end - en1 - en2 + i] == 0xaa);
+    for (size_t i = 0; i < en2; i++) assert(tx[ss_end - en2 + i] == 0xbb);
+    /* Sequence follows immediately -- proof the varint did not run short. */
+    for (int i = 0; i < 4; i++) assert(tx[ss_end + i] == 0xff);
+
+    free(tx);
+    coinbase_parts_free(&parts);
+    printf("ok: scriptSig length agrees with en1=%zu en2=%zu\n", en1, en2);
+}
+
+/* The same cb1 assembled with a wrong-width extranonce2 -- what a miner that
+ * ignored mining.subscribe would produce -- must not parse as a well-formed
+ * coinbase. This is the failure the stratum-side length check prevents. */
+static void test_wrong_width_extranonce_desyncs_the_parse(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
+                                "6a24aa21a9ed2222222222222222222222222222"
+                                "222222222222222222222222222222222222",
+                                "/simplepool/",
+                                STRATUM_EXTRANONCE1_SIZE,
+                                STRATUM_EXTRANONCE2_SIZE, &parts, NULL, NULL,
+                                err, sizeof err) == 0);
+
+    /* Splice in the classic 4-byte extranonce2 instead of the reserved width. */
+    size_t n = parts.cb1_len * 2 + (STRATUM_EXTRANONCE1_SIZE + 4) * 2
+             + parts.cb2_len * 2 + 1;
+    char *hex = (char *)malloc(n);
+    assert(hex);
+    size_t o = 0;
+    for (size_t i = 0; i < parts.cb1_len; i++)
+        o += (size_t)sprintf(hex + o, "%02x", parts.cb1[i]);
+    for (size_t i = 0; i < STRATUM_EXTRANONCE1_SIZE + 4; i++)
+        o += (size_t)sprintf(hex + o, "%02x", 0xcc);
+    for (size_t i = 0; i < parts.cb2_len; i++)
+        o += (size_t)sprintf(hex + o, "%02x", parts.cb2[i]);
+    hex[o] = '\0';
+
+    int spend = -1, opret = -1;
+    int rc = coinbase_count_outputs(hex, &spend, &opret);
+    /* Either the parse fails outright or it reports something other than the
+     * real output set -- never a clean, correct read. */
+    assert(!(rc == 0 && spend == 2 && opret == 1));
+
+    free(hex);
+    coinbase_parts_free(&parts);
+    printf("ok: wrong-width extranonce2 does not parse as a valid coinbase\n");
+}
+
+/* Consensus caps the coinbase scriptSig at 100 bytes. Unreachable through
+ * config today (height push + a 76-byte tag + 12 extranonce bytes is 93),
+ * but the guard is what keeps a future widening from emitting a coinbase
+ * that only fails at the network. */
+static void test_scriptsig_over_100_is_rejected(void) {
+    coinbase_parts_t parts = {0};
+    char err[256] = {0};
+    int rc = coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0,
+                                  NULL, "/simplepool/",
+                                  /* en1 */ 4, /* en2 */ 90,
+                                  &parts, NULL, NULL, err, sizeof err);
+    assert(rc < 0);
+    assert(strstr(err, "scriptSig length") != NULL);
+    printf("ok: oversized coinbase scriptSig rejected (%s)\n", err);
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -741,6 +850,9 @@ int main(void) {
     test_build_from_template_multi_sum_check();
     test_count_outputs();
     test_address_network();
+    test_scriptsig_length_matches_advertised_extranonce();
+    test_wrong_width_extranonce_desyncs_the_parse();
+    test_scriptsig_over_100_is_rejected();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }

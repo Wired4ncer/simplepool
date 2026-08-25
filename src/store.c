@@ -367,6 +367,10 @@ static const char *MIGRATIONS_SQL[] = {
     "ALTER TABLE pool_meta    ADD COLUMN coinbase_tag     TEXT",
     "ALTER TABLE pool_meta    ADD COLUMN operator_address TEXT",
     "ALTER TABLE pool_meta    ADD COLUMN pool_btc_address TEXT",
+    /* Stratum ports and their difficulty policies. NULL on an upgraded DB
+     * until the proxy restarts, which the dashboard renders as "not
+     * published yet" rather than claiming the pool has one port. */
+    "ALTER TABLE pool_meta    ADD COLUMN listeners        TEXT",
     /* Block accounting. Every pre-existing row becomes 'pending' — which
      * counts as nothing — rather than being assumed good: the rows were
      * written unconditionally, including for candidates submitblock had
@@ -1356,7 +1360,8 @@ int store_record_pool_identity(store_t *s, const char *network,
                                const char *network_source,
                                const char *coinbase_tag,
                                const char *operator_address,
-                               const char *pool_btc_address)
+                               const char *pool_btc_address,
+                               const char *listeners_json)
 {
     if (!s) return -1;
     /* Upserts the same id=1 row as store_record_pool_meta(), but only the
@@ -1371,14 +1376,15 @@ int store_record_pool_identity(store_t *s, const char *network,
      * blank". */
     static const char *Q =
         "INSERT INTO pool_meta (id, network, network_source, coinbase_tag,"
-        "  operator_address, pool_btc_address) "
-        "VALUES (1, ?, ?, ?, ?, ?) "
+        "  operator_address, pool_btc_address, listeners) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
         "  network = excluded.network,"
         "  network_source = excluded.network_source,"
         "  coinbase_tag = excluded.coinbase_tag,"
         "  operator_address = excluded.operator_address,"
-        "  pool_btc_address = excluded.pool_btc_address";
+        "  pool_btc_address = excluded.pool_btc_address,"
+        "  listeners = excluded.listeners";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
         atomic_fetch_add(&s->pg_errors, 1);
@@ -1393,6 +1399,14 @@ int store_record_pool_identity(store_t *s, const char *network,
         sqlite3_bind_text(st, 5, pool_btc_address, -1, SQLITE_TRANSIENT);
     } else {
         sqlite3_bind_null(st, 5);
+    }
+    /* NULL rather than "[]" when there is nothing to say, so the dashboard
+     * can tell "this proxy predates the column" from "this pool really does
+     * serve one port". */
+    if (listeners_json && listeners_json[0]) {
+        sqlite3_bind_text(st, 6, listeners_json, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(st, 6);
     }
     int rc = sqlite3_step(st);
     pthread_mutex_unlock(&s->node_tip_mu);
