@@ -177,9 +177,16 @@ static void test_listener_line_parses(void) {
     CHECK(rc == 0);
     CHECK(cfg.listener_count == 1);
     CHECK(cfg.listeners[0].port == 3335);
-    CHECK(cfg.listeners[0].min_diff == 500000.0);
+    /* `min_diff=` drives THREE fields, and the two that matter operationally
+     * are vardiff_min and initial_diff — that pairing is the whole point of a
+     * rental port, because the miner has to arrive already at the floor.
+     * min_diff itself only records that the operator asked, for the
+     * marketplace warning and the startup log. ⛔ It is NOT a second
+     * enforcement path that outranks the network clamp, which is where
+     * upstream differs — see stratum_listener_t.min_diff. */
     CHECK(cfg.listeners[0].vardiff_min == 500000.0);
     CHECK(cfg.listeners[0].initial_diff == 500000.0);
+    CHECK(cfg.listeners[0].min_diff == 500000.0);
     CHECK(strcmp(cfg.listeners[0].label, "braiins") == 0);
     /* The public port is untouched by any of it. */
     CHECK(cfg.listen_port == 3334);

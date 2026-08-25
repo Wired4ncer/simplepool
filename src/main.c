@@ -1730,7 +1730,7 @@ int main(int argc, char **argv) {
          * the server actually bound, whichever config spelling produced it. */
         for (int i = 0; i < cfg.listener_count; ++i) {
             LOG_INFO("stratum listening on %s:%d [%s] at difficulty %.0f "
-                     "(promised floor, kept even below network difficulty)",
+                     "(vardiff floor; the network difficulty still clamps it down)",
                      cfg.listen_addr, cfg.listeners[i].port,
                      cfg.listeners[i].label[0] ? cfg.listeners[i].label : "-",
                      cfg.listeners[i].min_diff);

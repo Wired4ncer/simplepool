@@ -2219,8 +2219,14 @@ static void test_listener_policy_reaches_the_connection(void) {
     /* Born on the server-wide default. */
     CHECK(stratum_conn_difficulty_for_test(c) == 1.0);
 
+    /* ⛔ min_diff is deliberately NOT set here. It is a record of operator
+     * intent that drives the config warning and the startup log; it is not a
+     * connection-level enforcement path, and setting it in a policy test
+     * implies otherwise. The floor a listener actually delivers arrives
+     * through vardiff_min and initial_diff, which is what parse_listener sets
+     * from `min_diff=`. See stratum_listener_t.min_diff. */
     stratum_listener_t pol = { .port = 3335, .initial_diff = 500000.0,
-                               .vardiff_min = 500000.0, .min_diff = 500000.0 };
+                               .vardiff_min = 500000.0 };
     snprintf(pol.label, sizeof pol.label, "rental");
     stratum_conn_apply_listener_for_test(c, &pol);
 

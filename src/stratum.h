@@ -75,18 +75,33 @@ typedef struct {
     double initial_diff;
     double vardiff_min;
     double vardiff_max;
-    /* The floor this port promises, set only when the operator wrote
-     * min_diff=. Unlike vardiff_min -- which merely bounds the rate loop, and
-     * which the network-difficulty ceiling overrides -- this one is kept even
-     * when the chain's own difficulty is lower, because a marketplace
-     * measures the difficulty on the wire and cancels an order that comes in
-     * under what the port advertised. Left 0 by any listener that did not ask
-     * for one, which is how the default port and every low-difficulty chain
-     * keep their existing behaviour. See clamp_assigned_difficulty.
+    /* Set only when the operator wrote `min_diff=` on this listener. It is a
+     * RECORD OF INTENT -- "this port was explicitly asked for a floor" -- and
+     * nothing more. It drives the marketplace warning in config.c and the
+     * startup log; the floor itself is delivered through vardiff_min and
+     * initial_diff, which parse_listener sets from the same value.
      *
-     * ⚠️ This is the one place a port policy outranks the chain. Our own
-     * rental-port note recorded the opposite behaviour as a limitation the
-     * network clamp forced on us; upstream's design fixes it. */
+     * ⛔ DELIBERATE DIVERGENCE FROM UPSTREAM. Upstream keeps this floor even
+     * when the chain's own difficulty is lower, so a port holds the difficulty
+     * it advertised to a marketplace. WE DO NOT, and this is not an oversight
+     * to be tidied up on the next merge:
+     *
+     *   If the share target D exceeds the network target N, every share that
+     *   arrives IS a block -- but shares arrive at H/(D*2^32) instead of
+     *   H/(N*2^32), because the miner discards anything above the stratum
+     *   target locally and never submits it. Block discovery falls by exactly
+     *   N/D. That is arithmetic, not risk.
+     *
+     * On a chain whose difficulty is briefly in the thousands -- a
+     * minimum-difficulty window after a fork, which is precisely when this
+     * pool most wants to be mining -- a rental port pinned at 500,000 would
+     * throw away blocks by two or three orders of magnitude. The marketplace
+     * risk it avoids is real but BOUNDED: an order cannot be served until the
+     * chain ramps back up, which we tell miners plainly.
+     *
+     * ⚠️ So the network-difficulty clamp is PROTECTIVE, not a limitation. An
+     * earlier revision of this comment said the opposite and cited upstream as
+     * the fix. It was wrong. Do not restore it. */
     double min_diff;
     /* Free-form, for logs and for the dashboard to tell miners which port to
      * point which machine at. Empty for the default listener. */

@@ -198,8 +198,10 @@ static int parse_listener(const char *v, stratum_listener_t *out,
     }
     out->vardiff_min  = min_diff;
     /* Recorded separately from vardiff_min so the server can tell "this port
-     * promised a floor" from "this port inherited the server-wide rate-loop
-     * bound". Only the former survives the network-difficulty ceiling. */
+     * was explicitly asked for a floor" from "this port inherited the
+     * server-wide rate-loop bound". Both are still subject to the
+     * network-difficulty ceiling -- see stratum_listener_t.min_diff for why
+     * that is deliberate here and differs from upstream. */
     out->min_diff     = min_diff;
     out->initial_diff = initial > 0.0 ? initial : min_diff;
     if (out->vardiff_max > 0.0 && out->initial_diff > out->vardiff_max) {
