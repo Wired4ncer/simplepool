@@ -894,6 +894,30 @@ static void test_suggest_difficulty_method(void) {
     stratum_server_free(s);
 }
 
+/* max_suggested_diff <= 0 DISABLES requests rather than uncapping them --
+ * the deploy gate, and the safer reading of "0". */
+static void test_requests_disabled_when_cap_is_zero(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                           .initial_diff = 1000,
+                           .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                           .vardiff_min = 1, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 0,   /* the gate, shut */
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    /* Ignored, NOT honoured as an uncapped request. */
+    CHECK(authorize_with_password(s, c, "d=4657000") == 1000.0);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* The password field is untrusted input from anyone who can open a socket.
  * `d=` is matched only at a token boundary, so a password that merely
  * CONTAINS those characters is not a difficulty request. */
@@ -2064,6 +2088,7 @@ int main(void) {
     test_suggest_difficulty_method();
     test_vardiff_cannot_lower_below_request();
     test_password_diff_parsing_edge_cases();
+    test_requests_disabled_when_cap_is_zero();
     test_socket_setup_applies_rcvtimeo();
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();

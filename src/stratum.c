@@ -1177,7 +1177,17 @@ static int parse_password_diff(const char *pw, double *out) {
 static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
                                  double req) {
     if (!(req > 0.0)) return;
-    if (s->cfg.max_suggested_diff > 0.0 && req > s->cfg.max_suggested_diff) {
+    /* <= 0 disables miner requests entirely -- the deploy gate. It still
+     * LOGS what was asked for, so a stage that has the feature switched off
+     * measures how many miners already send `d=` out of habit from other
+     * pools before we let it change anything. Measure, then enable. */
+    if (s->cfg.max_suggested_diff <= 0.0) {
+        LOG_INFO("stratum: %s requested difficulty %.0f — requests DISABLED "
+                 "(max_suggested_diff <= 0), ignoring",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)", req);
+        return;
+    }
+    if (req > s->cfg.max_suggested_diff) {
         LOG_INFO("stratum: %s requested difficulty %.0f above the cap %.0f — "
                  "using the cap",
                  c->worker_name[0] ? c->worker_name : "(unauthorized)",

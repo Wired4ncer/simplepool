@@ -39,6 +39,13 @@ typedef struct {
     /* Ceiling on a miner-requested difficulty (stratum password `d=<n>` or
      * mining.suggest_difficulty). Default 50000000.
      *
+     * ⚠️ <= 0 DISABLES requests; it does not mean "no ceiling". An
+     * uncapped request is not a safe state -- a miner naming a difficulty
+     * far above its hashrate simply stops submitting and is reaped -- so
+     * the off position and the unbounded position are deliberately the
+     * same switch. A disabled request is still logged, which is what makes
+     * a staged rollout able to measure existing `d=` usage first.
+     *
      * ⚠️ Size this against idle_timeout_authorized_sec, not against taste.
      * A request is a floor on the connection's difficulty, so it directly
      * lengthens that connection's expected share interval — and the reaper
