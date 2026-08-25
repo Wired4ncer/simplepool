@@ -637,6 +637,125 @@ static void test_block_wins_over_low_difficulty(void) {
     stratum_server_free(s);
 }
 
+/* ---- dual-stack listener ------------------------------------------------ */
+
+/* Connect to a started server over a chosen family and return the fd, or -1.
+ * Real sockets on purpose: the whole point is what accept() records, and
+ * stratum_conn_new_for_test never goes through accept() at all. */
+static int dial(int family, int port) {
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_storage ss;
+    socklen_t len;
+    memset(&ss, 0, sizeof ss);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)(void *)&ss;
+        a->sin6_family = AF_INET6;
+        a->sin6_port = htons((uint16_t)port);
+        a->sin6_addr = in6addr_loopback;
+        len = sizeof(*a);
+    } else {
+        struct sockaddr_in *a = (struct sockaddr_in *)(void *)&ss;
+        a->sin_family = AF_INET;
+        a->sin_port = htons((uint16_t)port);
+        a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        len = sizeof(*a);
+    }
+    if (connect(fd, (struct sockaddr *)&ss, len) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Walks a small port range rather than insisting on one number. A fixed port
+ * made this suite FLAKY: a back-to-back run (a mutation check, say) can find
+ * the previous process's socket still lingering, and the bind fails for a
+ * reason that has nothing to do with the code under test. A deploy gate that
+ * fails one run in twenty teaches people to re-run it, which is worse than
+ * having no gate. Writes the port actually bound back through *port. */
+static stratum_server_t *start_on(const char *addr, int *port) {
+    for (int p = *port; p < *port + 20; p++) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = 8,
+                              .initial_diff = 1.0, .vardiff_enabled = 0 };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "%s", addr);
+        stratum_server_t *s = NULL;
+        if (stratum_server_start(&cfg, &s) != 0) continue;
+        uint8_t net[32]; memset(net, 0xff, sizeof net);
+        stratum_server_set_job(s, make_test_job("J1", net), 1);
+        *port = p;
+        return s;
+    }
+    return NULL;
+}
+
+/* 🔴 GATE: on a dual-stack listener an IPv4 client MUST still record a dotted
+ * quad, not ::ffff:127.0.0.1.
+ *
+ * ecash-rental-live.sh attributes a worker to the rental port by matching the
+ * authorize line's peer IP against what `ss` reports as established, and `ss`
+ * prints dotted quad. If accept() started handing up mapped forms, the two
+ * would never match and the tool would report ZERO rental workers during a
+ * live order — a silent wrong answer feeding the decision that gates restarts.
+ * That is why this is a gate and not a comment. */
+static void test_dual_stack_ipv4_peer_is_dotted_quad(void) {
+    int port = 39334;
+    stratum_server_t *s = start_on("::", &port);
+    if (!s) { printf("ok: dual-stack skipped (no IPv6 on this host)\n"); return; }
+
+    int fd = dial(AF_INET, port);
+    CHECK(fd >= 0);                       /* an IPv4 client must be accepted */
+    if (fd >= 0) {
+        sleep_ms(150);
+        char ip[64] = {0};
+        CHECK(stratum_server_last_peer_ip_for_test(s, ip, sizeof ip) == 0);
+        /* the assertion the gate exists for */
+        CHECK(strncmp(ip, "::ffff:", 7) != 0);
+        CHECK(strcmp(ip, "127.0.0.1") == 0);
+        close(fd);
+    }
+    stratum_server_free(s);
+    printf("ok: dual-stack records an IPv4 peer as a dotted quad\n");
+}
+
+/* ...and an IPv6 client is accepted at all, which is the point of the change. */
+static void test_dual_stack_accepts_ipv6(void) {
+    int port = 39335;
+    stratum_server_t *s = start_on("::", &port);
+    if (!s) { printf("ok: dual-stack v6 skipped (no IPv6 on this host)\n"); return; }
+
+    int fd = dial(AF_INET6, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        sleep_ms(150);
+        char ip[64] = {0};
+        CHECK(stratum_server_last_peer_ip_for_test(s, ip, sizeof ip) == 0);
+        CHECK(strchr(ip, ':') != NULL);   /* a real IPv6 literal */
+        close(fd);
+    }
+    stratum_server_free(s);
+    printf("ok: dual-stack accepts an IPv6 client\n");
+}
+
+/* ⛔ The config gate: "0.0.0.0" must keep meaning IPv4-only, so installing this
+ * binary against production's existing config changes NOTHING. If this test
+ * ever passes an IPv6 connect, the gate has leaked and the deploy is no longer
+ * staged. */
+static void test_ipv4_wildcard_is_still_ipv4_only(void) {
+    int port = 39336;
+    stratum_server_t *s = start_on("0.0.0.0", &port);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    int v4 = dial(AF_INET, port);
+    CHECK(v4 >= 0);                       /* IPv4 still works */
+    if (v4 >= 0) close(v4);
+
+    int v6 = dial(AF_INET6, port);
+    CHECK(v6 < 0);                        /* IPv6 must be REFUSED */
+    if (v6 >= 0) close(v6);
+
+    stratum_server_free(s);
+    printf("ok: listen_addr 0.0.0.0 stays IPv4-only (the gate holds)\n");
+}
+
 /* ---- vardiff vs. a miner enforcing its own difficulty floor ------------ */
 
 /* Reproduce the hash a submit would produce, so a test can pick nonces that
@@ -2775,6 +2894,9 @@ int main(void) {
     test_authorize_rejects_non_address();
     test_authorize_address_with_label();
     test_block_wins_over_low_difficulty();
+    test_dual_stack_ipv4_peer_is_dotted_quad();
+    test_dual_stack_accepts_ipv6();
+    test_ipv4_wildcard_is_still_ipv4_only();
     test_vardiff_tracks_miner_local_floor();
     test_vardiff_floor_detect_respects_min_samples();
     test_vardiff_still_lowers_for_a_matched_miner();

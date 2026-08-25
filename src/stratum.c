@@ -348,7 +348,7 @@ struct stratum_conn {
      * be tied to the socket it actually came from: worker names are chosen by
      * the miner and several connections routinely share one, so the name
      * alone cannot answer "did their proxy ever reach us?". */
-    char     peer_ip[INET_ADDRSTRLEN];
+    char     peer_ip[INET6_ADDRSTRLEN];
 
     uint8_t  extranonce1[STRATUM_EXTRANONCE1_SIZE];
     double   difficulty;
@@ -2184,6 +2184,19 @@ int stratum_server_conn_count_for_test(const stratum_server_t *s) {
     return s ? atomic_load(&s->conn_count) : 0;
 }
 
+/* Copy the peer_ip of the most recently ACCEPTED connection. Exists so a test
+ * can assert what accept() actually recorded — the dual-stack listener's whole
+ * risk is that an IPv4 client starts reading as ::ffff:a.b.c.d, and nothing
+ * else in the API exposes that. Returns 0 on success, -1 if no connection. */
+int stratum_server_last_peer_ip_for_test(stratum_server_t *s, char *out, size_t cap) {
+    if (!s || !out || cap == 0) return -1;
+    pthread_mutex_lock(&s->conns_lock);
+    stratum_conn_t *c = s->conns_head;   /* register() pushes to the head */
+    if (c) snprintf(out, cap, "%s", c->peer_ip);
+    pthread_mutex_unlock(&s->conns_lock);
+    return c ? 0 : -1;
+}
+
 /* ---- real connection thread ------------------------------------------ */
 
 /* Write the whole buffer or fail.
@@ -2379,10 +2392,42 @@ done:
     return NULL;
 }
 
+/* Render an accepted peer's address, un-mapping ::ffff:a.b.c.d back to dotted
+ * quad.
+ *
+ * ⛔ The un-mapping is load-bearing, not cosmetic. On a dual-stack listener
+ * every IPv4 client arrives as an IPv4-mapped IPv6 address, so peer_ip would
+ * start reading "::ffff:169.58.184.136" for connections that today read
+ * "169.58.184.136". ecash-rental-live.sh attributes a worker to the rental
+ * port by matching the authorize line's peer IP against the addresses `ss`
+ * reports as established — and `ss` prints dotted quad. The two would stop
+ * matching, and the tool would report ZERO rental workers during a live order:
+ * a silent wrong answer feeding the decision that gates restarts.
+ *
+ * So an IPv4 client must look exactly as it does today, whichever family the
+ * listener is bound in. */
+static void peer_ip_from_sockaddr(const struct sockaddr_storage *ss,
+                                  char *out, size_t cap) {
+    if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)(const void *)ss;
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+            struct in_addr v4;
+            memcpy(&v4, &s6->sin6_addr.s6_addr[12], sizeof v4);
+            if (inet_ntop(AF_INET, &v4, out, (socklen_t)cap)) return;
+        } else if (inet_ntop(AF_INET6, &s6->sin6_addr, out, (socklen_t)cap)) {
+            return;
+        }
+    } else if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)(const void *)ss;
+        if (inet_ntop(AF_INET, &s4->sin_addr, out, (socklen_t)cap)) return;
+    }
+    snprintf(out, cap, "?");
+}
+
 static void *listener_thread(void *arg) {
     stratum_server_t *s = arg;
     while (!atomic_load(&s->stop)) {
-        struct sockaddr_in cli;
+        struct sockaddr_storage cli;
         socklen_t cl = sizeof(cli);
         int fd = accept(s->listen_fd, (struct sockaddr *)&cli, &cl);
         if (fd < 0) {
@@ -2404,8 +2449,7 @@ static void *listener_thread(void *arg) {
         stratum_conn_t *c = stratum_conn_new_for_test(s);
         if (!c) { close(fd); continue; }
         c->fd = fd;
-        if (!inet_ntop(AF_INET, &cli.sin_addr, c->peer_ip, sizeof c->peer_ip))
-            snprintf(c->peer_ip, sizeof c->peer_ip, "?");
+        peer_ip_from_sockaddr(&cli, c->peer_ip, sizeof c->peer_ip);
         atomic_fetch_add(&s->conn_count, 1);
         conn_register(s, c);
         if (pthread_create(&c->thr, NULL, conn_thread, c) != 0) {
@@ -2450,7 +2494,49 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
         s->shared_owned = 1;
     }
 
-    s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* Address family is chosen from bind_addr, and "0.0.0.0" keeps meaning
+     * exactly what it says.
+     *
+     *   ""  / "0.0.0.0"  -> IPv4 wildcard          (unchanged; the default)
+     *   "::"             -> DUAL-STACK wildcard    (IPv6 + IPv4-mapped)
+     *   IPv4 literal     -> that IPv4 address
+     *   IPv6 literal     -> that IPv6 address only (V6ONLY on)
+     *
+     * ⚠️ Deliberately NOT making "0.0.0.0" dual-stack, even though that is
+     * what production runs and would have made this fix arrive for free.
+     * Overloading a wildcard that has one obvious meaning is how a binary
+     * install changes behaviour nobody asked it to. Instead IPv6 is
+     * CONFIG-GATED like every other change in this series: install the binary
+     * and nothing moves; set listen_addr = :: and it turns on; revert is one
+     * config line and no rebuild.
+     *
+     * Why dual-stack at all: both hostnames publish AAAA records and nginx
+     * answers on [::], so the site looks healthy over IPv6 while stratum,
+     * bound IPv4-only, refuses the connection. A miner whose client prefers
+     * AAAA — the RFC 6724 default — never starts mining, and unlike a browser
+     * most mining firmware has no Happy Eyeballs fallback to recover with. */
+    int family = AF_INET;
+    int dual_stack = 0;
+    const char *ba = cfg->bind_addr;
+    struct in_addr  v4 = {0};
+    struct in6_addr v6;
+    if (ba[0] == '\0' || strcmp(ba, "0.0.0.0") == 0) {
+        v4.s_addr = htonl(INADDR_ANY);
+    } else if (strcmp(ba, "::") == 0) {
+        family = AF_INET6; dual_stack = 1; v6 = in6addr_any;
+    } else if (inet_pton(AF_INET, ba, &v4) == 1) {
+        /* explicit IPv4 literal — keeps its own family, so a test binding
+         * 127.0.0.1 is completely untouched by any of this */
+    } else if (inet_pton(AF_INET6, ba, &v6) == 1) {
+        family = AF_INET6;
+    } else {
+        LOG_ERROR("stratum: listen_addr '%s' is not an IPv4 or IPv6 address", ba);
+        if (s->shared_owned) stratum_shared_free(s->shared);
+        free(s);
+        return -1;
+    }
+
+    s->listen_fd = socket(family, SOCK_STREAM, 0);
     if (s->listen_fd < 0) {
         if (s->shared_owned) stratum_shared_free(s->shared);
         free(s);
@@ -2458,20 +2544,46 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     }
     int one = 1;
     setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)cfg->bind_port);
-    if (cfg->bind_addr[0] == '\0' || strcmp(cfg->bind_addr, "0.0.0.0") == 0) {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else {
-        if (inet_pton(AF_INET, cfg->bind_addr, &addr.sin_addr) != 1) {
-            close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
+    if (family == AF_INET6) {
+        /* 0 = accept IPv4-mapped connections too; 1 = this family only.
+         * Set EXPLICITLY in both directions: the default is a sysctl
+         * (net.ipv6.bindv6only) and inheriting it means the pool's listening
+         * behaviour depends on a host setting nobody here records. */
+        int v6only = dual_stack ? 0 : 1;
+        if (setsockopt(s->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                       &v6only, sizeof(v6only)) < 0) {
+            LOG_ERROR("stratum: IPV6_V6ONLY=%d: %s", v6only, strerror(errno));
+            close(s->listen_fd);
+            if (s->shared_owned) stratum_shared_free(s->shared);
+            free(s);
+            return -1;
         }
     }
-    if (bind(s->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+
+    struct sockaddr_storage ss;
+    socklen_t sslen;
+    memset(&ss, 0, sizeof ss);
+    if (family == AF_INET6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)(void *)&ss;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons((uint16_t)cfg->bind_port);
+        a6->sin6_addr = v6;
+        sslen = sizeof(*a6);
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)(void *)&ss;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons((uint16_t)cfg->bind_port);
+        a4->sin_addr = v4;
+        sslen = sizeof(*a4);
+    }
+    if (bind(s->listen_fd, (struct sockaddr *)&ss, sslen) < 0) {
         LOG_ERROR("stratum bind %s:%d: %s", cfg->bind_addr, cfg->bind_port, strerror(errno));
         close(s->listen_fd); if (s->shared_owned) stratum_shared_free(s->shared); free(s); return -1;
     }
+    LOG_INFO("stratum: listening on %s:%d (%s)", ba[0] ? ba : "0.0.0.0",
+             cfg->bind_port,
+             dual_stack ? "dual-stack, IPv4 clients un-mapped to dotted quad"
+                        : (family == AF_INET6 ? "IPv6 only" : "IPv4 only"));
     /* Clamped by net.core.somaxconn, so asking for more than the kernel
      * allows is harmless -- asking for less than it allows is not. */
     int backlog = cfg->listen_backlog > 0 ? cfg->listen_backlog
