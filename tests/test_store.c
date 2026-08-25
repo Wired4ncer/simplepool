@@ -59,6 +59,22 @@ static int64_t scalar_i64(sqlite3 *db, const char *sql) {
     return v;
 }
 
+/* Copies into `out` because the sqlite3_stmt is finalized before returning.
+ * Writes "" for SQL NULL, and returns whether the column was non-NULL — the
+ * identity test needs to tell "stored blank" from "stored nothing". */
+static int scalar_text(sqlite3 *db, const char *sql, char *out, size_t cap) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_step(st);
+    assert(rc == SQLITE_ROW);
+    int is_null = sqlite3_column_type(st, 0) == SQLITE_NULL;
+    const unsigned char *v = sqlite3_column_text(st, 0);
+    snprintf(out, cap, "%s", (is_null || !v) ? "" : (const char *)v);
+    sqlite3_finalize(st);
+    return !is_null;
+}
+
 static double scalar_dbl(sqlite3 *db, const char *sql) {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
@@ -108,7 +124,8 @@ static void test_basic(void) {
 
     /* Block path */
     rc = store_record_block(s, 9999, 12345, "abc123hash", "worker3",
-                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL);
+                            "bcrt1qexampleaddr", 4950000000LL, 50000000LL,
+                            STORE_BLOCK_PENDING, NULL);
     assert(rc == 0);
     rc = store_flush(s);
     assert(rc == 0);
@@ -350,6 +367,75 @@ static void test_credited_sats(void) {
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_credited_sats\n");
+}
+
+/* Pool identity: written once at startup, and the only source the dashboard
+ * has for what this pool is. Two properties matter beyond the round trip.
+ *
+ * First, it must not collide with the per-template pool_meta write — they
+ * share the id=1 row and run in either order, so each must leave the other's
+ * columns alone, including the write-once credited_from stamp.
+ *
+ * Second, solo mode must store pool_btc_address as NULL rather than "", so a
+ * reader can tell "no pool wallet in this mode" from "operator configured a
+ * blank one". */
+static void test_pool_identity(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Identity first, template second — the startup order. */
+    assert(store_record_pool_identity(s, "signet", "node", "/simplepool/",
+                                      "tb1qoperator", "tb1qpoolwallet") == 0);
+    assert(store_record_pool_meta(s, "pps-classic", 100, "derived",
+                                  2783.22, 2811.33, 100.4,
+                                  111157.455, 312500000, 1700000000ULL) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+
+    char buf[128];
+    assert(scalar_i64(db, "SELECT count(*) FROM pool_meta") == 1);
+    scalar_text(db, "SELECT network FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "signet") == 0);
+    scalar_text(db, "SELECT network_source FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "node") == 0);
+    scalar_text(db, "SELECT coinbase_tag FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "/simplepool/") == 0);
+    scalar_text(db, "SELECT operator_address FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "tb1qoperator") == 0);
+    scalar_text(db, "SELECT pool_btc_address FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "tb1qpoolwallet") == 0);
+
+    /* The template write must not have disturbed identity, and identity must
+     * not have pre-empted the write-once credited_from stamp. */
+    assert(scalar_i64(db, "SELECT fee_bps FROM pool_meta") == 100);
+    assert(scalar_i64(db, "SELECT credited_from FROM pool_meta") == 1700000000);
+
+    /* updated_at means "when the rate was last refreshed". Identity is
+     * written once at startup, so re-writing it must not touch that — else a
+     * stalled template path would keep looking alive. */
+    int64_t seen = scalar_i64(db, "SELECT updated_at FROM pool_meta");
+    assert(store_record_pool_identity(s, "regtest", "inferred", "/other/",
+                                      "bcrt1qop", NULL) == 0);
+    assert(scalar_i64(db, "SELECT updated_at FROM pool_meta") == seen);
+
+    /* Solo mode: NULL, not "". */
+    assert(scalar_text(db, "SELECT pool_btc_address FROM pool_meta",
+                       buf, sizeof buf) == 0);
+    scalar_text(db, "SELECT network FROM pool_meta", buf, sizeof buf);
+    assert(strcmp(buf, "regtest") == 0);
+    /* And still no collateral damage to the rate half. */
+    assert(scalar_i64(db, "SELECT credited_from FROM pool_meta") == 1700000000);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_pool_identity\n");
 }
 
 /* rate_history is the provenance half of the audit: it must append when the
@@ -1112,7 +1198,8 @@ static void test_proportional(void) {
     /* The real block row is written by store_record_block(), exactly as
      * on_block_found_cb() does it for every block, pooled or solo. */
     assert(store_record_block(s, (base_ts + 200) * 1000ULL, 100, "blockhash1",
-                              "worker1", addrs[0].address, reward, 0) == 0);
+                              "worker1", addrs[0].address, reward, 0,
+                              STORE_BLOCK_PENDING, NULL) == 0);
 
     rc = store_prop_settle_block(s, base_ts + 200, NULL, 0,
                                  ledger_buf, n_ledger_out);
@@ -1178,6 +1265,245 @@ static void test_proportional(void) {
     printf("  ok test_proportional\n");
 }
 
+/* Block-candidate accounting. A share meeting network difficulty is only a
+ * candidate: submitblock refuses stale, duplicate and high-hash ones
+ * routinely, and on a low-difficulty chain that is nearly all of them. Every
+ * row used to be written as a found block with its full reward, which is what
+ * disabled the solvency check — it sums reward_sats across the table. */
+static void test_block_candidate_status(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    int rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    /* Accepted by the node: recorded, but only as pending. Nothing on the
+     * submit path is allowed to claim a block is in the chain. */
+    rc = store_record_block(s, 1000, 800001, "hash_accepted", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_PENDING, NULL);
+    assert(rc == 0);
+
+    /* Refused by the node: recorded so the refusal is visible, but as
+     * 'rejected' — never counted, and carrying the node's reason. */
+    rc = store_record_block(s, 1001, 800001, "hash_rejected", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_REJECTED, "inconclusive");
+    assert(rc == 0);
+
+    /* A coinbase height of zero cannot exist. Refused outright rather than
+     * filed at a height no chain has. */
+    rc = store_record_block(s, 1002, 0, "hash_zero_height", "w1",
+                            "bcrt1qaddr", 5000000000LL, 0,
+                            STORE_BLOCK_PENDING, NULL);
+    assert(rc != 0);
+
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found") == 2);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='hash_zero_height'") == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='pending'") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='rejected'") == 1);
+    /* Nothing may be born confirmed. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE status='confirmed'") == 0);
+
+    char err[128] = {0};
+    int had = scalar_text(db,
+        "SELECT submit_error FROM blocks_found WHERE hash='hash_rejected'",
+        err, sizeof err);
+    assert(had && strcmp(err, "inconclusive") == 0);
+    /* An accepted candidate has no error to carry. */
+    had = scalar_text(db,
+        "SELECT submit_error FROM blocks_found WHERE hash='hash_accepted'",
+        err, sizeof err);
+    assert(!had);
+
+    /* This is the number the solvency check would sum. A rejected candidate
+     * must contribute nothing to it. */
+    assert(scalar_i64(db,
+        "SELECT COALESCE(SUM(reward_sats),0) FROM blocks_found "
+        "WHERE status='confirmed'") == 0);
+
+    /* The stats counter follows the same rule: refused candidates are not
+     * blocks, so the shutdown line does not report them as such. */
+    store_stats_t st = {0};
+    store_get_stats(s, &st);
+    assert(st.blocks_committed == 1);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_block_candidate_status\n");
+}
+
+/* Reconciliation against the observed chain of tips, which is the only path
+ * available when the backend serves nothing but getblocktemplate and
+ * submitblock — the CUSF enforcer a drivechain pool must point at.
+ *
+ * A template building height H+1 with prev_hash X is the node saying its tip
+ * at H was X. So a candidate at H is the chain's iff the newest observation
+ * at H+1 names it. */
+static void test_reconcile_from_templates(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Two competing candidates at the same height — expected on a
+     * low-difficulty chain, and both rows must survive. */
+    assert(store_record_block(s, 1000, 800001, "hash_win", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_record_block(s, 1001, 800001, "hash_lose", "w2", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    /* A candidate whose next height was never observed. Unverifiable, so it
+     * must stay pending — and pending is never revenue. */
+    assert(store_record_block(s, 1002, 800004, "hash_unseen", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_flush(s) == 0);
+
+    store_template_t t = {
+        .ts_s = 2000, .height = 800002, .prev_hash = "hash_win",
+        .bits = "1d00ffff", .network_difficulty = 1.0,
+        .coinbase_value_sats = 5000000000LL, .tx_count = 1,
+        .tx_fees_sats = 0, .source = "enforcer", .cb_spendable = 1,
+        .cb_op_returns = 2, .longpoll = 1, .rate_sats_per_diff = 0.0,
+    };
+    assert(store_record_template(s, &t) == 0);
+
+    int confirmed = 0, orphaned = 0, pending = 0;
+    assert(store_reconcile_blocks_from_templates(s, 800005, &confirmed,
+                                                 &orphaned, &pending) == 0);
+    assert(confirmed == 1);
+    assert(orphaned == 1);
+    assert(pending == 1);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    char st[32] = {0};
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+    /* tip 800005, block at 800001 → 5 confirmations. */
+    assert(scalar_i64(db,
+        "SELECT confirmations FROM blocks_found WHERE hash='hash_win'") == 5);
+    scalar_text(db, "SELECT checked_via FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "tips") == 0);
+
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_lose'",
+                st, sizeof st);
+    assert(strcmp(st, "orphaned") == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_unseen'",
+                st, sizeof st);
+    assert(strcmp(st, "pending") == 0);
+
+    /* Both candidates at 800001 are still on record. Losing a race is not a
+     * reason to forget the work was done. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE height=800001") == 2);
+
+    /* A reorg: a later template at the same height now builds on someone
+     * else. The confirmed block must be demoted, not left paid. */
+    store_template_t t2 = t;
+    t2.ts_s = 3000;
+    t2.prev_hash = "hash_lose";
+    t2.bits = "1d00fffe";   /* different work, so it opens its own row */
+    assert(store_record_template(s, &t2) == 0);
+    assert(store_reconcile_blocks_from_templates(s, 800006, &confirmed,
+                                                 &orphaned, &pending) == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_win'",
+                st, sizeof st);
+    assert(strcmp(st, "orphaned") == 0);
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='hash_lose'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_reconcile_from_templates\n");
+}
+
+/* The unique index has to survive a table that already holds duplicates —
+ * as a plain migration it would fail and be swallowed as a warning, leaving
+ * it absent on exactly the databases that needed it. */
+static void test_block_hash_index_after_dedupe(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* The same solution recorded twice — the stratum dedupe ring is in
+     * memory, so a restart can do this. */
+    assert(store_record_block(s, 1000, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_record_block(s, 1001, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    /* Distinct competing candidates must NOT be collapsed. */
+    assert(store_record_block(s, 1002, 800001, "other_hash", "w2", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_flush(s) == 0);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db, "SELECT count(*) FROM blocks_found") == 3);
+
+    /* A verdict reached on the duplicate must not be lost when it is
+     * collapsed away. */
+    assert(store_set_block_status(s, "dup_hash", STORE_BLOCK_CONFIRMED, 3,
+                                  "tips") == 0);
+    assert(sqlite3_exec(db, "UPDATE blocks_found SET status='pending' "
+                            "WHERE id=(SELECT MIN(id) FROM blocks_found "
+                            "           WHERE hash='dup_hash')",
+                        NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(store_finalize_block_hash_index(s) == 0);
+
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='other_hash'") == 1);
+    char st[32] = {0};
+    scalar_text(db, "SELECT status FROM blocks_found WHERE hash='dup_hash'",
+                st, sizeof st);
+    assert(strcmp(st, "confirmed") == 0);
+    /* The index actually exists — the whole point. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM sqlite_master WHERE type='index' "
+        "  AND name='blocks_found_hash_idx'") == 1);
+
+    /* And it now holds: a re-found hash cannot create a second row, and the
+     * OR IGNORE means it does not fail the batch either. */
+    assert(store_record_block(s, 1003, 800001, "dup_hash", "w1", "addr",
+                              5000000000LL, 0, STORE_BLOCK_PENDING, NULL) == 0);
+    assert(store_flush(s) == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM blocks_found WHERE hash='dup_hash'") == 1);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_block_hash_index_after_dedupe\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -1186,10 +1512,14 @@ int main(void) {
     test_concurrent();
     test_drop();
     test_credited_sats();
+    test_pool_identity();
     test_rate_history();
     test_template_history();
     test_template_retention();
     test_commit_survives_a_locked_db();
+    test_block_candidate_status();
+    test_reconcile_from_templates();
+    test_block_hash_index_after_dedupe();
     test_worker_recent_difficulty();
     test_proportional_window_pages();
     test_proportional_window_boundary_spans_a_page();

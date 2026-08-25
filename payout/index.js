@@ -19,7 +19,7 @@
 import { loadConfig }   from './lib/config.js';
 import { openDb }       from './lib/db.js';
 import { ThunderClient } from './lib/thunder.js';
-import { startLoop, reportStuck } from './lib/payout.js';
+import { startLoop, reportStuck, humanMs } from './lib/payout.js';
 import { startAdminHttp } from './lib/admin-http.js';
 
 const cfg = loadConfig();
@@ -33,8 +33,10 @@ const log = {
 
 log.info(`simplepool-payout starting (db=${cfg.dbPath} rpc=${cfg.rpcUrl}` +
          `${cfg.dryRun ? ' DRY-RUN' : ''})`);
-log.info(`  interval=${cfg.intervalMs}ms min_sats=${cfg.minSats} ` +
-         `max_per_tick=${cfg.maxPerTick}`);
+log.info(`  payout run every ${humanMs(cfg.intervalMs)} ` +
+         `(settle re-check ${humanMs(cfg.settleIntervalMs)}, ` +
+         `retry ${humanMs(cfg.retryIntervalMs)})`);
+log.info(`  min_sats=${cfg.minSats} max_per_tick=${cfg.maxPerTick}`);
 
 const db      = openDb(cfg.dbPath);
 const thunder = new ThunderClient({

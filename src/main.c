@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -180,7 +181,38 @@ typedef struct {
      * lock per share would not be. Zero means "no accrual" (solo, or a
      * template we could not derive a rate from). */
     _Atomic double  pps_rate;
+
+    /* Observed share-difficulty throughput, in difficulty units per second,
+     * and the window it is accumulated over. This is the pool's own hashrate
+     * expressed in the same units the PPS rate is paid in, which is what the
+     * issuance ceiling needs: accrual per second is rate * this. */
+    _Atomic double  diff_accum;        /* difficulty seen this window */
+    _Atomic uint64_t diff_window_ms;   /* when the window opened */
+    _Atomic double  diff_per_sec;      /* last completed measurement, 0 = none */
+
+    /* Set when accrual is refused because network difficulty is below
+     * cfg->pps_min_network_difficulty. Read by the stratum server, which
+     * turns miners away rather than letting them work uncredited. */
+    _Atomic int     pps_gated;
+
+    /* Whether the backend serves getblockhash: 0 unknown, 1 yes, -1 no.
+     * Latched on the first "Method not found", because a backend that does
+     * not implement the method never starts to — the CUSF enforcer serves
+     * exactly getblocktemplate and submitblock. -1 is not a failure state,
+     * it selects the observed-tip path. */
+    _Atomic int     gbh_state;
 } server_ctx_t;
+
+/* How long to accumulate share difficulty before turning it into a rate.
+ * Long enough to be stable, short enough that a pool starting up is measured
+ * within a minute. */
+#define HASHRATE_WINDOW_MS 60000
+
+/* A block this deep stops being re-checked. */
+#define BLOCK_FINAL_DEPTH      100
+/* Per tip change. Bounds how long reconciliation can hold the shared client's
+ * connection lock, which submitblock also needs. */
+#define RECONCILE_MAX_PER_TICK  16
 
 /* The rate this proxy will credit at: the operator's override verbatim if
  * set, otherwise fair value derived from the template. See the
@@ -660,6 +692,28 @@ static stratum_job_t *build_job_from_template(server_ctx_t *sctx,
  * Warns when an override implies a materially different fee from fee_bps —
  * that mismatch is invisible otherwise, and a stale override is how the fee
  * silently drifts to zero (or negative) as difficulty moves. */
+/* Close the hashrate window if it has run long enough, and return the best
+ * available difficulty-per-second measurement (0 when there is none yet). */
+static double observed_diff_per_sec(server_ctx_t *s) {
+    uint64_t now = now_ms();
+    uint64_t opened = atomic_load_explicit(&s->diff_window_ms, memory_order_relaxed);
+    if (opened == 0) {
+        atomic_store_explicit(&s->diff_window_ms, now, memory_order_relaxed);
+        return 0.0;
+    }
+    if (now - opened >= HASHRATE_WINDOW_MS) {
+        double accum = atomic_exchange_explicit(&s->diff_accum, 0.0,
+                                                memory_order_relaxed);
+        atomic_store_explicit(&s->diff_window_ms, now, memory_order_relaxed);
+        double secs = (double)(now - opened) / 1000.0;
+        if (secs > 0.0) {
+            atomic_store_explicit(&s->diff_per_sec, accum / secs,
+                                  memory_order_relaxed);
+        }
+    }
+    return atomic_load_explicit(&s->diff_per_sec, memory_order_relaxed);
+}
+
 static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     if (!s || !s->cfg || !t) return;
 
@@ -682,6 +736,69 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
     double eff_fee_bps = (gross > 0.0) ? (1.0 - rate / gross) * 10000.0 : 0.0;
 
     int accrues = strcmp(s->cfg->pool_mode, "pps-classic") == 0;
+
+    /* Two guards, in order. Both only matter while accruing.
+     *
+     * The floor is the operator's, and it is the one that works from the
+     * first share: below the configured difficulty the fair-value formula is
+     * not fair, so nothing accrues at all. The ceiling is automatic and needs
+     * no configuration, but it needs a hashrate measurement, so it cannot
+     * cover the first minute after a restart. They cover each other. */
+    double dps = observed_diff_per_sec(s);
+    int gated = 0;
+    if (accrues && s->cfg->pps_min_network_difficulty > 0.0 &&
+        net_diff > 0.0 && net_diff < s->cfg->pps_min_network_difficulty) {
+        gated = 1;
+        rate = 0.0;
+    }
+    if (accrues && !gated) {
+        double capped = pps_rate_apply_issuance_ceiling(
+            rate, value, dps, s->cfg->block_interval_sec);
+        if (capped < rate) {
+            LOG_WARN("pps rate capped at %.6f sats/diff (fair value says "
+                     "%.6f): at %.2f difficulty/s this pool would accrue "
+                     "faster than the chain can issue %lld sats every %ds. "
+                     "Network difficulty %.2f is below the %.2f this pool's "
+                     "own hashrate requires — set "
+                     "pps_min_network_difficulty and stop accruing until the "
+                     "chain catches up.",
+                     capped, rate, dps, (long long)value,
+                     s->cfg->block_interval_sec, net_diff,
+                     pps_min_safe_difficulty(dps, s->cfg->block_interval_sec));
+        }
+        rate = capped;
+    }
+
+    /* Report the transition, not every template — this path runs per poll. */
+    int was_gated = atomic_exchange_explicit(&s->pps_gated, gated,
+                                             memory_order_relaxed);
+    if (accrues && gated && !was_gated) {
+        LOG_WARN("PPS ACCRUAL SUSPENDED: network difficulty %.2f is below the "
+                 "configured floor of %.2f. Shares are not being credited "
+                 "because at this difficulty each one would be priced as "
+                 "though it were worth a whole block. Accrual resumes on its "
+                 "own once the chain retargets.",
+                 net_diff, s->cfg->pps_min_network_difficulty);
+    } else if (accrues && !gated && was_gated) {
+        LOG_INFO("pps accrual resumed: network difficulty %.2f is at or above "
+                 "the configured floor of %.2f", net_diff,
+                 s->cfg->pps_min_network_difficulty);
+    }
+
+    /* No floor configured is a real risk, not a neutral default. Say so once
+     * there is a measurement to say it with. */
+    if (accrues && s->cfg->pps_min_network_difficulty <= 0.0 && dps > 0.0) {
+        double need = pps_min_safe_difficulty(dps, s->cfg->block_interval_sec);
+        if (need > 0.0 && net_diff > 0.0 && net_diff < need) {
+            LOG_WARN("pps_min_network_difficulty is unset and network "
+                     "difficulty %.2f is below the %.2f this pool's own "
+                     "%.2f difficulty/s requires. Every share is being priced "
+                     "as though the chain could absorb it; it cannot. Set "
+                     "pps_min_network_difficulty=%.0f",
+                     net_diff, need, dps, need);
+        }
+    }
+
     atomic_store_explicit(&s->pps_rate, accrues ? rate : 0.0,
                           memory_order_relaxed);
 
@@ -769,6 +886,16 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         const char *block_hash_or_null) {
     server_ctx_t *s = (server_ctx_t *)ctx;
 
+    /* Fold this share into the hashrate window. Difficulty per second is what
+     * the issuance ceiling is judged against — accrual per second is exactly
+     * rate * this — so it is accumulated in the same units the rate is paid
+     * in, before any decision about crediting. */
+    if (s) {
+        double prev = atomic_load_explicit(&s->diff_accum, memory_order_relaxed);
+        atomic_store_explicit(&s->diff_accum, prev + difficulty,
+                              memory_order_relaxed);
+    }
+
     /* PPS accrual. Credit the worker proportional to share difficulty at the
      * rate derived from the current template (or the operator's override).
      * Truncates to whole sats; sub-sat dust accumulates per-share so over
@@ -833,18 +960,21 @@ static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
     }
 }
 
-static int on_block_cb(void *ctx, const char *block_hex) {
+/* Returns 0 when the node accepted the block, non-zero when it refused.
+ * The caller records the candidate accordingly — a refusal that goes only to
+ * the log is what let rejected candidates be counted as pool revenue. */
+static int on_block_cb(void *ctx, const char *block_hex,
+                       char *errbuf, size_t errlen) {
     server_ctx_t *s = (server_ctx_t *)ctx;
-    if (!s || !s->btc) return -1;
-    char err[512] = {0};
-    int rc = bitcoind_submit_block(s->btc, block_hex, err, sizeof err);
+    if (!s || !s->btc) {
+        snprintf(errbuf, errlen, "no bitcoind client");
+        return -1;
+    }
+    int rc = bitcoind_submit_block(s->btc, block_hex, errbuf, errlen);
     if (rc == 0) {
         LOG_INFO("submitted block to bitcoind successfully");
     } else {
-        /* Carries "rejected: inconclusive" for a valid block that lost the
-         * race for the tip. The caller uses this to decide whether the block
-         * is recorded at all — it is not merely logged. */
-        LOG_ERROR("submitblock failed: %s", err);
+        LOG_ERROR("submitblock failed: %s", errbuf);
     }
     return rc;
 }
@@ -854,12 +984,18 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
                               uint64_t ts_ms, uint32_t height,
                               const char *job_id,
                               const char *block_hash,
-                              int64_t reward_sats, int64_t fee_sats) {
+                              int64_t reward_sats, int64_t fee_sats,
+                              int accepted, const char *submit_error) {
     server_ctx_t *s = (server_ctx_t *)ctx;
+    /* Accepted only makes it a candidate the chain has not rejected — it is
+     * still 'pending' until something verifies the block is in the chain.
+     * Nothing here may write 'confirmed'. */
+    int status = accepted ? STORE_BLOCK_PENDING : STORE_BLOCK_REJECTED;
     if (s && s->store) {
         store_record_block(s->store, ts_ms, (int)height, block_hash,
                            worker_name, finder_address,
-                           reward_sats, fee_sats);
+                           reward_sats, fee_sats, status,
+                           accepted ? NULL : submit_error);
     }
 
     /* pool_mode=proportional: commit the carry-forward balances belonging to
@@ -867,12 +1003,19 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
      * no plan (a fallback template paid its finder directly), and nothing is
      * committed twice — the plan is consumed here.
      *
-     * ⚠️ This runs on acceptance by the pool, not by the network. A block that
-     * is later reorged out leaves the ledger reflecting a payment that no longer
-     * exists. No funds are at stake — the ledger only records who is owed a turn
-     * — but the fairness memory is wrong until it washes out. Solo mode has no
-     * such state; see ecash-pool-proportional-plan.md §3.6. */
-    if (s && s->store && s->cfg &&
+     * ⛔ GATED ON `accepted`. This callback now fires for every candidate,
+     * including ones submitblock refused — settling a refused candidate would
+     * consume its plan and pay out a turn for a block that does not exist.
+     * Recording a candidate and paying for one are different acts.
+     *
+     * ⚠️ `accepted` still means the node took it, not that it survived. A
+     * block later reorged out leaves the ledger reflecting a payment that no
+     * longer exists. No funds are at stake — the ledger only records who is
+     * owed a turn — but the fairness memory is wrong until it washes out.
+     * reconcile_blocks() resolves chain membership for the blocks_found row;
+     * it does NOT unwind a settled plan. See ecash-pool-proportional-plan.md
+     * §3.6. */
+    if (s && s->store && s->cfg && accepted &&
         strcmp(s->cfg->pool_mode, "proportional") == 0 && job_id) {
         prop_plan_t settled;
         memset(&settled, 0, sizeof settled);
@@ -910,14 +1053,89 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
                      block_hash ? block_hash : "?", job_id);
         }
     }
-    if (s && s->bcast) {
+    /* pool:blocks carries solved blocks. A candidate the node refused is not
+     * one, so it does not go out on that channel — the DB row is where a
+     * refusal is visible. */
+    if (s && s->bcast && accepted) {
         broadcast_block(s->bcast, worker_name, finder_address,
                         ts_ms, height, block_hash, reward_sats, fee_sats);
     }
-    LOG_INFO("BLOCK FOUND: height=%u finder=%s reward=%lld fee=%lld hash=%s",
-             height, worker_name ? worker_name : "?",
-             (long long)reward_sats, (long long)fee_sats,
-             block_hash ? block_hash : "?");
+    if (accepted) {
+        LOG_INFO("BLOCK CANDIDATE ACCEPTED: height=%u finder=%s reward=%lld "
+                 "fee=%lld hash=%s (pending confirmation)",
+                 height, worker_name ? worker_name : "?",
+                 (long long)reward_sats, (long long)fee_sats,
+                 block_hash ? block_hash : "?");
+    } else {
+        LOG_WARN("BLOCK CANDIDATE REJECTED: height=%u finder=%s hash=%s "
+                 "reason=%s", height, worker_name ? worker_name : "?",
+                 block_hash ? block_hash : "?",
+                 submit_error && submit_error[0] ? submit_error : "unknown");
+    }
+}
+
+/* ---------- block confirmation ---------- */
+
+/* Decide which of the pool's candidates are actually in the chain.
+ *
+ * Preferred path is getblockhash: authoritative, one call per unresolved
+ * candidate. Not always available — the CUSF enforcer, which is the backend a
+ * drivechain pool must point at, answers "Method not found" to everything but
+ * getblocktemplate and submitblock. So fall back to the chain of tips the pool
+ * has already observed: a template building height H+1 with prev_hash X says
+ * the node's tip at H was X. That needs no RPC at all.
+ *
+ * Whichever answered is recorded in checked_via, the same way
+ * pool_meta.network_source distinguishes an authoritative answer from an
+ * inferred one. Nothing here invents a verdict: a candidate that neither path
+ * can speak to stays pending, and pending counts as nothing. */
+static void reconcile_blocks(server_ctx_t *s, int tip_height) {
+    if (!s || !s->store || tip_height <= 0) return;
+
+    if (atomic_load(&s->gbh_state) >= 0) {
+        store_block_candidate_t cands[RECONCILE_MAX_PER_TICK];
+        int n = store_list_unresolved_blocks(s->store, tip_height,
+                                             BLOCK_FINAL_DEPTH, cands,
+                                             RECONCILE_MAX_PER_TICK);
+        for (int i = 0; i < n; ++i) {
+            char have[80] = {0};
+            char gerr[256] = {0};
+            int rc = bitcoind_get_block_hash(s->btc, cands[i].height, have,
+                                             sizeof have, gerr, sizeof gerr);
+            if (rc == BITCOIND_ERR_UNSUPPORTED) {
+                atomic_store(&s->gbh_state, -1);
+                LOG_INFO("backend does not serve getblockhash — confirming "
+                         "blocks from the observed chain of template tips "
+                         "instead");
+                break;
+            }
+            if (rc != 0) {
+                /* Transient. Leave the rows alone and retry on the next tip
+                 * rather than recording a verdict we did not get. */
+                LOG_WARN("getblockhash(%d) failed: %s", cands[i].height, gerr);
+                return;
+            }
+            atomic_store(&s->gbh_state, 1);
+            int match = strcasecmp(have, cands[i].hash) == 0;
+            store_set_block_status(s->store, cands[i].hash,
+                                   match ? STORE_BLOCK_CONFIRMED
+                                         : STORE_BLOCK_ORPHANED,
+                                   match ? tip_height - cands[i].height + 1 : 0,
+                                   "node");
+            if (!match) {
+                LOG_WARN("block %s at height %d is no longer in the chain — "
+                         "marked orphaned", cands[i].hash, cands[i].height);
+            }
+        }
+        if (atomic_load(&s->gbh_state) > 0) return;
+    }
+
+    int confirmed = 0, orphaned = 0, pending = 0;
+    if (store_reconcile_blocks_from_templates(s->store, tip_height, &confirmed,
+                                              &orphaned, &pending) == 0) {
+        LOG_DEBUG("block reconcile: confirmed=%d orphaned=%d pending=%d",
+                  confirmed, orphaned, pending);
+    }
 }
 
 /* Starting share difficulty for a reconnecting worker: what it was actually
@@ -998,6 +1216,10 @@ static void *tip_watcher(void *arg) {
         }
         pthread_mutex_unlock(&s->lock);
 
+        /* A new tip is exactly when a candidate's fate can have changed:
+         * either it is the one that extended the chain, or something else
+         * was. */
+        if (t->height - 1 != s->last_height) reconcile_blocks(s, t->height - 1);
         /* The two branches above are exactly the clean_jobs distinction, and
          * it used to be computed here and then thrown away: every job went
          * out flagged clean. On a same-tip refresh that tells every miner to
@@ -1045,6 +1267,62 @@ static void *tip_watcher(void *arg) {
         bitcoind_template_free(t);
     }
     return NULL;
+}
+
+/* ---------- pool identity ---------- */
+
+/* Which chain this pool is mining, and how confidently we know it.
+ *
+ * getblockchaininfo is authoritative, so ask first. It is also not always
+ * available: the CUSF enforcer serves getblocktemplate and submitblock and
+ * answers "Method not found" to everything else, and that enforcer is
+ * precisely the backend a drivechain pool has to point at for BIP300/301
+ * commitments. So fall back to the network encoded in operator_address —
+ * which is weaker (it cannot tell testnet from signet) but never wrong about
+ * mainnet — and record which of the two answered, so the dashboard can say
+ * "inferred" instead of asserting.
+ *
+ * Also the only place the two are ever compared. A mainnet operator address
+ * on a test chain, or the reverse, pays the fee to a script nobody on that
+ * chain controls: the block is valid, the coinbase looks fine, and the
+ * money is gone. That is worth a loud line in the journal. */
+static void resolve_network(bitcoind_client_t *btc, const proxy_config_t *cfg,
+                            char *net, size_t net_cap,
+                            char *src, size_t src_cap) {
+    const char *from_addr = coinbase_address_network(cfg->operator_address);
+    char node_chain[32] = {0};
+    char nerr[256] = {0};
+
+    if (bitcoind_get_chain(btc, node_chain, sizeof node_chain,
+                           nerr, sizeof nerr) == 0) {
+        snprintf(net, net_cap, "%s", node_chain);
+        snprintf(src, src_cap, "node");
+        if (from_addr &&
+            coinbase_network_is_mainnet(node_chain) !=
+            coinbase_network_is_mainnet(from_addr)) {
+            LOG_WARN("operator_address '%s' is a %s address but the node is "
+                     "on '%s' — the %d bps fee would pay a script nobody on "
+                     "this chain controls. Fix operator_address before "
+                     "mining a block.",
+                     cfg->operator_address, from_addr, node_chain,
+                     cfg->fee_bps);
+        }
+        return;
+    }
+
+    if (from_addr) {
+        snprintf(net, net_cap, "%s", from_addr);
+        snprintf(src, src_cap, "inferred");
+        LOG_INFO("network: backend does not answer getblockchaininfo (%s); "
+                 "inferred '%s' from operator_address", nerr, from_addr);
+        return;
+    }
+
+    snprintf(net, net_cap, "unknown");
+    snprintf(src, src_cap, "unknown");
+    LOG_WARN("network: could not determine which chain this pool is mining "
+             "(getblockchaininfo: %s, and operator_address '%s' encodes no "
+             "network)", nerr, cfg->operator_address);
 }
 
 /* ---------- usage ---------- */
@@ -1158,6 +1436,24 @@ int main(int argc, char **argv) {
         return 4;
     }
 
+    /* Pool identity into the DB, before anything else can read the table.
+     * The dashboard shows this to miners; see store.h for why it lives in
+     * the DB rather than in the dashboard's own environment. */
+    {
+        char network[32] = {0}, network_src[16] = {0};
+        resolve_network(&btc, &cfg, network, sizeof network,
+                        network_src, sizeof network_src);
+        const int pps = strcmp(cfg.pool_mode, "pps-classic") == 0;
+        LOG_INFO("pool identity: network=%s (%s) mode=%s fee=%d bps tag=\"%s\" "
+                 "operator=%s%s%s",
+                 network, network_src, cfg.pool_mode, cfg.fee_bps,
+                 cfg.coinbase_tag, cfg.operator_address,
+                 pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        store_record_pool_identity(store, network, network_src,
+                                   cfg.coinbase_tag, cfg.operator_address,
+                                   pps ? cfg.pool_btc_address : NULL);
+    }
+
     /* Broadcast (optional). */
     broadcast_cfg_t bcfg2 = {0};
     snprintf(bcfg2.url, sizeof bcfg2.url, "%s", cfg.redis_url);
@@ -1213,6 +1509,35 @@ int main(int argc, char **argv) {
         if (bcast) {
             broadcast_node_tip(bcast, tmpl->height - 1, tmpl->prev_hash_hex, now_s);
         }
+    }
+
+    /* Classify whatever is already on record, once, before serving.
+     *
+     * Rows written before blocks_found had a status are all 'pending', which
+     * counts as nothing — correct, but useless. The templates table is a log
+     * of the tips this pool observed, so one bulk SQL pass settles every
+     * candidate whose next height was ever seen, with no RPC and no reliance
+     * on a backend that may serve only two methods. What it cannot reach
+     * stays pending.
+     *
+     * Then, and only then, the UNIQUE index on hash: it fails outright on a
+     * table that still holds duplicates, which is why it is not a migration —
+     * the migration runner would swallow that failure as a warning and leave
+     * the index missing on exactly the databases that needed it. */
+    {
+        int confirmed = 0, orphaned = 0, pending = 0;
+        if (store_reconcile_blocks_from_templates(store, tmpl->height - 1,
+                                                  &confirmed, &orphaned,
+                                                  &pending) == 0) {
+            LOG_INFO("blocks on record: confirmed=%d orphaned=%d pending=%d",
+                     confirmed, orphaned, pending);
+            if (pending > 0) {
+                LOG_INFO("%d block candidate(s) could not be verified from "
+                         "observed tips and count as nothing until they are",
+                         pending);
+            }
+        }
+        store_finalize_block_hash_index(store);
     }
 
     /* Seed the rate before any share can arrive — a share credited at 0
@@ -1275,6 +1600,10 @@ int main(int argc, char **argv) {
     stcfg.on_reject      = on_reject_cb;
     stcfg.on_block       = on_block_cb;
     stcfg.on_block_found = on_block_found_cb;
+    /* Let the server see the accrual gate so it can refuse work the pool has
+     * decided not to pay for. */
+    stcfg.pps_gate = &sctx.pps_gated;
+    stcfg.pps_refuse_shares_below_min = cfg.pps_refuse_shares_below_min;
 
     /* Validate the rental port BEFORE anything is started, so a bad value is
      * a clean config error rather than a half-built pool. */

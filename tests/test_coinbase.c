@@ -690,6 +690,41 @@ static void test_build_from_template_multi_sum_check(void) {
     printf("ok: coinbase_build_from_template_multi sum check\n");
 }
 
+/* The network an address encodes, used when the block-template backend
+ * cannot be asked (the CUSF enforcer answers only getblocktemplate and
+ * submitblock). Deliberately coarse: several networks share version bytes
+ * and HRPs, so the test pins that it reports what the encoding proves and
+ * refuses to over-claim. */
+static void test_address_network(void) {
+    assert(strcmp(coinbase_address_network(
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"), "main") == 0);
+    assert(strcmp(coinbase_address_network(
+        "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"), "main") == 0);
+    assert(strcmp(coinbase_address_network(
+        "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"), "regtest") == 0);
+    /* testnet and signet share the `tb` HRP — reporting either one alone
+     * would be a guess dressed up as a fact. */
+    assert(strcmp(coinbase_address_network(
+        "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"), "test/signet") == 0);
+
+    /* A typo must read as "no idea", not as a network: it is the input to a
+     * mainnet-vs-testnet mismatch warning, and a false negative there is a
+     * burnt fee output. */
+    assert(coinbase_address_network(
+        "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfna") == NULL);
+    assert(coinbase_address_network("") == NULL);
+    assert(coinbase_address_network(NULL) == NULL);
+
+    assert(coinbase_network_is_mainnet("main") == 1);
+    assert(coinbase_network_is_mainnet("signet") == 0);
+    assert(coinbase_network_is_mainnet("test") == 0);
+    assert(coinbase_network_is_mainnet("regtest") == 0);
+    /* Unrecognised must not read as mainnet. */
+    assert(coinbase_network_is_mainnet("who-knows") == 0);
+    assert(coinbase_network_is_mainnet(NULL) == 0);
+    printf("ok: address -> network\n");
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -705,6 +740,7 @@ int main(void) {
     test_build_from_template_multi_fee();
     test_build_from_template_multi_sum_check();
     test_count_outputs();
+    test_address_network();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }

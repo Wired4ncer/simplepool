@@ -413,6 +413,48 @@ int coinbase_address_to_script(const char *addr,
     return -1;
 }
 
+/* ---------- address -> network ---------- */
+
+/* The network an address encodes, from its bech32 HRP or base58 version
+ * byte. Returns a static string, or NULL when the address parses as neither.
+ *
+ * Coarser than getblockchaininfo's `chain` on purpose. Testnet, signet and
+ * regtest share the 0x6f/0xc4 base58 version bytes, and testnet and signet
+ * share the `tb` HRP, so an address genuinely cannot tell those apart — this
+ * returns what the encoding actually proves and nothing more. That is enough
+ * for the one check worth making: mainnet vs not. Paying the operator fee to
+ * a mainnet address on a test chain (or the reverse) burns it to a script
+ * nobody on that chain controls. */
+const char *coinbase_address_network(const char *addr) {
+    if (!addr || !addr[0]) return NULL;
+    if (strncmp(addr, "bcrt1", 5) == 0 || strncmp(addr, "BCRT1", 5) == 0)
+        return "regtest";
+    if (strncmp(addr, "bc1", 3) == 0 || strncmp(addr, "BC1", 3) == 0)
+        return "main";
+    if (strncmp(addr, "tb1", 3) == 0 || strncmp(addr, "TB1", 3) == 0)
+        return "test/signet";
+
+    uint8_t dec[64];
+    size_t  dec_len = 0;
+    if (b58_decode(addr, dec, sizeof dec, &dec_len) < 0 || dec_len != 25)
+        return NULL;
+    /* Checksum, so a typo reads as "unknown" rather than as a network. */
+    uint8_t h1[32], h2[32];
+    sha256(dec, dec_len - 4, h1);
+    sha256(h1, 32, h2);
+    if (memcmp(h2, dec + dec_len - 4, 4) != 0) return NULL;
+    if (dec[0] == 0x00 || dec[0] == 0x05) return "main";
+    if (dec[0] == 0x6f || dec[0] == 0xc4) return "test/signet/regtest";
+    return NULL;
+}
+
+/* Whether a chain name — from either getblockchaininfo or the function above
+ * — means mainnet. Anything that is not explicitly mainnet is treated as a
+ * test chain, so an unrecognised name never silently reads as "main". */
+int coinbase_network_is_mainnet(const char *network) {
+    return network && strcmp(network, "main") == 0;
+}
+
 /* ---------- main builder ---------- */
 
 void coinbase_parts_free(coinbase_parts_t *p) {

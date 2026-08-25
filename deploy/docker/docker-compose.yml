@@ -82,7 +82,11 @@ services:
       THUNDER_RPC_URL: ${THUNDER_RPC_URL:-http://host.docker.internal:6009}
       THUNDER_FROM_ADDRESS: ${THUNDER_FROM_ADDRESS:-}
       PAYOUT_MIN_SATS: ${PAYOUT_MIN_SATS:-10000}
-      PAYOUT_INTERVAL_MS: ${PAYOUT_INTERVAL_MS:-30000}
+      # Daily batch. Settlement of an already-broadcast batch runs on its
+      # own short clock so a payout isn't left uncredited for 24h.
+      PAYOUT_INTERVAL_MS: ${PAYOUT_INTERVAL_MS:-86400000}
+      PAYOUT_SETTLE_INTERVAL_MS: ${PAYOUT_SETTLE_INTERVAL_MS:-30000}
+      PAYOUT_RETRY_INTERVAL_MS: ${PAYOUT_RETRY_INTERVAL_MS:-300000}
       PAYOUT_DRY_RUN: ${PAYOUT_DRY_RUN:-0}
       # Admin HTTP surface — dashboard reaches it at PAYOUT_ADMIN_URL.
       # Bind to 0.0.0.0 (default) so the dashboard container can reach

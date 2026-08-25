@@ -43,6 +43,29 @@ CREATE TABLE IF NOT EXISTS rejects (
 );
 CREATE INDEX IF NOT EXISTS rejects_ts_idx ON rejects(ts);
 
+-- A row here is a block CANDIDATE, not a block. A share meeting network
+-- difficulty produces one, and submitblock refuses stale, duplicate and
+-- high-hash candidates routinely — on a low-difficulty chain that is nearly
+-- every one of them. `status` is what separates the two, and every count and
+-- every sum of reward_sats MUST filter on status='confirmed':
+--
+--   pending    submitted and accepted by the node, not yet verified to be in
+--              the chain. NOT revenue. Against a backend that answers only
+--              getblocktemplate/submitblock there may be nothing able to
+--              verify it for some time, so this is a normal steady state
+--              rather than a transient.
+--   confirmed  verified to be in the chain. The only status worth money.
+--   orphaned   was in the chain, then reorged out. Earns nothing.
+--   rejected   submitblock refused it; submit_error carries the reason.
+--
+-- checked_via records who answered: 'node' (getblockhash) or 'tips' (the
+-- observed chain of getblocktemplate prev_hashes, used when the backend does
+-- not serve getblockhash) — the same distinction pool_meta.network_source
+-- draws between an authoritative answer and an inferred one.
+--
+-- Several rows per height is expected, not a bug: on a low-difficulty chain
+-- the pool genuinely finds competing candidates at one height. At most one of
+-- them can be 'confirmed'.
 CREATE TABLE IF NOT EXISTS blocks_found (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   ts              INTEGER NOT NULL,
@@ -51,9 +74,14 @@ CREATE TABLE IF NOT EXISTS blocks_found (
   finder_id       INTEGER REFERENCES workers(id),
   finder_address  TEXT,
   reward_sats     INTEGER,
-  fee_sats        INTEGER
+  fee_sats        INTEGER,
+  status          TEXT NOT NULL DEFAULT 'pending',
+  confirmations   INTEGER NOT NULL DEFAULT 0,
+  submit_error    TEXT,
+  checked_via     TEXT
 );
 CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);
+CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status);
 
 /* Single-row mirror of the upstream bitcoind tip the proxy is currently
  * mining on. Written by the proxy's tip watcher on every successful
@@ -83,6 +111,18 @@ CREATE TABLE IF NOT EXISTS node_status (
  * which shares.credited_sats is populated. */
 CREATE TABLE IF NOT EXISTS pool_meta (
   id                  INTEGER PRIMARY KEY CHECK (id = 1),
+  /* Pool identity — what the proxy is configured to be, written once at
+   * startup rather than on the template path. A miner cannot tell any of
+   * this from the stratum URL, so the dashboard has to say it: which chain
+   * the coinbase is being built for, whose tag is in it, and where the
+   * money goes. network_source is 'node' (getblockchaininfo answered) or
+   * 'inferred' (it did not, and the network was read off the operator
+   * address, which cannot distinguish testnet from signet). */
+  network             TEXT,
+  network_source      TEXT,     /* 'node' | 'inferred' */
+  coinbase_tag        TEXT,
+  operator_address    TEXT,     /* fee_bps recipient */
+  pool_btc_address    TEXT,     /* pps-classic only; NULL in solo */
   pool_mode           TEXT,
   fee_bps             INTEGER,
   rate_source         TEXT,     /* 'derived' | 'override' */

@@ -53,7 +53,7 @@ BIN       := $(BUILD_DIR)/simplepool
 # different question: a tree gets patched or moves on past the last `make`,
 # and from then on its HEAD is not what the running process was built from.
 # Empty outside a git checkout (release tarball) — reported as "unknown".
-VERSION    := 0.1.0
+VERSION    := 0.2.0
 GIT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
 GIT_DIRTY  := $(shell git status --porcelain --untracked-files=no 2>/dev/null | head -1)
@@ -68,7 +68,7 @@ SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
 OBJS := $(SRCS:%.c=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean test format install help FORCE
+.PHONY: all clean test asan format install help FORCE
 
 all: $(BIN)
 
@@ -139,6 +139,36 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_thunder
 	./build/test_pplns
 	./build/test_config
+
+# Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
+#
+# Worth its own target: the jobs the stratum server hands to submit handlers
+# are shared across threads and freed by the tip watcher, and a lifetime bug
+# there is invisible to a normal test run — it corrupts a field rather than
+# crashing. One reached production as blocks_found rows carrying a freed job's
+# height and reward. Plain `make test` will not catch the next one; this will.
+#
+# Not the default build: ASan costs roughly 2x runtime and a lot of memory.
+ASAN_CFLAGS := -std=c11 -g -O1 -fsanitize=address,undefined \
+               -fno-omit-frame-pointer -D_POSIX_C_SOURCE=200809L \
+               -Iinclude -Isrc -Isrc/cjson $(PLATFORM_CFLAGS)
+ASAN_DIR := build/asan
+
+asan:
+	@mkdir -p $(ASAN_DIR)
+	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_stratum tests/test_stratum.c \
+		src/stratum.c src/coinbase.c src/share.c src/sha256.c src/thunder.c \
+		src/log.c src/cjson/cJSON.c -lpthread
+	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_store tests/test_store.c \
+		src/store.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_coinbase tests/test_coinbase.c \
+		src/coinbase.c src/sha256.c
+	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_share tests/test_share.c \
+		src/share.c src/sha256.c
+	./$(ASAN_DIR)/test_stratum
+	./$(ASAN_DIR)/test_store
+	./$(ASAN_DIR)/test_coinbase
+	./$(ASAN_DIR)/test_share
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \

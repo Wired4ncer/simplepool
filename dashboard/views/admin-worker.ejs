@@ -307,7 +307,13 @@ const atCurrentRate = meta && meta.rate_sats_per_diff
                         <td class="mono small" title="<%= fmtTs(r.ts) %>"><%= ago(r.ts) %></td>
                         <td><%= fmtF(r.difficulty, 6) %></td>
                         <td><%= fmtSats(r.credit_sats) %></td>
-                        <td><%= r.is_block ? '✓ ' + (r.block_hash ? r.block_hash.slice(0, 10) + '…' : '') : '' %></td>
+                        <%# is_block means the hash met the network target — what the
+                            miner actually did. Whether it became a block is a
+                            separate question, so show the verdict beside it rather
+                            than letting a bare tick imply one. %>
+                        <td><% if (r.is_block) { %>✓ <%= r.block_hash ? r.block_hash.slice(0, 10) + '…' : '' %>
+                            <%- blockStatus({ status: r.block_status }) %>
+                        <% } %></td>
                         <td><%= fmtSats(r.running_accrued) %></td>
                     </tr>
                     <% }) %>

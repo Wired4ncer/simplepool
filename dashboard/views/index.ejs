@@ -13,50 +13,7 @@
             </div>
         <% } %>
 
-        <section class="card info">
-            <h2>About the numbers on this page</h2>
-            <p class="muted small">
-                This is the <strong>PPS-classic build</strong> of simplepool,
-                paying out in <strong>Thunder</strong>
-                (BIP300 drivechain sidechain&nbsp;#9). Every accepted share
-                credits your worker a fixed number of sats — currently
-                <strong>1&nbsp;000&nbsp;sats × share difficulty</strong> — whether
-                or not that share becomes a block. Accruals accumulate under
-                your Thunder address in <code>pps_credits</code>.
-            </p>
-            <p class="muted small">
-                When a share becomes a block, the coinbase pays the pool's own
-                Bitcoin wallet (a normal P2WPKH output) for the miner-share of
-                the reward, and the operator address for a small fee (1%). The
-                pool operator then periodically batches accumulated BTC into
-                Thunder via a canonical BIP300 deposit transaction — this is
-                the step that actually moves value onto the sidechain. Once
-                the pool's Thunder reserve is funded, the payout worker sends
-                Thunder transactions to each miner's Thunder address on a
-                cadence to drain their owed balance.
-            </p>
-            <p class="muted small">
-                Why the two-step deposit? The LayerTwo-Labs enforcer only
-                credits deposits that spend real, spendable UTXOs. Coinbases
-                don't qualify; embedding the deposit directly in the coinbase
-                results in a stranded output. Standard drivechain mining
-                pools all route through a pool BTC wallet.
-            </p>
-
-            <h3 style="margin-top:1em;margin-bottom:0.25em">Connect a miner</h3>
-            <pre class="mono small" style="margin:0;padding:0.5em;background:#0002;border-radius:4px;overflow-x:auto"><%= stratumUrl %>
-username:  &lt;your-Thunder-address&gt;[.&lt;rig_label&gt;]
-password:  (ignored — any value)</pre>
-            <p class="muted small" style="margin-top:0.5em">
-                The username must be a valid Thunder address — base58 of a 20-byte
-                hash, e.g. <code>3Z6z1hPySNkFeB7HiKPCgqu4TZez</code>. Generate one
-                with <code>thunder-cli get-new-address</code> on any Thunder node.
-                Using a Bitcoin address is rejected with
-                <em>"invalid thunder address"</em> and no shares accrue.
-                The optional <code>.&lt;rig_label&gt;</code> groups multiple rigs
-                paying the same address as separate rows on the per-worker page.
-            </p>
-        </section>
+        <%- include('partial/about-numbers') %>
 
         <section class="card">
             <h2>Bitcoin node tip</h2>
@@ -89,7 +46,7 @@ password:  (ignored — any value)</pre>
                 <div><label>Accepted</label><strong><%= fmtN(ov.accepted) %></strong></div>
                 <div><label>Rejected</label><strong><%= fmtN(ov.rejected) %></strong></div>
                 <div><label>Reject rate</label><strong><%= ov.reject_rate_pct.toFixed(2) %>%</strong></div>
-                <div><label>Blocks found</label><strong><%= fmtN(ov.blocks) %></strong></div>
+                <div><label>Blocks found</label><strong title="confirmed to be in the chain"><%= fmtN(ov.blocks) %></strong></div>
                 <div><label>Best share (24h)</label><strong><%= fmtN(Math.round(ov.best_share_24h)) %></strong></div>
             </div>
         </section>
@@ -99,10 +56,19 @@ password:  (ignored — any value)</pre>
             <div class="grid">
                 <div><label>Shares</label><strong><%= fmtN(ov.shares_lifetime) %></strong></div>
                 <div><label>Rejects</label><strong><%= fmtN(ov.rejects_lifetime) %></strong></div>
-                <div><label>Blocks</label><strong><%= fmtN(ov.blocks_lifetime) %></strong></div>
+                <div><label>Blocks</label><strong title="confirmed to be in the chain"><%= fmtN(ov.blocks_lifetime) %></strong></div>
                 <div><label>Best share ever</label><strong><%= fmtN(Math.round(ov.best_share_lifetime)) %></strong></div>
                 <div><label>Tracking since</label><strong title="<%= fmtTs(ov.oldest_share_ts) %>"><%= ago(ov.oldest_share_ts) %></strong></div>
             </div>
+            <% if (ov.blocks_orphaned || ov.blocks_rejected || ov.blocks_pending) { %>
+            <p class="muted small">
+                Candidates that are not blocks:
+                <%= fmtN(ov.blocks_orphaned) %> orphaned,
+                <%= fmtN(ov.blocks_rejected) %> rejected by the node,
+                <%= fmtN(ov.blocks_pending) %> not yet verified.
+                Only confirmed blocks are counted above, and only they pay the pool.
+            </p>
+            <% } %>
         </section>
 
         <section class="card">
@@ -166,13 +132,14 @@ password:  (ignored — any value)</pre>
                 <p class="muted">No blocks found.</p>
             <% } else { %>
             <table class="lb">
-                <thead><tr><th>Height</th><th>Finder</th><th>Reward</th><th>Hash</th><th>When</th></tr></thead>
+                <thead><tr><th>Height</th><th>Finder</th><th>Reward</th><th>Status</th><th>Hash</th><th>When</th></tr></thead>
                 <tbody>
                 <% blocks.forEach(b => { %>
                     <tr>
                         <td><%= fmtN(b.height) %></td>
                         <td><% if (b.finder) { %><a href="/worker/<%= encodeURIComponent(b.finder) %>"><%= b.finder %></a><% } else { %>—<% } %></td>
-                        <td><%= fmtBtc(b.reward_sats) %></td>
+                        <td><%= b.status === 'confirmed' ? fmtBtc(b.reward_sats) : '—' %></td>
+                        <td><%- blockStatus(b) %></td>
                         <td class="mono small"><%= b.hash %></td>
                         <td title="<%= fmtTs(b.ts) %>"><%= ago(b.ts) %></td>
                     </tr>

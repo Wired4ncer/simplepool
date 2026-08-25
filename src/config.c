@@ -79,6 +79,9 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->prop_min_payout_sats = 1000000LL;  /* ~0.01 ECX at current subsidy */
     cfg->prop_max_outputs = 12;
     cfg->prop_window_min_sec = 600;         /* 10 minutes */
+    cfg->pps_min_network_difficulty = 0.0;
+    cfg->block_interval_sec = 600;
+    cfg->pps_refuse_shares_below_min = 1;
 }
 
 static char *strtrim(char *s) {
@@ -213,6 +216,9 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "prop_min_payout_sats")      == 0) cfg->prop_min_payout_sats = (int64_t)atoll(v);
         else if (strcmp(k, "prop_max_outputs")          == 0) cfg->prop_max_outputs = atoi(v);
         else if (strcmp(k, "prop_window_min_sec")       == 0) cfg->prop_window_min_sec = atoi(v);
+        else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
+        else if (strcmp(k, "block_interval_sec")        == 0) cfg->block_interval_sec = atoi(v);
+        else if (strcmp(k, "pps_refuse_shares_below_min") == 0) cfg->pps_refuse_shares_below_min = atoi(v);
         /* Retired with pool_mode=pps (the drivechain-in-coinbase build).
          * Accepted and ignored so an existing proxy.conf keeps loading;
          * the Thunder reserve address now lives only on the dashboard,
@@ -278,6 +284,17 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
                     "config: 'pool_btc_address' is required when pool_mode=pps-classic");
             return -9;
         }
+        if (cfg->pps_min_network_difficulty < 0.0) {
+            set_err(errbuf, errlen,
+                    "config: 'pps_min_network_difficulty' cannot be negative "
+                    "(0 disables the check)");
+            return -10;
+        }
+    }
+    if (cfg->block_interval_sec <= 0) {
+        set_err(errbuf, errlen,
+                "config: 'block_interval_sec' must be > 0 (600 for Bitcoin)");
+        return -11;
     }
     if (strcmp(cfg->pool_mode, "proportional") == 0) {
         if (cfg->prop_window_k <= 0.0) {

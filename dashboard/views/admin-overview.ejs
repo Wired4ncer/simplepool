@@ -74,19 +74,21 @@
     </section>
 
     <section class="card">
-        <h2>Recent blocks</h2>
+        <h2>Recent block candidates</h2>
         <% if (blocks.length === 0) { %>
             <p class="muted">No blocks recorded yet.</p>
         <% } else { %>
         <p class="muted small" style="margin-top:0">
             Every block's coinbase pays the pool's <code>pool_btc_address</code>
             (pps-classic). Operator batches accumulated BTC into Thunder via the
-            deposits page.
+            deposits page. Only candidates shown as <em>in chain</em> actually
+            paid — a rejected or orphaned one contributes nothing, and the
+            solvency check counts it as nothing.
         </p>
         <table>
             <thead><tr>
                 <th>When</th><th>Height</th><th>Block hash</th>
-                <th>Finder</th><th>Reward</th><th>Fee</th>
+                <th>Finder</th><th>Reward</th><th>Fee</th><th>Status</th>
             </tr></thead>
             <tbody>
                 <% blocks.forEach(b => { %>
@@ -101,8 +103,9 @@
                             <span class="muted">(unattributed)</span>
                         <% } %>
                     </td>
-                    <td><%= fmtSats(b.reward_sats) %></td>
-                    <td class="muted small"><%= fmtSats(b.fee_sats) %></td>
+                    <td><%= b.status === 'confirmed' ? fmtSats(b.reward_sats) : '—' %></td>
+                    <td class="muted small"><%= b.status === 'confirmed' ? fmtSats(b.fee_sats) : '—' %></td>
+                    <td><%- blockStatus(b) %></td>
                 </tr>
                 <% }) %>
             </tbody>

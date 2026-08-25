@@ -234,7 +234,11 @@ typedef struct {
     int mode;
     int requests;      /* how many to serve before returning */
     int saw_gbt;       /* did a getblocktemplate request arrive? */
+    int saw_getblockhash;
 } stub_t;
+
+#define STUB_BLOCK_HASH \
+    "0000000000000000000fedcba9876543210fedcba9876543210fedcba987654"
 
 static const char *STUB_TEMPLATE_RESULT =
     "{\"version\":536870912,"
@@ -266,10 +270,16 @@ static void *stub_thread(void *arg) {
 
         int wants_gbt  = strstr(buf, "getblocktemplate")  != NULL;
         int wants_info = strstr(buf, "getblockchaininfo") != NULL;
+        int wants_hash = strstr(buf, "getblockhash")      != NULL;
         if (wants_gbt) st->saw_gbt = 1;
+        if (wants_hash) st->saw_getblockhash = 1;
 
         char body[2048];
-        if (st->mode == STUB_FULL_NODE && wants_info) {
+        if (st->mode == STUB_FULL_NODE && wants_hash) {
+            snprintf(body, sizeof body,
+                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"%s\","
+                     "\"error\":null}", STUB_BLOCK_HASH);
+        } else if (st->mode == STUB_FULL_NODE && wants_info) {
             snprintf(body, sizeof body,
                      "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"chain\":\"main\"},\"error\":null}");
         } else if (st->mode != STUB_DEAD && wants_gbt) {
@@ -387,6 +397,65 @@ static void test_ping_fails_when_nothing_is_served(void) {
     close(st.listen_fd);
 }
 
+/* A backend that does not serve getblockhash must be recognised as such, not
+ * treated as a failure to retry. The CUSF enforcer — the backend a drivechain
+ * pool has to point at — answers "Method not found" to everything but
+ * getblocktemplate and submitblock, so a confirmation design that assumes
+ * getblockhash simply never runs there. The caller latches this answer and
+ * falls back to the observed chain of template tips. */
+static void test_getblockhash_unsupported_is_distinguished(void) {
+    stub_t st;
+    if (stub_start(&st, STUB_TEMPLATE_ONLY, 1) != 0) { CHECK(0); return; }
+    pthread_t th;
+    pthread_create(&th, NULL, stub_thread, &st);
+
+    bitcoind_client_t c;
+    bitcoind_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.url, sizeof cfg.url, "http://127.0.0.1:%d", st.port);
+    cfg.timeout_ms = 5000;
+    CHECK(bitcoind_client_init(&c, &cfg) == 0);
+
+    char hash[80] = {0};
+    char err[256] = {0};
+    int rc = bitcoind_get_block_hash(&c, 800123, hash, sizeof hash,
+                                     err, sizeof err);
+    CHECK(rc == BITCOIND_ERR_UNSUPPORTED);
+    CHECK(hash[0] == '\0');
+
+    bitcoind_client_free(&c);
+    pthread_join(th, NULL);
+    close(st.listen_fd);
+}
+
+/* And where it is served, the hash comes back verbatim — this is what says a
+ * block the pool submitted is still the one at its height. */
+static void test_getblockhash_returns_the_hash(void) {
+    stub_t st;
+    if (stub_start(&st, STUB_FULL_NODE, 1) != 0) { CHECK(0); return; }
+    pthread_t th;
+    pthread_create(&th, NULL, stub_thread, &st);
+
+    bitcoind_client_t c;
+    bitcoind_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.url, sizeof cfg.url, "http://127.0.0.1:%d", st.port);
+    cfg.timeout_ms = 5000;
+    CHECK(bitcoind_client_init(&c, &cfg) == 0);
+
+    char hash[80] = {0};
+    char err[256] = {0};
+    int rc = bitcoind_get_block_hash(&c, 800123, hash, sizeof hash,
+                                     err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(hash, STUB_BLOCK_HASH) == 0);
+    CHECK(st.saw_getblockhash == 1);
+
+    bitcoind_client_free(&c);
+    pthread_join(th, NULL);
+    close(st.listen_fd);
+}
+
 int main(void) {
     test_parse_ok();
     test_parse_coinbasetxn();
@@ -397,6 +466,8 @@ int main(void) {
     test_ping_uses_chaininfo_when_available();
     test_ping_falls_back_to_template();
     test_ping_fails_when_nothing_is_served();
+    test_getblockhash_unsupported_is_distinguished();
+    test_getblockhash_returns_the_hash();
 
     printf("test_bitcoind: %d passed, %d failed\n", g_pass, g_fail);
     if (g_fail == 0) {

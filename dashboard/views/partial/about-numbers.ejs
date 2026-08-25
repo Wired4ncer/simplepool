@@ -1,0 +1,186 @@
+<%# What the figures on the overview mean, and how to point a rig at this pool.
+
+    Branches on pool_mode because almost nothing here is shared between the
+    two modes: solo pays the finder in the coinbase and accrues nothing,
+    pps-classic credits every share and settles through a pool wallet and a
+    BIP300 deposit. The card used to state the pps-classic story
+    unconditionally, which on a solo pool told miners to authorize with a
+    Thunder address — the one thing that cannot work there (stratum.c
+    rejects it with "invalid payout address in stratum username").
+
+    Every figure comes from res.locals.pool, i.e. from pool_meta, i.e. from
+    the running proxy. Nothing here is a literal, because the previous
+    literal — "1 000 sats × share difficulty" — was never true of a rate
+    that is derived per template and moves with difficulty.
+
+    Locals: pool, stratumUrl, sidechainId. %>
+<%
+const _p    = (typeof pool !== 'undefined' && pool) ? pool : null;
+const _mode = _p && _p.pool_mode ? _p.pool_mode : null;
+const _net  = _p && _p.network   ? _p.network   : null;
+const _url  = (typeof stratumUrl !== 'undefined' && stratumUrl)
+            ? stratumUrl : 'stratum+tcp://<pool-host>:3334';
+const _sid  = (typeof sidechainId !== 'undefined' && sidechainId != null)
+            ? sidechainId : 9;
+const _feePct = _p && _p.fee_bps ? (_p.fee_bps / 100).toFixed(2) + '%' : null;
+const _sats = n => Number(n).toLocaleString('en-US',
+                     { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/* Address examples for the network this pool is actually on — a miner told
+ * to use "bc1q…" on a signet pool has been misled just as surely as one told
+ * to use a Thunder address in solo mode.
+ *
+ * Only for networks the encoding pins down. "test/signet/regtest" comes from
+ * a base58 operator address, which genuinely cannot say which — so it falls
+ * through to prose rather than inventing a prefix. */
+function _examples(net) {
+    if (net === 'main')    return { w: 'bc1q…',   t: 'bc1p…',   l: '1…',       s: '3…' };
+    if (net === 'regtest') return { w: 'bcrt1q…', t: 'bcrt1p…', l: 'm… / n…',  s: '2…' };
+    if (net === 'test' || net === 'signet' || net === 'test/signet')
+                           return { w: 'tb1q…',   t: 'tb1p…',   l: 'm… / n…',  s: '2…' };
+    return null;
+}
+const _ex = _examples(_net);
+%>
+<section class="card info">
+    <h2>About the numbers on this page</h2>
+
+<% if (_mode === 'pps-classic') { %>
+    <p class="muted small">
+        This pool runs in <strong>pps-classic</strong> mode, paying out in
+        <strong>Thunder</strong> (BIP300 drivechain sidechain&nbsp;#<%= _sid %>).
+        Every accepted share credits your worker whether or not that share
+        becomes a block. Credits accumulate under your Thunder address in
+        <code>pps_credits</code>.
+    </p>
+
+    <p class="muted small">
+        <strong>The rate is not a fixed number.</strong> It is derived from
+        each block template as
+        <code>(block value ÷ network difficulty) × (1 − fee)</code>, so it
+        moves with difficulty and with the fees in the template.
+        <% if (_p && _p.rate_sats_per_diff > 0) { %>
+            Right now: <strong><%= _sats(_p.rate_sats_per_diff) %>&nbsp;sats</strong>
+            per unit of share difficulty<% if (_feePct) { %>, net of the
+            <strong><%= _feePct %></strong> operator fee<% } %><% if (_p.gross_sats_per_diff > 0) { %>
+            (gross <%= _sats(_p.gross_sats_per_diff) %>)<% } %>.
+        <% } else { %>
+            The proxy has not published a rate yet — it does so on its first
+            block template, so this fills in once the pool is receiving work.
+        <% } %>
+        Every credit is stored with the exact rate it was paid at, so you can
+        recompute your own balance on your worker page rather than take the
+        pool's word for it.
+    </p>
+
+    <% if (_p && _p.rate_source === 'override') { %>
+    <p class="muted small poolid-unknown">
+        ⚠ The operator has <strong>pinned</strong> this rate rather than
+        deriving it. A pinned rate does not track difficulty, and is taken
+        already net of fee — what it actually implies here is a
+        <strong><%= (_p.effective_fee_bps / 100).toFixed(2) %>%</strong> fee<%
+        if (_feePct) { %>, against the <%= _feePct %> configured<% } %>.
+        See <a href="/health">/health</a>.
+    </p>
+    <% } %>
+
+    <p class="muted small">
+        When a share becomes a block, the coinbase pays the pool's own
+        Bitcoin wallet<% if (_p && _p.pool_btc_address) { %>
+        (<code class="poolid-addr"><%= _p.pool_btc_address %></code>)<% } %>
+        for the miner-share of the reward, and the operator address<% if (_p && _p.operator_address) { %>
+        (<code class="poolid-addr"><%= _p.operator_address %></code>)<% } %>
+        for the fee<% if (_feePct) { %> of <%= _feePct %><% } %>. The operator
+        then periodically batches accumulated BTC into Thunder via a canonical
+        BIP300 deposit transaction — this is the step that actually moves
+        value onto the sidechain. Once the pool's Thunder reserve is funded,
+        the payout worker sends Thunder transactions to each miner's Thunder
+        address on a cadence to drain their owed balance.
+    </p>
+
+    <p class="muted small">
+        Why the two-step deposit? The LayerTwo-Labs enforcer only credits
+        deposits that spend real, spendable UTXOs. Coinbases don't qualify;
+        embedding the deposit directly in the coinbase results in a stranded
+        output. Standard drivechain mining pools all route through a pool BTC
+        wallet.
+    </p>
+
+    <h3 class="about-h3">Connect a miner</h3>
+    <pre class="about-pre"><%= _url %>
+username:  &lt;your-Thunder-address&gt;[.&lt;rig_label&gt;]
+password:  (ignored — any value)</pre>
+    <p class="muted small about-note">
+        The username must be a valid Thunder address — base58 of a 20-byte
+        hash, e.g. <code>3Z6z1hPySNkFeB7HiKPCgqu4TZez</code>. Generate one
+        with <code>thunder-cli get-new-address</code> on any Thunder node.
+        Using a <strong>Bitcoin</strong> address is rejected with
+        <em>"invalid thunder address"</em> and no shares accrue.
+        The optional <code>.&lt;rig_label&gt;</code> groups multiple rigs
+        paying the same address as separate rows on the per-worker page.
+    </p>
+
+<% } else if (_mode === 'solo') { %>
+    <p class="muted small">
+        This pool runs in <strong>solo</strong> mode. Each block it finds pays
+        the miner who found it, directly in that block's coinbase. Nothing
+        accrues between blocks: a share that does not become a block earns
+        nothing — it only proves you are working and sets your difficulty.
+        There is no PPS credit, no pool wallet and no Thunder payout in this
+        mode.
+    </p>
+
+    <p class="muted small">
+        When one of your shares does become a block, the coinbase pays
+        <strong>your address</strong> the block reward<% if (_feePct) { %>
+        minus the operator fee of <strong><%= _feePct %></strong><% if (_p && _p.operator_address) { %>,
+        which goes to <code class="poolid-addr"><%= _p.operator_address %></code><% } %><% } %>.
+        Coinbase outputs mature after <strong>100 confirmations</strong>
+        (roughly 16 hours), so a block shows up here well before it is
+        spendable in your wallet.<% if (_feePct) { %> If the fee would come to
+        under 546 sats it is dropped as dust and you take the whole reward.<% } %>
+    </p>
+
+    <h3 class="about-h3">Connect a miner</h3>
+    <pre class="about-pre"><%= _url %>
+username:  &lt;your-bitcoin-address&gt;[.&lt;rig_label&gt;]
+password:  (ignored — any value)</pre>
+    <p class="muted small about-note">
+        The username must be a Bitcoin address this pool can build an output
+        for:
+        <% if (_ex) { %>
+            <strong>P2WPKH</strong> (<code><%= _ex.w %></code>),
+            <strong>P2PKH</strong> (<code><%= _ex.l %></code>) or
+            <strong>P2SH</strong> (<code><%= _ex.s %></code>) on
+            <%= _net %>. <strong>Taproot (<code><%= _ex.t %></code>) is not
+            supported</strong>
+        <% } else { %>
+            <strong>P2WPKH</strong>, <strong>P2PKH</strong> or
+            <strong>P2SH</strong>. <strong>Taproot is not supported</strong>
+        <% } %>
+        and is rejected at authorize, as is a <strong>Thunder</strong> address
+        — that is the other mode. Both fail with
+        <em>"invalid payout address in stratum username"</em>.
+        The optional <code>.&lt;rig_label&gt;</code> groups multiple rigs
+        paying the same address as separate rows on the per-worker page.
+    </p>
+
+<% } else { %>
+    <%# Same rule as the identity strip: an unknown mode gets prose that is
+        true either way, never a guess. The two modes differ on what a share
+        is worth and on what the username must be, so guessing wrong here
+        costs a miner real time. %>
+    <p class="muted small">
+        This pool has not published its mode yet, and the two differ in ways
+        that change how you connect: <strong>solo</strong> pays the finder
+        directly in the coinbase and takes a Bitcoin address as the stratum
+        username, while <strong>pps-classic</strong> credits every accepted
+        share and takes a Thunder address. Restart the proxy to publish which
+        one this is, or ask the operator before pointing a rig at it.
+    </p>
+    <h3 class="about-h3">Connect a miner</h3>
+    <pre class="about-pre"><%= _url %>
+username:  &lt;address&gt;[.&lt;rig_label&gt;]   (see above)
+password:  (ignored — any value)</pre>
+<% } %>
+</section>

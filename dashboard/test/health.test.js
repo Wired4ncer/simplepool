@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import ejs from 'ejs';
 
-import { health, startHealthMonitor, currentHealth } from '../lib/health.js';
+import { subsidyAt, health, startHealthMonitor, currentHealth } from '../lib/health.js';
 import * as fmt from '../lib/fmt.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -50,13 +50,19 @@ function makeDb() {
                     fee_bps, network_difficulty, block_value_sats, rate_source)
                 VALUES (1700000000, ?, ?, 100, 111157.455, 312500000, 'derived')`)
       .run(RATE, GROSS);
-    /* Mined comfortably more than owed. */
-    db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats)
-                VALUES (1700000000, 1, 'b1', 309375000, 3125000)`).run();
+    /* Mined comfortably more than owed. Explicitly CONFIRMED: solvency counts
+     * only blocks verified to be in the chain, so a candidate that is merely
+     * recorded funds nothing. */
+    db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status,confirmations,checked_via)
+                VALUES (1700000000, 840001, 'b1', 309375000, 3125000, 'confirmed', 101, 'node')`).run();
+    /* Height and value have to agree: 312,500,000 sats is the subsidy in the
+     * era beginning at 840,000, and a template claiming it at height 2 — where
+     * the subsidy is 50 BTC — is the exact inconsistency the block_value check
+     * exists to catch. */
     db.prepare(`INSERT INTO templates (ts,height,prev_hash,bits,network_difficulty,
                     coinbase_value_sats,tx_count,tx_fees_sats,source,cb_spendable,
                     cb_op_returns,longpoll,rate_sats_per_diff)
-                VALUES (1700000000, 2, 'aa', '1a', 111157.455, 312500000, 1, 0,
+                VALUES (1700000000, 840002, 'aa', '1a', 111157.455, 312500000, 1, 0,
                         'enforcer', 1, 3, 1, ?)`).run(RATE);
     db.prepare(`INSERT INTO pool_meta (id,pool_mode,fee_bps,rate_source,
                     rate_sats_per_diff,gross_sats_per_diff,effective_fee_bps,
@@ -69,11 +75,127 @@ function makeDb() {
 
 const failing = h => h.failing.map(c => c.id);
 
+/* Replace the confirmed block with one in some other state. Each of these is
+ * a candidate that pays nothing, so each must leave the pool insolvent. */
+const withBlockStatus = (status) => {
+    const db = makeDb();
+    db.prepare('UPDATE blocks_found SET status = ?').run(status);
+    return db;
+};
+
 test('a healthy pool reports nothing', () => {
     const h = health(makeDb());
     assert.equal(h.ok, true, failing(h).join(','));
     assert.deepEqual(failing(h), []);
     assert.deepEqual(h.unavailable.map(c => c.id), []);
+});
+
+/* The bug this whole column exists for. submitblock refuses stale, duplicate
+ * and high-hash candidates routinely — on a low-difficulty chain almost every
+ * one of them — and each refusal used to be summed as pool revenue, so the
+ * solvency guard reported healthy no matter how much was owed. */
+test('a rejected candidate funds nothing', () => {
+    const h = health(withBlockStatus('rejected'));
+    assert.ok(failing(h).includes('margin'));
+});
+
+test('an orphaned candidate funds nothing', () => {
+    const h = health(withBlockStatus('orphaned'));
+    assert.ok(failing(h).includes('margin'));
+});
+
+/* Pending is not a transient here: against a backend that serves only
+ * getblocktemplate and submitblock there may be nothing able to verify a
+ * block for some time. Counting it optimistically would reintroduce exactly
+ * the bug, so it has to count as nothing. */
+test('an unverified candidate funds nothing', () => {
+    const h = health(withBlockStatus('pending'));
+    assert.ok(failing(h).includes('margin'));
+});
+
+test('a pool whose candidates never reach the chain is caught', () => {
+    const db = makeDb();
+    /* Keep the confirmed block so solvency stays green and only the orphan
+     * rate can fire — otherwise the assertion proves nothing. */
+    for (let i = 0; i < 20; i++) {
+        db.prepare(`INSERT INTO blocks_found (ts,height,hash,reward_sats,fee_sats,status)
+                    VALUES (?, ?, ?, 0, 0, 'orphaned')`)
+          .run(1700000100 + i, 100 + i, `orphan${i}`);
+    }
+    const h = health(db);
+    assert.ok(failing(h).includes('orphan_rate'));
+});
+
+/* A pool that has found nothing yet has not failed at anything. */
+test('no settled candidates is not an orphan-rate failure', () => {
+    const db = makeDb();
+    db.prepare('DELETE FROM blocks_found').run();
+    const h = health(db);
+    assert.ok(!failing(h).includes('orphan_rate'));
+});
+
+/* An inflated block value is the silent one. On the coinbasetxn path the
+ * backend supplies the coinbase, so the block stays valid and nothing
+ * complains — but the same number sets the PPS rate, so every miner is
+ * overpaid by the same factor and the pool owes money it never earned. */
+test('a block value above the subsidy schedule is caught', () => {
+    const db = makeDb();
+    db.prepare('UPDATE templates SET coinbase_value_sats = ?')
+      .run(312500000 * 6);
+    const h = health(db);
+    assert.ok(failing(h).includes('block_value'));
+});
+
+/* The other direction of the same parse: reading the coinbasetxn `fee` field
+ * as BIP22-strict fees rather than the total output value leaves the block
+ * looking nearly worthless. */
+test('a block value far below the subsidy is caught', () => {
+    const db = makeDb();
+    db.prepare('UPDATE templates SET coinbase_value_sats = 1200').run();
+    const h = health(db);
+    assert.ok(failing(h).includes('block_value'));
+});
+
+/* Fees genuinely push the coinbase above the subsidy, and that is not a
+ * fault — only a value that cannot be explained by fees is. */
+test('a busy block with real fees is not flagged', () => {
+    const db = makeDb();
+    db.prepare(`UPDATE templates SET coinbase_value_sats = ?, tx_fees_sats = ?`)
+      .run(312500000 + 40000000, 40000000);
+    const h = health(db);
+    assert.ok(!failing(h).includes('block_value'));
+});
+
+test('the subsidy schedule is the standard one', () => {
+    assert.equal(subsidyAt(0), 50e8);
+    assert.equal(subsidyAt(209999), 50e8);
+    assert.equal(subsidyAt(210000), 25e8);
+    assert.equal(subsidyAt(840000), 312500000);
+    assert.equal(subsidyAt(210000 * 64), 0);
+});
+
+/* The check that would have caught the production blow-up before it cost
+ * anything. Twenty shares of difficulty 10-29 over 19 seconds is ~20
+ * difficulty/s, needing ~12,000 — against a pool_meta difficulty of 1. */
+test('a difficulty too low for PPS to be fair is caught', () => {
+    const db = makeDb();
+    db.prepare('UPDATE pool_meta SET network_difficulty = 1').run();
+    const h = health(db);
+    assert.ok(failing(h).includes('pps_difficulty'));
+});
+
+test('a properly calibrated difficulty passes', () => {
+    const db = makeDb();   /* fixture is mainnet difficulty */
+    const h = health(db);
+    assert.ok(!failing(h).includes('pps_difficulty'));
+});
+
+/* Solo pays from the block's own coinbase, so there is no rate to be unfair. */
+test('solo mode is not judged on PPS difficulty', () => {
+    const db = makeDb();
+    db.prepare("UPDATE pool_meta SET pool_mode='solo', network_difficulty=1").run();
+    const h = health(db);
+    assert.ok(!failing(h).includes('pps_difficulty'));
 });
 
 test('shares accepted but never stored are caught', () => {
@@ -178,7 +300,7 @@ test('a DB missing a table degrades to unavailable, not to healthy', () => {
     db.exec('DROP TABLE payouts_in_flight');
     const h = health(db);
     assert.ok(h.unavailable.some(c => c.id === 'payout_ambiguous'));
-    assert.equal(h.checks.length, 7, 'every check still reported');
+    assert.equal(h.checks.length, 10, 'every check still reported');
     /* The assertion this test was missing, and the reason the bug shipped:
      * the comment above always said "must not read as a pass", but nothing
      * checked it, so ok stayed true and /health answered 200. */

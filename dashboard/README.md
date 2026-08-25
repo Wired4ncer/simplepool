@@ -73,6 +73,66 @@ each component is running. It always returns 200 — it is a report, and a
 report that a check is failing was still produced successfully. Watch
 `health.ok` for the condition and `/health` for a status code to alert on.
 
+## Pool identity
+
+Every page carries a strip under the header naming what this pool actually
+is: the **network** its coinbases are built for, the **mode** (`solo` or
+`pps-classic`) and fee, the **coinbase tag**, the **operator address** the
+fee is paid to, and — under `pps-classic` — the **pool wallet** the
+net-of-fee reward goes to. `/api/status` returns the same five fields under
+`pool`.
+
+None of it is derivable from the stratum URL a miner was handed. The port
+looks identical whether the pool is mining mainnet or regtest, whether a
+block pays its finder or the pool's wallet, and whoever collects the fee.
+
+The dashboard does **not** take these from its own environment. The proxy
+writes them to `pool_meta` at startup and the dashboard reads them back —
+same rule as the PPS rate, and for the same reason: a second copy of the
+config is a copy that can disagree with the pool it claims to describe.
+The practical consequence is that the strip reads `unknown` until the proxy
+has restarted onto a build that publishes them. That is deliberate; a banner
+that asserts the wrong network is worse than one that admits it doesn't know.
+
+`network_source` says how the network was determined:
+
+| Value      | Meaning |
+| ---------- | ------- |
+| `node`     | `getblockchaininfo` answered. Authoritative. |
+| `inferred` | It did not — the CUSF enforcer serves only `getblocktemplate` and `submitblock` — so the network was read off the operator address. Cannot distinguish testnet from signet, and says so. |
+
+A non-mainnet pool is flagged with a warn-coloured rule, because "why has my
+payout not arrived" and "this pool is mining signet" are frequently the same
+question.
+
+## "About the numbers on this page"
+
+The explanatory card on `/` branches on `pool_mode`, because almost nothing
+in it is shared between the modes:
+
+| | `solo` | `pps-classic` |
+| --- | --- | --- |
+| A share that isn't a block | worth nothing | credited at the live rate |
+| Block reward goes to | the finder, in the coinbase | the pool's BTC wallet |
+| Stratum username | a **Bitcoin** address (P2WPKH / P2PKH / P2SH — **not** taproot) | a **Thunder** address |
+| Rejection if you get it wrong | `invalid payout address in stratum username` | `invalid thunder address` |
+
+That last row is why this is not cosmetic. `src/stratum.c` branches on
+`pps_enabled` at authorize, so the card's instructions are load-bearing: a
+solo pool that tells miners to use a Thunder address is telling them to do
+the one thing that cannot work.
+
+Every figure comes from `pool_meta` — rate, gross, fee, operator address,
+pool wallet, network — and the address examples follow the pool's network, so
+a signet pool shows `tb1q…` rather than `bc1q…`. Nothing in the card is a
+literal. The version this replaced hardcoded *"1 000 sats × share
+difficulty"*, which was never true of a rate that is derived per template and
+moves with difficulty; a pinned rate (`rate_source = override`) is now called
+out with the fee it actually implies.
+
+Unknown mode gets prose naming both, and no username form — same rule as the
+identity strip, since guessing wrong costs a miner real time.
+
 ## Build provenance — `/api/versions`
 
 Answers "which commit is this pool actually running?" for simplepool, the

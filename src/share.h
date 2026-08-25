@@ -39,6 +39,35 @@ double target_to_diff(const uint8_t target_be[32]);
  * reward), so callers disable accrual rather than credit a guess. */
 double pps_rate_from_template(int64_t value_sats, double net_diff, int fee_bps);
 
+/* The difficulty below which PPS fair value stops being fair.
+ *
+ * pps_rate_from_template pays block_value/difficulty per share, which is the
+ * share's expected value only while the pool's solutions can actually become
+ * blocks. A chain accepts one block per interval no matter how fast work
+ * arrives, so once the pool's own difficulty throughput exceeds one block's
+ * worth per interval, the formula promises blocks the chain will never mint.
+ *
+ * The boundary is where the pool alone would find exactly one block per
+ * interval: min_difficulty = diff_per_sec * block_interval_sec. Pass the
+ * pool's observed share-difficulty throughput. Returns 0 when there is no
+ * measurement yet, which callers must read as "unknown", not "safe". */
+double pps_min_safe_difficulty(double diff_per_sec, int block_interval_sec);
+
+/* Cap a rate at what the chain can actually issue.
+ *
+ * The chain mints one block_value per block_interval_sec across every miner
+ * in existence, so no pool can earn faster than that — crediting faster is
+ * promising money that will not exist. Given the pool's observed difficulty
+ * throughput, the highest defensible rate is (value / interval) / throughput.
+ *
+ * Returns `rate` unchanged when it is already below the ceiling or when there
+ * is no throughput measurement to judge against. This is a backstop, not the
+ * primary guard: it needs history, so it cannot protect the first shares after
+ * a restart. pps_min_network_difficulty is what covers that. */
+double pps_rate_apply_issuance_ceiling(double rate, int64_t value_sats,
+                                       double diff_per_sec,
+                                       int block_interval_sec);
+
 /* Fold coinbase txid (LE 32-byte) into a merkle root using branches
  * (each LE 32-byte). Always cur||branch order (Stratum: coinbase at idx 0). */
 void merkle_root_from_branches(const uint8_t leaf_le[32],

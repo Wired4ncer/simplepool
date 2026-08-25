@@ -120,7 +120,10 @@ export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30
                COALESCE(SUM(credited_sats), 0)       AS accrued_computed,
                MIN(ts)                               AS first_ts,
                MAX(ts)                               AS last_ts,
-               COUNT(*) FILTER (WHERE is_block = 1)  AS blocks_found
+               COUNT(*) FILTER (WHERE is_block = 1 AND EXISTS (
+                   SELECT 1 FROM blocks_found b
+                    WHERE b.hash = shares.block_hash
+                      AND b.status = 'confirmed'))  AS blocks_found
         FROM   shares
         WHERE  worker_id = ? AND is_block IS NOT NULL
     `).get(workerId);
@@ -132,7 +135,10 @@ export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30
                COUNT(*)              AS shares,
                SUM(difficulty)       AS sum_diff,
                SUM(credited_sats)    AS accrued_delta,
-               COUNT(*) FILTER (WHERE is_block = 1) AS blocks
+               COUNT(*) FILTER (WHERE is_block = 1 AND EXISTS (
+                   SELECT 1 FROM blocks_found b
+                    WHERE b.hash = shares.block_hash
+                      AND b.status = 'confirmed')) AS blocks
         FROM   shares
         WHERE  worker_id = ?
         GROUP  BY day
@@ -140,13 +146,21 @@ export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30
         LIMIT  ?
     `).all(workerId, dayLimit);
 
-    /* Most-recent shares, cheapest to derive running_accrued client-side. */
+    /* Most-recent shares, cheapest to derive running_accrued client-side.
+     *
+     * is_block means the hash met the network target — it is what the miner
+     * did, and it stays true whatever the chain later decided. Whether that
+     * became a block is a different question, answered by block_status, and
+     * conflating the two is why this page reported a worker as having found
+     * thousands of blocks. */
     const recent = db.prepare(`
-        SELECT id, ts, difficulty, is_block, block_hash,
-               credited_sats AS credit_sats
-        FROM   shares
-        WHERE  worker_id = ?
-        ORDER  BY ts DESC
+        SELECT s.id, s.ts, s.difficulty, s.is_block, s.block_hash,
+               s.credited_sats AS credit_sats,
+               b.status AS block_status
+        FROM   shares s
+        LEFT   JOIN blocks_found b ON b.hash = s.block_hash
+        WHERE  s.worker_id = ?
+        ORDER  BY s.ts DESC
         LIMIT  ?
     `).all(workerId, recentLimit);
 
@@ -188,6 +202,7 @@ export function workerAudit(handle, workerId, { recentLimit = 100, dayLimit = 30
             difficulty:  Number(r.difficulty),
             is_block:    Number(r.is_block),
             block_hash:  r.block_hash,
+            block_status: r.block_status || null,
             credit_sats: Number(r.credit_sats),
         })),
     };
@@ -260,6 +275,7 @@ export function recentBlocksFound(handle, limit = 15) {
     return db.prepare(`
         SELECT b.id, b.ts, b.height, b.hash, b.finder_id, b.finder_address,
                b.reward_sats, b.fee_sats,
+               b.status, b.confirmations, b.checked_via,
                w.name AS finder_name
         FROM   blocks_found b
         LEFT   JOIN workers w ON w.id = b.finder_id

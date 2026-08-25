@@ -1,13 +1,22 @@
 # simplepool
 
-A small, single-binary **solo-mining stratum server** in pure C11. It accepts
-miner connections on TCP `:3334`, builds block templates via `bitcoind`'s
+A small, single-binary **stratum server** in pure C11. It accepts miner
+connections on TCP `:3334`, builds block templates via `bitcoind`'s
 `getblocktemplate`, submits found blocks via `submitblock`, and records every
 accepted share into a local SQLite database. A separate Node.js dashboard
 reads that file for stats.
 
-Created by **Roberto Santacroce** —
-source: <https://github.com/rsantacroce/simplepool>.
+It runs in two modes: **solo**, where the miner who finds a block is paid in
+that block's own coinbase, and **pps-classic**, where every accepted share
+earns a derivable amount paid out over Thunder. Both ship in this repo — see
+[The two modes](#the-two-modes) below.
+
+Created by **Roberto Santacroce**.
+Canonical repository: <https://github.com/LayerTwo-Labs/simplepool>.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scripts/install.sh | sudo bash
+```
 
 ## About simplepool
 
@@ -27,6 +36,13 @@ source: <https://github.com/rsantacroce/simplepool>.
 > trust the pool's reporting, with little ability to independently
 > verify what they're owed. simplepool aims to address this transparency
 > gap. (Hopefully!)
+
+> A single-file, no-JavaScript explainer covering the modes end to end —
+> shares, difficulty, the coinbase, PPS credit, Thunder payouts and how to
+> audit every number — lives at [`docs/simplepool.html`](docs/simplepool.html).
+> Open it from disk or serve it next to the dashboard.
+
+### The modes
 
 This repository ships **three modes**, selected by `pool_mode` in
 `proxy.conf`:
@@ -54,6 +70,12 @@ This repository ships **three modes**, selected by `pool_mode` in
   `s9_<base58>_<hex6>` is rejected, since Thunder itself doesn't
   recognize it at the byte level.
 
+  Payouts run as a **daily batch**: once every 24h everyone over
+  `PAYOUT_MIN_SATS` goes out in a single Thunder transaction. Settlement of
+  an already-broadcast batch runs on its own 30-second clock, because nobody
+  in a batch is credited until a tick observes it in a Thunder block. See
+  [`payout/README.md`](payout/README.md) for all three clocks.
+
   > An earlier `pool_mode = pps` put a BIP300 drivechain deposit
   > directly in each coinbase, so the pool would never custody BTC.
   > Regtest and forknet both showed the enforcer does *not* credit
@@ -72,20 +94,23 @@ tip changes and PPS credits to Redis pub/sub channels (`pool:shares`,
 dashboard and any downstream consumers. SQLite remains the source of
 truth; the publish is fire-and-forget.
 
-It is a **solo pool with direct payouts**: every coinbase has two outputs —
-the **miner who found the block gets the reward** (minus a small operator
-fee), and the configured `operator_address` gets the rest (default 1% =
-100 basis points, configurable via `fee_bps`). Each connected miner gets
+**In `solo` mode** it is a solo pool with direct payouts: every coinbase has
+two outputs — the **miner who found the block gets the reward** (minus a small
+operator fee), and the configured `operator_address` gets the rest (default
+1% = 100 basis points, configurable via `fee_bps`). Each connected miner gets
 its own coinbase rendered against the miner's own address; the merkle
 branches, prev-hash, ntime, etc. are shared.
 
-There is **no PPS**, no inter-miner reward sharing, and no
-difficulty-weighted accounting. If your miner finds the block, your
-address gets ~99% of the subsidy + fees on-chain in the same coinbase
-transaction; if it doesn't, nobody on this proxy gets anything for that
-height. The `shares` and `workers` tables exist purely so the dashboard
-can show a leaderboard, per-worker drilldown, and historical "blocks
-found by the pool" view.
+In that mode there is no inter-miner reward sharing and no difficulty-weighted
+accounting. If your miner finds the block, your address gets ~99% of the
+subsidy + fees on-chain in the same coinbase transaction; if it doesn't,
+nobody on this proxy gets anything for that height. The `shares` and `workers`
+tables exist so the dashboard can show a leaderboard, per-worker drilldown,
+and historical "blocks found by the pool" view.
+
+**In `pps-classic` mode** that inverts: the coinbase pays the pool, every
+accepted share credits a balance at a rate derived from the live block
+template, and the pool — not the miner — carries the variance.
 
 ### A note on terminology: "share" vs "work"
 
@@ -105,11 +130,12 @@ hold even though this is currently solo-mode:
   We surface it with an explanatory banner on the dashboard and with
   the project blurb above, rather than by renaming things.
 
-**In this solo build**, a share is an accepted Proof-of-Work submission
-below the connection's worker target. It is *not* a payout claim and
-does not accrue a balance — it exists for hashrate estimation,
-per-rig accountability, and as the data primitive the upcoming PPS
-billing engine will consume.
+**In `solo` mode**, a share is an accepted Proof-of-Work submission below the
+connection's worker target. It is *not* a payout claim and does not accrue a
+balance — it exists for hashrate estimation, per-rig accountability, and as
+the data primitive the PPS billing path consumes. **In `pps-classic`** the
+same row additionally carries `credited_sats` and the `rate_used` that
+produced it, and *is* the unit of account.
 
 ### How the solo flow actually works
 
@@ -218,29 +244,51 @@ address. Format:
 
 Examples: `bc1qabc…`, `bc1qabc….basement-rig`, `bcrt1q…test.alice`.
 
-This is a **sibling project** to the Rust mining pool that lives elsewhere in
-this same monorepo. The two share nothing in code or goals: the Rust pool is
-a production-style PPS pool with payouts; `simplepool` is intentionally minimal
-and exists for solo mining + observability only.
+`simplepool` is deliberately small: one C binary for the hot path, one
+read-only Node dashboard, one Node payout worker, and a SQLite file that is
+the source of truth for all three. Nothing in the stratum path depends on the
+dashboard or the payout worker being up — a billing outage must never stop the
+pool accepting work or submitting blocks.
 
-Status: **wired**. The main binary loads config, connects to bitcoind,
-opens the SQLite store, builds an initial job from `getblocktemplate`,
-serves stratum on the configured port, and watches for new tips on a
-background thread.
+## Install
 
-## Build
+On a fresh Ubuntu or Debian server:
 
-Dependencies: `sqlite3`, `libcurl`, `pthread`, plus a C11 compiler.
+```sh
+curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scripts/install.sh | sudo bash
+```
+
+That downloads the published build for the machine's architecture, checks it
+against the release `SHA256SUMS`, then interviews you for the rest — pool mode,
+bitcoind RPC, your operator address, dashboard domain, nginx and TLS — and
+leaves a running pool behind nginx with a `simplepoolctl` command to drive it.
+No compiler and no clone: `--from-source` if you want those instead. Answers
+are saved, so re-running it is how you change your mind about any of them.
+
+```sh
+simplepoolctl status      # what's running, on which ports, at which version
+simplepoolctl doctor      # check the things that actually break in production
+simplepoolctl logs -f     # follow every service at once
+simplepoolctl upgrade     # move to the next release, then restart
+simplepoolctl uninstall   # remove the services (--purge also drops the data)
+```
+
+Full walkthrough, including the manual steps the script automates, is in
+[INSTALL.md](INSTALL.md). To cut a release, see [RELEASING.md](RELEASING.md).
+
+## Build from source
+
+Dependencies: `sqlite3`, `libcurl`, `libhiredis`, `pthread`, plus a C11 compiler.
 
 macOS:
 ```
-brew install sqlite curl
+brew install sqlite curl hiredis
 make
 ```
 
 Debian / Ubuntu:
 ```
-sudo apt install build-essential libsqlite3-dev libcurl4-openssl-dev
+sudo apt install build-essential libsqlite3-dev libcurl4-openssl-dev libhiredis-dev
 make
 ```
 
@@ -292,9 +340,11 @@ at a snapshot via `PROXY_DB_PATH` if you want — see
 
 ## Deploy to a server
 
-There's a one-shot deploy script that brings a fresh Ubuntu 24.04 box
-from nothing to fully serving stratum + dashboard behind nginx. It is
-idempotent: re-run it after every code change.
+[`scripts/install.sh`](scripts/install.sh) (see [Install](#install) above) is
+the way to bring a box up from nothing. `scripts/deploy-to-server.sh` is the
+other direction: it drives an *already installed* box from your workstation,
+which is what you want while iterating on code that isn't released yet. It is
+idempotent: re-run it after every change.
 
 ```
 ./scripts/deploy-to-server.sh \
@@ -333,11 +383,15 @@ or use `stunnel`.
 ### Operations
 
 ```
-sudo systemctl status   simplepool simplepool-dashboard nginx
-sudo journalctl -u simplepool           -f      # stratum log
-sudo journalctl -u simplepool-dashboard -f      # dashboard log
-sudo systemctl restart  simplepool              # after pulling new code
+simplepoolctl status                            # services, ports, ledger totals
+simplepoolctl logs proxy -f                     # stratum log
+simplepoolctl logs dashboard -f                 # dashboard log
+sudo simplepoolctl restart proxy                # after changing proxy.conf
 ```
+
+`simplepoolctl` is a wrapper over systemd — the underlying commands
+(`systemctl status simplepool`, `journalctl -u simplepool -f`) work exactly as
+before, and are what it prints when something needs a closer look.
 
 To pull edits made directly on a server back into a local checkout (so
 you can commit + push from here), use
@@ -391,6 +445,54 @@ recorded in `blocks_found` with `height`, `hash`, `finder_id`,
 (paid to `operator_address`). The matching `shares` row has
 `is_block = 1` and the block hash.
 
+That row is a block **candidate**, and `status` says which it turned out
+to be. `submitblock` can refuse it (`rejected`, with the node's reason in
+`submit_error`); an accepted one is `pending` until the block is verified
+to be in the chain (`confirmed`), and a reorg moves it to `orphaned`.
+**Only `confirmed` counts as a block or as pool revenue** — every count and
+every sum of `reward_sats` filters on it, because a refused or reorged
+candidate pays nothing. On a low-difficulty chain most candidates are one
+of the latter, which is normal; the dashboard reports the orphan rate
+rather than hiding it.
+
+Verification prefers `getblockhash`. Backends that do not serve it — the
+CUSF enforcer answers only `getblocktemplate` and `submitblock` — are
+handled by comparing against the chain of tips the pool has already
+observed through `templates`, and `checked_via` records which of the two
+answered. A candidate neither can speak to stays `pending` and counts as
+nothing.
+
+`shares.is_block` keeps its own meaning: the hash met the network target.
+That is what the miner did, and it stays true whatever the chain later
+decided.
+
+### PPS is only safe once difficulty has caught up
+
+`pool_mode = pps-classic` derives the rate from each template as
+`coinbasevalue / network_difficulty`, which is a share's expected value. That
+holds only while difficulty is calibrated to hashrate. On a new chain it is
+not — difficulty starts at 1 and climbs — and until it catches up the pool
+produces solutions far faster than the chain accepts blocks, so the formula
+prices every share as though it were worth a whole block.
+
+Set `pps_min_network_difficulty` to the difficulty at which your pool alone
+would find one block per block interval:
+
+```
+pps_min_network_difficulty = hashrate_H/s * block_interval_sec / 2^32
+```
+
+A 40 TH/s pool on a 600-second chain needs roughly **5,600,000**. Below that
+the proxy credits nothing, refuses new miners by default rather than taking
+work it will not pay for, and resumes on its own once the chain retargets. A
+separate automatic ceiling caps accrual at what the chain can actually mint,
+but it needs a minute of hashrate history and so cannot cover a restart — the
+floor is what does.
+
+Left at 0 the check is off, which is only safe on mainnet, testnet or signet.
+A pool that skipped it on a forknet accrued 15,561,471 BTC of liability in
+under four hours against 943.60 BTC actually mined.
+
 ## Run against local regtest
 
 The repo ships a best-effort integration test that exercises the proxy
@@ -415,8 +517,9 @@ The script:
 5. Asserts that `workers` has at least one row, `workers.payout_address`
    is populated, and `rejects` has at least one row.
 
-For the broader stack flow (Docker compose, Rust pool, dashboard) see
-[`../docs/TESTING.md`](../docs/TESTING.md).
+There is also a full end-to-end regtest (`tests/test_e2e_regtest.sh`) and a
+payout regtest (`tests/test_payout_regtest.sh`); both run in CI. For the
+verification checklist behind each mode, see [`VERIFY.md`](VERIFY.md).
 
 ## Layout
 
@@ -435,45 +538,58 @@ src/
   stratum.{c,h}      # stratum v1 server
   store.{c,h}        # SQLite writer with batching
   bitcoind.{c,h}     # libcurl-based JSON-RPC client
+  broadcast.{c,h}    # optional Redis pub/sub mirror of pool events
+  thunder.{c,h}      # Thunder base58 address decoder (pps-classic)
+  version.{c,h}      # build provenance compiled into the binary
   cjson/             # vendored cJSON (MIT) — see src/cjson/README.md
-include/             # public headers (empty for now)
-tests/               # unit tests + integration shell script
+tests/               # unit tests + integration shell scripts
 deploy/              # systemd unit templates + nginx vhost templates
-scripts/             # deploy + sync helpers
+scripts/
+  install.sh         # bootstrap a fresh box (release download or source build)
+  simplepoolctl      # status / logs / doctor / upgrade / uninstall
+  release.sh         # build a release tarball (CI runs this exact script)
+  deploy-to-server.sh, sync-from-server.sh, record-build.sh, ...
 dashboard/           # Node/Express read-only stats UI
+payout/              # Thunder payout worker (pps-classic)
+docs/simplepool.html # single-file explainer: both modes, end to end
 ```
 
 ## Roadmap
 
-The solo build is intentionally minimal; the items below extend it
-toward the full simplepool PPS pool without changing the share/block data
-model that already lives in `schema.sql`.
+The share/block data model in `schema.sql` has not had to change as the pool
+grew from solo-only to PPS, and the items below are not expected to change it
+either.
 
-1. **Move persistence behind Redis.** Add a Redis-backed write path
-   alongside the SQLite store so the hot share queue isn't bound to a
-   single-writer file. SQLite stays as the durable archive; Redis
-   absorbs the high-frequency writes and makes the share stream
-   consumable by other services in real time.
-2. **PPS billing as a separate, non-blocking service.** Run the
-   Pay-Per-Share build on its own port / instance. The billing engine
-   consumes the share stream (Redis) and settles payouts over
-   **Thunder**. Strict separation: a billing outage must never block
-   the stratum proxy from accepting work or submitting blocks.
-3. **Miner registration for the PPS pool.** Endpoint + flow for miners
-   to register a payout address, a withdrawal threshold, and any
-   per-account settings the PPS engine needs. The solo build doesn't
-   need this — solo miners are identified by the address embedded in
-   the stratum username — but PPS does.
-4. **Status and observability.** Expose Prometheus-style metrics
+Shipped since this list was first written:
+
+- **Redis broadcast.** Accepted shares, rejects, blocks, tip changes and PPS
+  credits are mirrored onto Redis pub/sub when `redis_url` is set. SQLite
+  remains the source of truth; the publish is fire-and-forget.
+- **PPS billing as a separate, non-blocking service.** `pool_mode =
+  pps-classic` accrues credits in the proxy; the separate
+  [`payout/`](payout/) worker settles them over **Thunder** on its own
+  process and its own schedule. A payout outage cannot stop the proxy
+  accepting work.
+- **Miner registration turned out to be unnecessary.** PPS miners are
+  identified by the Thunder address in the stratum username, exactly as solo
+  miners are identified by their BTC address. There is nothing to register.
+
+Still open:
+
+1. **Automatic BTC → Thunder deposits.** Today the operator presses a button
+   per deposit (see [`CLASSIC_PAYOUTS.md`](CLASSIC_PAYOUTS.md)). An
+   auto-batching worker needs no schema change — just a service that posts to
+   `/admin/deposit`.
+2. **Status and observability.** Expose Prometheus-style metrics
    (`/metrics`), structured logs, and per-connection health for both
    the proxy and the billing service. The goal is for any miner to be
    able to audit their own contribution end to end without having to
    trust an opaque "pool dashboard."
-5. **Richer dashboard metrics.** Build on the current overview / per-
+3. **Richer dashboard metrics.** Build on the current overview / per-
    worker / blocks pages with per-rig hashrate variance, expected-vs-
    observed payouts, network-difficulty overlays, and historical
    charts that go beyond the rolling 24-hour window.
-6. **Decouple the dashboard from the live database.** Have the
+4. **Decouple the dashboard from the live database.** Have the
    dashboard read its own derived store (a Redis replica or a periodic
    materialised view) rather than the proxy's primary SQLite file.
    That keeps the dashboard's read pattern from ever touching the hot

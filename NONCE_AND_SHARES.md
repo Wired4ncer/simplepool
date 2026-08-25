@@ -504,8 +504,12 @@ WHERE  worker_id = :wid
 SELECT height, hash, datetime(ts,'unixepoch') AS ts_utc, finder_id,
        finder_address, reward_sats
 FROM   blocks_found
+WHERE  status = 'confirmed'
 ORDER  BY ts DESC LIMIT 1;
 ```
+
+Drop the `WHERE` to see candidates that did not make it — but read `status`
+before believing a `reward_sats`: only a confirmed block was ever paid.
 
 **Rejects, grouped by reason, last hour:**
 
@@ -536,7 +540,9 @@ ORDER  BY ts DESC;
 | Audit page shows ⚠ | `POOL_PPS_SATS_PER_DIFF` env doesn't match `proxy.conf` | grep both, restart dashboard |
 | accrued grows without shares | somebody wrote to `pps_credits` by hand | `.timeline` the DB; look for gaps in `shares.id` |
 | paid_sats > sum of `deposits` | payout worker sending BTC-equivalent that never entered Thunder | reconcile via Thunder RPC's tx history |
-| shares.is_block=1 but no `blocks_found` row | block was found but `submitblock` failed or is still in flight | grep pool log for `submitblock failed` |
+| shares.is_block=1 but the `blocks_found` row says `rejected` | the node refused the submission — normal on a low-difficulty chain | read `blocks_found.submit_error` for the node's own reason |
+| `blocks_found` rows stuck at `pending` | nothing can verify them: the backend does not serve `getblockhash` and no template has been observed at their height+1 | expected against the CUSF enforcer; they count as nothing until verified |
+| many `orphaned` candidates | the pool's blocks keep losing races — a slow or badly-peered node, or templates lagging the tip | check the "Blocks reaching the chain" health check and the node's peer count |
 | dashboard hashrate lower than the miner's own display | actual delivery is lower than the miner claims (thermal / net / firmware); nonce distribution is fine | see [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md) troubleshooting |
 | single share value looks tiny | vardiff pushed worker difficulty down; per-share reward compresses; but shares_per_minute is up so payout per minute stays the same | look at `Σ difficulty` per hour on the audit page — that number is invariant to vardiff |
 

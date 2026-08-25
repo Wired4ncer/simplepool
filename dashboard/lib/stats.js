@@ -12,11 +12,24 @@ const EMPTY_OVERVIEW = {
     accepted: 0,
     rejected: 0,
     blocks: 0,
+    blocks_pending: 0,
+    blocks_orphaned: 0,
+    blocks_rejected: 0,
     workers_active: 0,
     hashrate: 0,
     window_sec: 86400,
     db_ready: false,
 };
+
+/* A row in blocks_found is a block CANDIDATE. Only status='confirmed' is a
+ * block the pool actually mined and can be paid for, so every count and every
+ * sum of reward_sats filters on it. Counting all of them is what made a pool
+ * that had mined nothing look like it had mined thousands of blocks.
+ *
+ * The other statuses are reported alongside rather than hidden: a pool whose
+ * candidates are nearly all orphaned has a real operational problem, and
+ * hiding the rows is what kept it invisible. */
+const CONFIRMED = "status = 'confirmed'";
 
 function db(handle) {
     return handle.get();
@@ -41,7 +54,9 @@ export function overview(handle, windowSec = 86400) {
         'SELECT COUNT(*) AS n, COALESCE(SUM(difficulty),0) AS sum_diff, COALESCE(MAX(difficulty),0) AS best FROM shares WHERE ts >= ?'
     ).get(since);
     const rej = d.prepare('SELECT COUNT(*) AS n FROM rejects WHERE ts >= ?').get(since);
-    const blk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ?').get(since);
+    const blk = d.prepare(
+        `SELECT COUNT(*) AS n FROM blocks_found WHERE ts >= ? AND ${CONFIRMED}`
+    ).get(since);
     const wk = d.prepare(
         'SELECT COUNT(DISTINCT worker_id) AS n FROM shares WHERE ts >= ?'
     ).get(since);
@@ -50,7 +65,15 @@ export function overview(handle, windowSec = 86400) {
     ).get();
     const last = d.prepare('SELECT MAX(ts) AS ts FROM shares').get();
     const totalRej = d.prepare('SELECT COUNT(*) AS n FROM rejects').get();
-    const totalBlk = d.prepare('SELECT COUNT(*) AS n FROM blocks_found').get();
+    const totalBlk = d.prepare(
+        `SELECT COUNT(*) AS n FROM blocks_found WHERE ${CONFIRMED}`
+    ).get();
+    const candidates = d.prepare(`
+        SELECT COUNT(*) FILTER (WHERE status = 'pending')  AS pending,
+               COUNT(*) FILTER (WHERE status = 'orphaned') AS orphaned,
+               COUNT(*) FILTER (WHERE status = 'rejected') AS rejected
+          FROM blocks_found
+    `).get();
 
     const total24h = acc.n + rej.n;
     const rejectRate24h = total24h > 0 ? (rej.n / total24h) * 100 : 0;
@@ -59,6 +82,9 @@ export function overview(handle, windowSec = 86400) {
         accepted: acc.n,
         rejected: rej.n,
         blocks: blk.n,
+        blocks_pending:  Number(candidates?.pending  || 0),
+        blocks_orphaned: Number(candidates?.orphaned || 0),
+        blocks_rejected: Number(candidates?.rejected || 0),
         workers_active: wk.n,
         hashrate: (acc.sum_diff * TWO_32) / windowSec,   // 24h estimate
         hashrate_1h: hashrateOver(d, nowSec, 3600),
@@ -186,9 +212,12 @@ export function worker(handle, name, windowSec = 86400) {
     `).all(w.id);
 
     // Compute the share's "actual difficulty": diff1_target / hash_value.
-    // diff1_target = 0x00000000_ffff0000_0000... (256-bit), so actual_diff
-    // approximates 2^32 / int(top 8 hex digits) for the leading non-zero
-    // 32 bits. Plenty good for ranking 'how lucky was each share'.
+    // diff1_target = 0x00000000_ffff0000_0000... (256-bit) — note it already
+    // carries 8 leading zero nibbles of its own. Writing the hash as
+    // v * 16^(56-i) for i leading zero nibbles and v the next 8 hex digits,
+    // and diff1_target as 0xffff0000 * 16^48, the ratio comes out as
+    // (0xffff0000 / v) * 16^(i-8). The -8 is diff1's own leading zeros;
+    // dropping it overstates every share by 16^8 = 2^32.
     const shares = sharesRaw.map(s => {
         let actual = null;
         if (s.share_hash && /^[0-9a-fA-F]+$/.test(s.share_hash)) {
@@ -200,8 +229,10 @@ export function worker(handle, name, windowSec = 86400) {
             const slice = h.slice(i, i + 8).padEnd(8, '0');
             const v = parseInt(slice, 16);
             if (v > 0) {
-                // Leading zeros add 16^(zeros) ≈ 4*zeros bits of difficulty.
-                const zeroFactor = Math.pow(16, i);
+                // Leading zeros beyond diff1's own eight are what make a
+                // share harder than difficulty 1; fewer than eight means a
+                // share easier than 1, so the exponent may go negative.
+                const zeroFactor = Math.pow(16, i - 8);
                 actual = (0xffff0000 / v) * zeroFactor;
             }
         }
@@ -299,7 +330,8 @@ export function worker(handle, name, windowSec = 86400) {
 
     /* Blocks found BY this worker specifically. */
     const workerBlocks = d.prepare(`
-        SELECT id, ts, height, hash, reward_sats, fee_sats
+        SELECT id, ts, height, hash, reward_sats, fee_sats,
+               status, confirmations, checked_via
         FROM   blocks_found
         WHERE  finder_id = ?
         ORDER  BY ts DESC, id DESC
@@ -308,6 +340,9 @@ export function worker(handle, name, windowSec = 86400) {
         id: r.id, ts: Number(r.ts), height: Number(r.height), hash: r.hash,
         reward_sats: Number(r.reward_sats || 0),
         fee_sats:    Number(r.fee_sats || 0),
+        status: r.status || 'pending',
+        confirmations: Number(r.confirmations || 0),
+        checked_via: r.checked_via || null,
     }));
 
     return {
@@ -337,6 +372,44 @@ export function worker(handle, name, windowSec = 86400) {
  *
  * Returns null on a DB predating pool_meta, in which case callers should
  * present the rate as unknown rather than substituting a guess. */
+/* The identity half of pool_meta: which chain the pool builds coinbases
+ * for, the tag it stamps into them, and where the money goes.
+ *
+ * Selected separately from the rate columns, and swallowing its own errors,
+ * because the two halves land in different releases: a dashboard upgraded
+ * ahead of the proxy reads a pool_meta that has no identity columns yet, and
+ * folding this into the main SELECT would turn that into a null poolMeta —
+ * losing the rate figures too, to add a banner.
+ *
+ * Everything is nullable on purpose. Rendering "unknown" is correct until
+ * the proxy has restarted and written the row; guessing a network is not. */
+function poolIdentity(d) {
+    const blank = {
+        network: null, network_source: null, coinbase_tag: null,
+        operator_address: null, pool_btc_address: null,
+    };
+    try {
+        const r = d.prepare(`
+            SELECT network, network_source, coinbase_tag,
+                   operator_address, pool_btc_address
+              FROM pool_meta WHERE id = 1
+        `).get();
+        if (!r) return blank;
+        /* The proxy binds "" for an unset string; normalise to null so
+         * callers have one empty case to test rather than two. */
+        const or_ = v => (v === undefined || v === null || v === '') ? null : v;
+        return {
+            network:          or_(r.network),
+            network_source:   or_(r.network_source),
+            coinbase_tag:     or_(r.coinbase_tag),
+            operator_address: or_(r.operator_address),
+            pool_btc_address: or_(r.pool_btc_address),
+        };
+    } catch {
+        return blank;   /* DB predating the identity columns */
+    }
+}
+
 export function poolMeta(handle) {
     /* Called from stats.js with a lazy handle and from admin.js with an
      * already-resolved better-sqlite3 Database, so accept either rather
@@ -355,6 +428,7 @@ export function poolMeta(handle) {
         const gross = Number(r.gross_sats_per_diff || 0);
         const rate  = Number(r.rate_sats_per_diff  || 0);
         return {
+            ...poolIdentity(d),
             pool_mode:           r.pool_mode || 'solo',
             fee_bps:             Number(r.fee_bps || 0),
             rate_source:         r.rate_source || 'derived',
@@ -574,6 +648,9 @@ export function recentBlocks(handle, limit = 25) {
                b.finder_address,
                b.reward_sats,
                b.fee_sats,
+               b.status,
+               b.confirmations,
+               b.checked_via,
                w.name AS finder
           FROM blocks_found b
           LEFT JOIN workers w ON w.id = b.finder_id
@@ -592,7 +669,8 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
     if (beforeTs == null) {
         rows = d.prepare(`
             SELECT b.ts, b.height, b.hash, b.finder_address,
-                   b.reward_sats, b.fee_sats, w.name AS finder
+                   b.reward_sats, b.fee_sats, b.status, b.confirmations,
+                   b.checked_via, w.name AS finder
               FROM blocks_found b
               LEFT JOIN workers w ON w.id = b.finder_id
              ORDER BY b.ts DESC
@@ -601,7 +679,8 @@ export function allBlocks(handle, { limit = 50, beforeTs = null } = {}) {
     } else {
         rows = d.prepare(`
             SELECT b.ts, b.height, b.hash, b.finder_address,
-                   b.reward_sats, b.fee_sats, w.name AS finder
+                   b.reward_sats, b.fee_sats, b.status, b.confirmations,
+                   b.checked_via, w.name AS finder
               FROM blocks_found b
               LEFT JOIN workers w ON w.id = b.finder_id
              WHERE b.ts < ?

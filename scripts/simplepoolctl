@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+#
+# simplepoolctl — day-to-day control of an installed simplepool.
+#
+# Installed to /usr/local/bin by scripts/install.sh. Everything it needs to
+# know about this box lives in /etc/simplepool/install.env, which the
+# installer wrote: where the tree is, which services exist, which ports, and
+# whether this box tracks releases or builds from source. That file is the
+# reason this can be a wrapper rather than another place to configure things.
+#
+# Commands:
+#   status                 what is running, on which ports, at which version
+#   logs [svc] [-f] [-n N] journalctl for one service or all of them
+#   start|stop|restart [svc]
+#   version                versions of everything, including what is released
+#   config                 where the config files are (and what is in them)
+#   doctor                 check the things that actually break in production
+#   upgrade [<tag>]        fetch and install a newer version, then restart
+#   uninstall [--purge]    remove the services (--purge also removes the data)
+#
+#   svc is one of: proxy | dashboard | payout | all   (default: all)
+#
+set -uo pipefail
+
+STATE_DIR=/etc/simplepool
+STATE_FILE="$STATE_DIR/install.env"
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; OFF=$'\033[0m'
+[[ -t 1 ]] || { BOLD=""; DIM=""; RED=""; GRN=""; YEL=""; OFF=""; }
+
+say()  { echo "    $*"; }
+head_() { echo; echo "${BOLD}$*${OFF}"; }
+warn() { echo "${YEL}    warning: $*${OFF}" >&2; }
+die()  { echo "${RED}simplepoolctl: $*${OFF}" >&2; exit 1; }
+
+usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+[[ -r "$STATE_FILE" ]] || die "no install found ($STATE_FILE is missing or unreadable).
+    Run the installer first, or re-run this with sudo if simplepool IS installed."
+# shellcheck disable=SC1090
+source "$STATE_FILE"
+
+ROOT="${ROOT:-/home/simplepool}"
+SVC_USER="${SVC_USER:-simplepool}"
+DASH_PORT="${DASH_PORT:-8081}"
+STRATUM_PORT="${STRATUM_PORT:-3334}"
+MODE="${MODE:-solo}"
+SOURCE="${SOURCE:-source}"
+REPO_SLUG="${REPO_SLUG:-LayerTwo-Labs/simplepool}"
+BIN="$ROOT/build/simplepool"
+DB_PATH="${DB_PATH:-$ROOT/data/shares.db}"
+
+# Which units this install actually has. Asking systemd rather than trusting
+# the saved answers, because a unit can be removed by hand and the answers
+# file would never know.
+unit_exists() { systemctl list-unit-files "$1" >/dev/null 2>&1 && \
+                systemctl cat "$1" >/dev/null 2>&1; }
+
+UNITS=()
+unit_exists simplepool.service           && UNITS+=(simplepool.service)
+unit_exists simplepool-dashboard.service && UNITS+=(simplepool-dashboard.service)
+unit_exists simplepool-payout.service    && UNITS+=(simplepool-payout.service)
+
+# svc name -> unit, so operators type `logs payout` rather than the full unit.
+resolve() {
+    case "${1:-all}" in
+        proxy|simplepool)  echo simplepool.service ;;
+        dash|dashboard)    echo simplepool-dashboard.service ;;
+        payout)            echo simplepool-payout.service ;;
+        all)               [[ ${#UNITS[@]} -gt 0 ]] && printf '%s\n' "${UNITS[@]}" ;;
+        *) die "unknown service '$1' (proxy | dashboard | payout | all)" ;;
+    esac
+}
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "'$1' needs root — try: sudo simplepoolctl $1"
+}
+
+# ------------------------------------------------------------------ status --
+svc_state() { systemctl is-active "$1" 2>/dev/null || echo inactive; }
+
+cmd_status() {
+    head_ "services"
+    for u in "${UNITS[@]}"; do
+        s="$(svc_state "$u")"
+        # Uptime matters as much as state: a unit that is "active" but was
+        # started ten seconds ago is a crash loop, not a healthy service.
+        since="$(systemctl show -p ActiveEnterTimestamp --value "$u" 2>/dev/null)"
+        if [[ "$s" == "active" ]]; then
+            printf "    %-28s ${GRN}%-10s${OFF} ${DIM}since %s${OFF}\n" "${u%.service}" "$s" "${since:-?}"
+        else
+            printf "    %-28s ${RED}%-10s${OFF} ${DIM}journalctl -u %s -n 50${OFF}\n" "${u%.service}" "$s" "${u%.service}"
+        fi
+    done
+    [[ ${#UNITS[@]} -gt 0 ]] || say "none installed"
+
+    head_ "listening"
+    if command -v ss >/dev/null 2>&1; then
+        local found
+        found="$(ss -ltn 2>/dev/null | grep -E ":(${STRATUM_PORT}|${DASH_PORT})\b" || true)"
+        if [[ -n "$found" ]]; then echo "$found" | sed 's/^/    /'
+        else warn "neither :${STRATUM_PORT} (stratum) nor :${DASH_PORT} (dashboard) is listening"; fi
+    else
+        say "ss not available"
+    fi
+
+    if [[ " ${UNITS[*]} " == *" simplepool-dashboard.service "* ]]; then
+        head_ "dashboard"
+        if curl -fsS --max-time 5 "http://127.0.0.1:${DASH_PORT}/healthz" >/dev/null 2>&1; then
+            say "healthz ${GRN}ok${OFF}   http://127.0.0.1:${DASH_PORT}/"
+            [[ -n "${FQDN:-}" ]] && say "public  http$([[ "${DO_TLS:-0}" == 1 ]] && echo s)://${FQDN}/"
+        else
+            warn "healthz did not respond on :${DASH_PORT}"
+        fi
+    fi
+
+    head_ "pool"
+    say "mode              $MODE"
+    say "stratum           stratum+tcp://${FQDN:-<this-host>}:${STRATUM_PORT}"
+    case "$MODE" in
+        solo) say "stratum username  <miner BTC address>[.<rig>]" ;;
+        *)    say "stratum username  <miner Thunder address>[.<rig>]" ;;
+    esac
+    if [[ -r "$DB_PATH" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        # Read-only URI: never let a status command touch the writer's file
+        # in a mode that could take a lock.
+        local q; q="file:${DB_PATH}?mode=ro"
+        say "workers           $(sqlite3 "$q" 'SELECT count(*) FROM workers' 2>/dev/null || echo '?')"
+        say "shares (24h)      $(sqlite3 "$q" "SELECT count(*) FROM shares WHERE ts > strftime('%s','now') - 86400" 2>/dev/null || echo '?')"
+        say "blocks found      $(sqlite3 "$q" 'SELECT count(*) FROM blocks_found' 2>/dev/null || echo '?')"
+        if [[ "$MODE" == "pps-classic" ]]; then
+            say "owed (sats)       $(sqlite3 "$q" 'SELECT COALESCE(SUM(accrued_sats - paid_sats),0) FROM pps_credits' 2>/dev/null || echo '?')"
+        fi
+    fi
+    echo
+}
+
+# ----------------------------------------------------------------- version --
+cmd_version() {
+    head_ "installed"
+    if [[ -r "$ROOT/RELEASE" ]]; then
+        sed 's/^/    /' "$ROOT/RELEASE"
+    else
+        say "${DIM}no RELEASE file — this box was installed from source${OFF}"
+    fi
+
+    head_ "binary"
+    if [[ -x "$BIN" ]]; then
+        "$BIN" --version 2>/dev/null | sed 's/^/    /' || warn "$BIN --version failed"
+    else
+        warn "no binary at $BIN"
+    fi
+
+    if [[ "$SOURCE" == "source" ]] && [[ -d "$ROOT/.git" ]]; then
+        head_ "checkout"
+        say "branch  $(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+        say "commit  $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
+        [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]] && \
+            warn "working tree has uncommitted changes — the binary may not match this commit"
+    fi
+
+    head_ "available"
+    local latest
+    latest="$(latest_tag || true)"
+    if [[ -n "$latest" ]]; then
+        say "latest release  $latest   ${DIM}(simplepoolctl upgrade)${OFF}"
+    else
+        say "${DIM}could not reach github.com to check for a newer release${OFF}"
+    fi
+    echo
+}
+
+# The full component picture (bitcoind, enforcer, Thunder) lives behind the
+# dashboard's /api/versions, which already knows how to interrogate binaries
+# that don't embed their own commit. No reason to reimplement it here.
+latest_tag() {
+    curl -fsS --max-time 8 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+# -------------------------------------------------------------------- logs --
+cmd_logs() {
+    local svc="all" args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            proxy|simplepool|dash|dashboard|payout|all) svc="$1"; shift ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [[ ${#args[@]} -gt 0 ]] || args=(-n 100)
+    local units=() u
+    while read -r u; do [[ -n "$u" ]] && units+=(-u "$u"); done < <(resolve "$svc")
+    [[ ${#units[@]} -gt 0 ]] || die "no services installed"
+    exec journalctl "${units[@]}" "${args[@]}"
+}
+
+# --------------------------------------------------------- start/stop/etc. --
+cmd_lifecycle() {
+    local action="$1"; shift
+    need_root "$action"
+    local svc="${1:-all}" u
+    while read -r u; do
+        [[ -n "$u" ]] || continue
+        printf "    %-28s " "${u%.service}"
+        if systemctl "$action" "$u"; then echo "${GRN}${action}ed${OFF}"; else echo "${RED}failed${OFF}"; fi
+    done < <(resolve "$svc")
+}
+
+# ------------------------------------------------------------------ config --
+cmd_config() {
+    head_ "files"
+    say "proxy config     $ROOT/proxy.conf"
+    say "install answers  $STATE_FILE   ${DIM}(root only — contains secrets)${OFF}"
+    say "database         $DB_PATH"
+    [[ -f "$STATE_DIR/admin.cred" ]] && say "admin creds      $STATE_DIR/admin.cred"
+    for d in /etc/systemd/system/simplepool-dashboard.service.d/local.conf \
+             /etc/systemd/system/simplepool-payout.service.d/local.conf; do
+        [[ -f "$d" ]] && say "service env      $d"
+    done
+
+    head_ "effective proxy.conf"
+    if [[ -r "$ROOT/proxy.conf" ]]; then
+        # Passwords are redacted rather than omitted: an operator needs to see
+        # that the key is set without the value ending up in a paste.
+        grep -vE '^\s*(#|$)' "$ROOT/proxy.conf" \
+            | sed -E 's/^([[:space:]]*(bitcoind_pass)[[:space:]]*=).*/\1 ****REDACTED****/' \
+            | sed 's/^/    /'
+    else
+        warn "cannot read $ROOT/proxy.conf (try sudo)"
+    fi
+    echo
+    say "${DIM}edit with: sudo \$EDITOR $ROOT/proxy.conf && sudo simplepoolctl restart proxy${OFF}"
+    echo
+}
+
+# ------------------------------------------------------------------ doctor --
+DOCTOR_FAILED=0
+check()  { printf "    %-42s " "$1"; }
+pass()   { echo "${GRN}ok${OFF}${1:+   ${DIM}$1${OFF}}"; }
+fail()   { echo "${RED}FAIL${OFF}   $1"; DOCTOR_FAILED=1; }
+soft()   { echo "${YEL}warn${OFF}   $1"; }
+
+cmd_doctor() {
+    head_ "install"
+    check "binary present and runnable"
+    if [[ -x "$BIN" ]] && "$BIN" --version >/dev/null 2>&1; then pass "$("$BIN" --version 2>/dev/null | head -1)"
+    else fail "$BIN missing or won't run — reinstall, or check its shared libraries with 'ldd $BIN'"; fi
+
+    check "proxy.conf readable"
+    if [[ -r "$ROOT/proxy.conf" ]]; then pass
+    else fail "$ROOT/proxy.conf missing or unreadable by this user"; fi
+
+    check "operator_address is set"
+    local op; op="$(sed -n 's/^[[:space:]]*operator_address[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$ROOT/proxy.conf" 2>/dev/null | head -1)"
+    if [[ -n "$op" && "$op" != *REPLACEME* ]]; then pass "$op"
+    else fail "unset or still the placeholder — the proxy refuses to start without it"; fi
+
+    if [[ "$MODE" == "pps-classic" ]]; then
+        check "pool_btc_address is set (pps-classic)"
+        local pb; pb="$(sed -n 's/^[[:space:]]*pool_btc_address[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$ROOT/proxy.conf" 2>/dev/null | head -1)"
+        if [[ -n "$pb" && "$pb" != *REPLACE* ]]; then pass "$pb"; else fail "unset — the proxy refuses to start in pps-classic without it"; fi
+
+        check "payout worker has a Thunder source address"
+        if grep -qs 'THUNDER_FROM_ADDRESS=[^[:space:]]' /etc/systemd/system/simplepool-payout.service.d/local.conf 2>/dev/null \
+           || [[ -n "${THUNDER_ADDRESS:-}" ]]; then pass
+        else soft "THUNDER_FROM_ADDRESS is empty — the payout worker exits on start"; fi
+    fi
+
+    head_ "database"
+    check "database exists"
+    if [[ -f "$DB_PATH" ]]; then pass "$(du -h "$DB_PATH" 2>/dev/null | cut -f1)"; else fail "$DB_PATH missing — re-run the installer"; fi
+    check "schema is initialised"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        local n; n="$(sqlite3 "file:${DB_PATH}?mode=ro" "SELECT count(*) FROM sqlite_master WHERE type='table'" 2>/dev/null || echo 0)"
+        if [[ "${n:-0}" -ge 4 ]]; then pass "$n tables"; else fail "only ${n:-0} tables — load schema.sql"; fi
+    else soft "sqlite3 not installed; skipped"; fi
+    check "data directory writable by $SVC_USER"
+    if sudo -u "$SVC_USER" test -w "$(dirname "$DB_PATH")" 2>/dev/null; then pass
+    else fail "$(dirname "$DB_PATH") is not writable by $SVC_USER — the proxy cannot record shares"; fi
+
+    head_ "backend"
+    local url; url="$(sed -n 's/^[[:space:]]*bitcoind_url[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$ROOT/proxy.conf" 2>/dev/null | head -1)"
+    check "bitcoind reachable"
+    if [[ -z "$url" ]]; then fail "bitcoind_url is not set in proxy.conf"
+    else
+        local user pass_ auth=()
+        user="$(sed -n 's/^[[:space:]]*bitcoind_user[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$ROOT/proxy.conf" 2>/dev/null | head -1)"
+        pass_="$(sed -n 's/^[[:space:]]*bitcoind_pass[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$ROOT/proxy.conf" 2>/dev/null | head -1)"
+        [[ -n "$user" ]] && auth=(--user "$user:$pass_")
+        # getblockchaininfo rather than getblocktemplate: it is cheap, and a
+        # template failure here would be indistinguishable from an unfunded
+        # or still-syncing node.
+        local out
+        out="$(curl -fsS --max-time 8 "${auth[@]}" --data-binary \
+              '{"jsonrpc":"1.0","id":"doctor","method":"getblockchaininfo","params":[]}' \
+              -H 'content-type: text/plain;' "$url" 2>&1)"
+        # The body is the test, not curl's exit status: a 200 carrying a
+        # JSON-RPC error is a failure too, and a failed curl leaves its
+        # message in $out, which cannot contain a result object either way.
+        if [[ "$out" == *'"result"'* ]]; then
+            local h; h="$(printf '%s' "$out" | sed -n 's/.*"blocks"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
+            pass "height ${h:-?} at $url"
+        else
+            fail "no usable JSON-RPC answer from $url — check the node, the port, and bitcoind_user/pass"
+        fi
+    fi
+
+    head_ "services"
+    for u in "${UNITS[@]}"; do
+        check "${u%.service}"
+        local s; s="$(svc_state "$u")"
+        if [[ "$s" == "active" ]]; then pass
+        elif [[ "$s" == "inactive" ]]; then soft "not running — 'sudo simplepoolctl start'"
+        else fail "$s — journalctl -u ${u%.service} -n 50"; fi
+    done
+
+    check "stratum port ${STRATUM_PORT} accepting connections"
+    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE ":${STRATUM_PORT}\b"; then pass
+    else fail "nothing is listening on :${STRATUM_PORT} — miners cannot connect"; fi
+
+    head_ "disk"
+    check "free space on $(df -P "$ROOT" 2>/dev/null | awk 'NR==2{print $6}')"
+    local avail_kb; avail_kb="$(df -Pk "$ROOT" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [[ -n "$avail_kb" && "$avail_kb" -gt 1048576 ]]; then pass "$(( avail_kb / 1024 )) MB"
+    elif [[ -n "$avail_kb" ]]; then soft "$(( avail_kb / 1024 )) MB left — the share ledger only grows"
+    else soft "could not read"; fi
+
+    echo
+    if [[ "$DOCTOR_FAILED" == "1" ]]; then
+        echo "${RED}${BOLD}doctor: something above needs attention.${OFF}"
+        return 1
+    fi
+    echo "${GRN}${BOLD}doctor: all checks passed.${OFF}"
+    echo
+}
+
+# ----------------------------------------------------------------- upgrade --
+cmd_upgrade() {
+    need_root upgrade
+    local target="${1:-}"
+    local installer="$ROOT/scripts/install.sh"
+    [[ -f "$installer" ]] || die "no installer at $installer — reinstall from the one-liner in the README"
+
+    # The installer is the single implementation of "put simplepool on a box".
+    # Upgrading by re-running it non-interactively against the saved answers
+    # means an upgrade cannot drift from a fresh install — there is no second
+    # code path to keep in sync.
+    if [[ "$SOURCE" == "release" ]]; then
+        local tag="${target:-$(latest_tag)}"
+        [[ -n "$tag" ]] || die "could not determine the latest release tag — pass one: simplepoolctl upgrade v0.2.0"
+        if [[ "$tag" == "${RELEASE_TAG:-}" && -z "$target" ]]; then
+            say "already on $tag — nothing to do (pass a tag to force)"
+            return 0
+        fi
+        echo "${BOLD}==> upgrading ${RELEASE_TAG:-unknown} -> $tag${OFF}"
+        bash "$installer" --non-interactive --yes --from-release "$tag"
+    else
+        echo "${BOLD}==> rebuilding from ${BRANCH:-main}${OFF}"
+        bash "$installer" --non-interactive --yes --from-source ${target:+--branch "$target"}
+    fi
+}
+
+# --------------------------------------------------------------- uninstall --
+cmd_uninstall() {
+    need_root uninstall
+    local purge=0
+    [[ "${1:-}" == "--purge" ]] && purge=1
+
+    echo "${BOLD}This will stop and remove:${OFF}"
+    for u in "${UNITS[@]}"; do say "systemd unit  $u"; done
+    say "command       /usr/local/bin/simplepoolctl"
+    if [[ "$purge" == "1" ]]; then
+        echo "${RED}${BOLD}--purge also deletes, permanently:${OFF}"
+        say "${RED}$ROOT              (the checkout AND proxy.conf)${OFF}"
+        say "${RED}$DB_PATH           (every share, block and PPS credit ever recorded)${OFF}"
+        say "${RED}$STATE_DIR         (install answers and admin credentials)${OFF}"
+        echo
+        say "${YEL}The ledger is the only record of what the pool owes its miners.${OFF}"
+        say "${YEL}Back it up first:  sqlite3 $DB_PATH \".backup /somewhere/safe.db\"${OFF}"
+    else
+        say "${DIM}$ROOT and $DB_PATH are LEFT IN PLACE (use --purge to remove them)${OFF}"
+    fi
+    echo
+    local answer=""
+    read -r -p "    type 'yes' to proceed: " answer </dev/tty || true
+    [[ "$answer" == "yes" ]] || { echo "aborted"; exit 1; }
+
+    for u in "${UNITS[@]}"; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$u"
+        rm -rf "/etc/systemd/system/$u.d"
+        say "removed $u"
+    done
+    systemctl daemon-reload
+
+    if [[ -n "${FQDN:-}" && -e "/etc/nginx/sites-enabled/${FQDN}" ]]; then
+        rm -f "/etc/nginx/sites-enabled/${FQDN}"
+        say "removed nginx vhost symlink for ${FQDN} (the vhost and any certbot TLS block are left in sites-available)"
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$purge" == "1" ]]; then
+        rm -rf "$ROOT" "$STATE_DIR"
+        say "removed $ROOT and $STATE_DIR"
+    fi
+    rm -f /usr/local/bin/simplepoolctl
+    echo
+    say "${GRN}done.${OFF} The service user '$SVC_USER' was left in place — remove it with 'userdel' if you want it gone."
+    echo
+}
+
+# -------------------------------------------------------------------- main --
+case "${1:-status}" in
+    status)     shift || true; cmd_status "$@" ;;
+    version|--version) shift || true; cmd_version "$@" ;;
+    logs)       shift; cmd_logs "$@" ;;
+    start|stop|restart) a="$1"; shift; cmd_lifecycle "$a" "$@" ;;
+    config)     shift; cmd_config "$@" ;;
+    doctor)     shift; cmd_doctor "$@" ;;
+    upgrade)    shift; cmd_upgrade "$@" ;;
+    uninstall)  shift; cmd_uninstall "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "simplepoolctl: unknown command '$1'" >&2; echo; usage; exit 2 ;;
+esac

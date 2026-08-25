@@ -17,7 +17,16 @@ Environment=PAYOUT_DB_PATH=@ROOT@/data/shares.db
 Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
 # Environment=THUNDER_FROM_ADDRESS=<paste from proxy.conf>
 Environment=PAYOUT_MIN_SATS=10000
-Environment=PAYOUT_INTERVAL_MS=30000
+# Payout runs are a daily batch: once every 24h everyone over
+# PAYOUT_MIN_SATS goes out in a single Thunder transaction.
+Environment=PAYOUT_INTERVAL_MS=86400000
+# ...but a batch already broadcast is re-checked on its own, much shorter
+# clock. Nobody in a batch is credited until a tick sees it confirmed in a
+# Thunder block, so this must NOT follow the daily cadence.
+Environment=PAYOUT_SETTLE_INTERVAL_MS=30000
+# And a tick that tried and got nowhere (transfer failed, or the reserve
+# could not cover what is owed) comes back on this one rather than tomorrow.
+Environment=PAYOUT_RETRY_INTERVAL_MS=300000
 # Admin HTTP surface — used by the dashboard's "Trigger payout now"
 # button. Loopback-only. Set port=0 to disable.
 Environment=PAYOUT_ADMIN_BIND=127.0.0.1

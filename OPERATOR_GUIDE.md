@@ -23,6 +23,7 @@ tracked by git.
 | Which commit is running | `http://<pool-host>:8081/api/versions` | none |
 | Stratum (miner endpoint) | `stratum+tcp://<pool-host>:3334` | username = Thunder base58 address |
 | SSH | `root@<pool-host>` | `<ssh-key>` |
+| Everything from the shell | `simplepoolctl status` / `doctor` / `logs -f` | root for `restart`, `upgrade`, `uninstall` |
 
 The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
 box (root-only). To rotate, edit
@@ -157,6 +158,22 @@ If you see a `⚠` banner AND owed is significant, do a deposit (below).
 Also check the **In-flight payouts** card — should be empty. Any row
 with a set `txid` means a payout crashed mid-flight and needs manual
 reconciliation.
+
+From the shell, `simplepoolctl status` covers the same ground (services,
+ports, worker count, blocks found, sats owed) and `simplepoolctl doctor`
+checks the things that actually break: the binary runs here, bitcoind
+answers, the DB is writable, something is listening on :3334.
+
+**On the payout cadence.** Payouts run as a **daily batch** — once every 24h
+everyone over `PAYOUT_MIN_SATS` goes out in a single Thunder transaction.
+So "nobody has been paid yet today" is the normal state for most of the day,
+not a fault. What does *not* wait a day is settlement: once a batch is
+broadcast the worker re-checks it every 30s until Thunder mines it, because
+nobody in that batch is credited until then. To pay out early, use **Trigger
+payout now** on the admin dashboard. To change the cadence, re-run the
+installer with `--payout-interval-hours N`, or edit
+`PAYOUT_INTERVAL_MS` in
+`/etc/systemd/system/simplepool-payout.service.d/local.conf`.
 
 ### 2. Deposit BTC into Thunder (when reserve is short)
 

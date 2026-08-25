@@ -1,0 +1,1531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simplepool — how it works</title>
+<meta name="description" content="simplepool: a single-binary C11 stratum server for Bitcoin. How solo mode and pps-classic mode work, end to end — shares, difficulty, the coinbase, PPS credit, Thunder payouts, and how to audit every number.">
+<style>
+/* ---------------------------------------------------------------------------
+   One file, no build step, no network. Everything below is deliberately
+   self-contained so this page can be opened from disk, dropped next to the
+   dashboard, or mailed to a miner and still render identically.
+   --------------------------------------------------------------------------- */
+:root {
+  --bg:        #fbfaf8;
+  --bg-sunk:   #f2f0ec;
+  --bg-card:   #ffffff;
+  --fg:        #1b1a17;
+  --fg-muted:  #6a665e;
+  --fg-faint:  #918c82;
+  --rule:      #e2ded6;
+  --rule-firm: #cdc7bb;
+  --solo:      #b45309;
+  --solo-bg:   #fdf5e9;
+  --pps:       #4338ca;
+  --pps-bg:    #eeecfb;
+  --warn:      #b91c1c;
+  --warn-bg:   #fdeceb;
+  --ok:        #15803d;
+  --code-bg:   #f4f2ee;
+  --shadow:    0 1px 2px rgba(28,26,23,.05), 0 4px 16px rgba(28,26,23,.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:        #16161a;
+    --bg-sunk:   #1d1d22;
+    --bg-card:   #1e1e24;
+    --fg:        #e9e7e3;
+    --fg-muted:  #a7a29a;
+    --fg-faint:  #7d786f;
+    --rule:      #2e2e36;
+    --rule-firm: #43424c;
+    --solo:      #f0a848;
+    --solo-bg:   #2a2117;
+    --pps:       #a5a0f5;
+    --pps-bg:    #1e1d33;
+    --warn:      #f2837c;
+    --warn-bg:   #2c1a19;
+    --ok:        #6ee7a4;
+    --code-bg:   #23232a;
+    --shadow:    0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.25);
+  }
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 1.5rem; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.65 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+}
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                                Consolas, "Liberation Mono", monospace; }
+
+/* ------------------------------------------------------------ page frame -- */
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 1.25rem; }
+.layout { display: grid; grid-template-columns: 15rem minmax(0,1fr); gap: 3rem; align-items: start; }
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; gap: 0; } }
+
+/* ------------------------------------------------------------------ nav --- */
+nav.toc {
+  position: sticky; top: 0; max-height: 100vh; overflow-y: auto;
+  padding: 2.5rem 0 3rem; font-size: .875rem;
+}
+@media (max-width: 900px) {
+  nav.toc { position: static; max-height: none; padding: 1rem 0 2rem;
+            border-bottom: 1px solid var(--rule); margin-bottom: 2rem; }
+}
+nav.toc .toc-title {
+  font-size: .6875rem; letter-spacing: .11em; text-transform: uppercase;
+  color: var(--fg-faint); font-weight: 600; margin-bottom: .75rem;
+}
+nav.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: toc; }
+nav.toc li { counter-increment: toc; }
+nav.toc a {
+  display: block; padding: .3rem 0 .3rem 1.9rem; text-indent: -1.9rem;
+  color: var(--fg-muted); text-decoration: none; border-radius: 4px;
+}
+nav.toc a::before {
+  content: counter(toc, decimal-leading-zero); color: var(--fg-faint);
+  font-variant-numeric: tabular-nums; margin-right: .7rem; font-size: .8125rem;
+}
+nav.toc a:hover { color: var(--fg); }
+nav.toc a:hover::before { color: var(--solo); }
+
+/* ------------------------------------------------------------- masthead --- */
+header.masthead { padding: 4rem 0 2.5rem; border-bottom: 1px solid var(--rule); }
+header.masthead .eyebrow {
+  font-size: .75rem; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--fg-faint); font-weight: 600;
+}
+header.masthead h1 {
+  font-size: clamp(2.5rem, 6vw, 3.75rem); line-height: 1.04; margin: .5rem 0 0;
+  letter-spacing: -.03em; font-weight: 700;
+}
+header.masthead .lede {
+  font-size: clamp(1.0625rem, 2vw, 1.25rem); color: var(--fg-muted);
+  max-width: 44rem; margin: 1.1rem 0 0; line-height: 1.55;
+}
+.badges { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1.75rem; }
+.badge {
+  font-size: .75rem; padding: .28rem .6rem; border-radius: 999px;
+  border: 1px solid var(--rule-firm); color: var(--fg-muted);
+  background: var(--bg-card); white-space: nowrap;
+}
+
+/* -------------------------------------------------------------- content --- */
+main { padding-bottom: 6rem; }
+section { padding-top: 3.5rem; }
+section > h2 {
+  font-size: clamp(1.5rem, 3vw, 1.875rem); letter-spacing: -.02em;
+  margin: 0 0 .35rem; font-weight: 680; line-height: 1.2;
+}
+section > .section-sub { color: var(--fg-muted); margin: 0 0 1.75rem; max-width: 46rem; }
+h3 { font-size: 1.125rem; margin: 2.25rem 0 .6rem; letter-spacing: -.01em; font-weight: 650; }
+h4 { font-size: .9375rem; margin: 1.5rem 0 .4rem; font-weight: 650; }
+p  { margin: 0 0 1rem; max-width: 46rem; }
+ul, ol { max-width: 46rem; padding-left: 1.25rem; }
+li { margin: .3rem 0; }
+a { color: inherit; text-underline-offset: 2px; text-decoration-color: var(--rule-firm); }
+a:hover { text-decoration-color: currentColor; }
+strong { font-weight: 650; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0 0; }
+
+code {
+  background: var(--code-bg); padding: .1em .36em; border-radius: 4px;
+  font-size: .875em; border: 1px solid var(--rule);
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px;
+  padding: 1rem 1.1rem; overflow-x: auto; font-size: .8125rem; line-height: 1.6;
+  margin: 0 0 1.25rem;
+}
+pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+
+/* ---------------------------------------------------------------- cards --- */
+.card {
+  background: var(--bg-card); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 1.25rem 1.4rem; margin: 0 0 1.25rem; box-shadow: var(--shadow);
+}
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1.25rem; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
+
+.mode-card { border-top: 3px solid var(--rule-firm); }
+.mode-card.solo { border-top-color: var(--solo); }
+.mode-card.pps  { border-top-color: var(--pps); }
+.mode-card h3 { margin-top: .25rem; display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+.mode-card.solo h3 code { color: var(--solo); background: var(--solo-bg); border-color: transparent; }
+.mode-card.pps  h3 code { color: var(--pps);  background: var(--pps-bg);  border-color: transparent; }
+.mode-card .tagline { font-size: .8125rem; color: var(--fg-faint); font-weight: 400; }
+.mode-card dl { margin: 1rem 0 0; display: grid; grid-template-columns: 9rem 1fr; gap: .45rem 1rem; font-size: .875rem; }
+.mode-card dt { color: var(--fg-faint); }
+.mode-card dd { margin: 0; }
+@media (max-width: 480px) { .mode-card dl { grid-template-columns: 1fr; gap: .1rem 0; }
+                            .mode-card dd { margin-bottom: .55rem; } }
+
+.stat { text-align: left; }
+.stat .n { font-size: 1.5rem; font-weight: 660; letter-spacing: -.02em; display: block; line-height: 1.15; }
+.stat .k { font-size: .75rem; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .08em; margin-top: .3rem; display: block; }
+
+/* --------------------------------------------------------------- callout -- */
+.note, .warnbox {
+  border-left: 3px solid var(--rule-firm); background: var(--bg-sunk);
+  padding: .9rem 1.1rem; border-radius: 0 8px 8px 0; margin: 0 0 1.25rem;
+  font-size: .9375rem; max-width: 46rem;
+}
+.note p:last-child, .warnbox p:last-child { margin-bottom: 0; }
+.warnbox { border-left-color: var(--warn); background: var(--warn-bg); }
+.note .label, .warnbox .label {
+  display: block; font-size: .6875rem; letter-spacing: .1em; text-transform: uppercase;
+  font-weight: 650; color: var(--fg-faint); margin-bottom: .35rem;
+}
+.warnbox .label { color: var(--warn); }
+
+/* --------------------------------------------------------------- tables --- */
+.tablewrap { overflow-x: auto; margin: 0 0 1.5rem; border: 1px solid var(--rule); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: .875rem; }
+th, td { text-align: left; padding: .6rem .85rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+thead th { background: var(--bg-sunk); font-weight: 620; font-size: .75rem;
+           letter-spacing: .05em; text-transform: uppercase; color: var(--fg-muted); white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+td code { white-space: nowrap; }
+
+/* ------------------------------------------------------------- sequence --- */
+ol.steps { list-style: none; padding: 0; counter-reset: step; max-width: 46rem; }
+ol.steps > li {
+  counter-increment: step; position: relative; padding: 0 0 1.4rem 2.75rem;
+  border-left: 1px solid var(--rule); margin-left: .85rem;
+}
+ol.steps > li:last-child { border-left-color: transparent; padding-bottom: 0; }
+ol.steps > li::before {
+  content: counter(step); position: absolute; left: -.85rem; top: -.15rem;
+  width: 1.7rem; height: 1.7rem; border-radius: 50%;
+  background: var(--bg-card); border: 1px solid var(--rule-firm);
+  display: grid; place-items: center; font-size: .75rem; font-weight: 650;
+  color: var(--fg-muted); font-variant-numeric: tabular-nums;
+}
+ol.steps .who {
+  display: inline-block; font-size: .6875rem; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--fg-faint); font-weight: 640; margin-bottom: .1rem;
+}
+ol.steps h4 { margin: 0 0 .25rem; font-size: 1rem; }
+ol.steps p  { margin: 0 0 .5rem; font-size: .9375rem; }
+
+/* -------------------------------------------------------------- diagram --- */
+figure { margin: 0 0 1.75rem; }
+figure svg { display: block; width: 100%; height: auto; }
+figcaption { font-size: .8125rem; color: var(--fg-faint); margin-top: .6rem; max-width: 46rem; }
+.svgbox { border: 1px solid var(--rule); border-radius: 10px; background: var(--bg-card);
+          padding: 1.25rem; overflow-x: auto; }
+
+/* byte-layout strip */
+.bytes { display: flex; flex-wrap: wrap; gap: 2px; margin: 0 0 .5rem; font-size: .75rem; }
+.bytes .f {
+  padding: .5rem .7rem; border-radius: 5px; background: var(--bg-sunk);
+  border: 1px solid var(--rule); flex: 1 1 auto; min-width: 5.5rem;
+}
+.bytes .f b { display: block; font-weight: 620; font-size: .8125rem; }
+.bytes .f span { color: var(--fg-faint); }
+.bytes .f.pool   { background: var(--solo-bg); border-color: transparent; }
+.bytes .f.miner  { background: var(--pps-bg);  border-color: transparent; }
+.legend { font-size: .8125rem; color: var(--fg-faint); display: flex; gap: 1.25rem; flex-wrap: wrap; }
+.legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 3px; margin-right: .35rem; }
+
+/* ---------------------------------------------------------------- footer -- */
+footer { border-top: 1px solid var(--rule); padding: 2.5rem 0 4rem; color: var(--fg-muted); font-size: .875rem; }
+footer .wrap > p { max-width: 46rem; }
+
+/* ----------------------------------------------------------------- print -- */
+@media print {
+  nav.toc, .badges { display: none; }
+  .layout { grid-template-columns: 1fr; }
+  body { background: #fff; color: #000; font-size: 11pt; }
+  section { page-break-inside: auto; padding-top: 1.5rem; }
+  h2, h3 { page-break-after: avoid; }
+  pre, table, figure, .card { page-break-inside: avoid; }
+  a { text-decoration: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <div class="eyebrow">Bitcoin mining infrastructure</div>
+    <h1>simplepool</h1>
+    <p class="lede">
+      A single-binary stratum server in pure C11. It hands work to your ASICs,
+      checks every submission itself, submits found blocks, and records the whole
+      thing in a SQLite file you are allowed to read. It runs in two modes —
+      <strong>solo</strong>, where the miner who finds a block is paid in that
+      block's own coinbase, and <strong>pps-classic</strong>, where every accepted
+      share earns a fixed, derivable amount paid out over Thunder.
+    </p>
+    <div class="badges">
+      <span class="badge">C11 · no runtime dependencies beyond libc, sqlite3, libcurl, hiredis</span>
+      <span class="badge">stratum v1 on :3334</span>
+      <span class="badge">SQLite (WAL) ledger</span>
+      <span class="badge">MIT</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+<div class="layout">
+
+<nav class="toc">
+  <div class="toc-title">Contents</div>
+  <ol>
+    <li><a href="#what">What it is</a></li>
+    <li><a href="#modes">The two modes</a></li>
+    <li><a href="#stack">The stack</a></li>
+    <li><a href="#lifecycle">Life of a share</a></li>
+    <li><a href="#nonce">Dividing the search space</a></li>
+    <li><a href="#difficulty">Difficulty &amp; vardiff</a></li>
+    <li><a href="#solo">Solo mode</a></li>
+    <li><a href="#pps">pps-classic mode</a></li>
+    <li><a href="#fees">Where the fee lands</a></li>
+    <li><a href="#payouts">Payouts over Thunder</a></li>
+    <li><a href="#audit">Auditing every number</a></li>
+    <li><a href="#data">The data model</a></li>
+    <li><a href="#connect">Connect a miner</a></li>
+    <li><a href="#config">Configuration</a></li>
+    <li><a href="#operate">Running one</a></li>
+    <li><a href="#limits">What it can't do</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ====================================================== 1. what it is === -->
+<section id="what">
+  <h2>What it is</h2>
+  <p class="section-sub">
+    A stratum server, a share ledger, and a read-only dashboard. That is the
+    whole system.
+  </p>
+
+  <p>
+    Miners open a TCP connection to port <code>3334</code> and speak stratum v1.
+    simplepool builds block templates from <code>bitcoind</code>'s
+    <code>getblocktemplate</code>, hands each connection its own job, re-hashes
+    every submission it receives, and writes each accepted one into
+    <code>data/shares.db</code>. If a submission also clears the network target,
+    it goes straight back out via <code>submitblock</code>.
+  </p>
+  <p>
+    There is no account system. There is no password — the stratum password
+    field is read and discarded. Your identity on the pool <em>is</em> the
+    payout address you authorize with, which means there is nothing to register,
+    nothing to log into, and nothing the operator can quietly change about who
+    you are.
+  </p>
+
+  <div class="grid-3">
+    <div class="card stat"><span class="n">2</span><span class="k">payout modes</span></div>
+    <div class="card stat"><span class="n">1</span><span class="k">binary, no daemon zoo</span></div>
+    <div class="card stat"><span class="n">1</span><span class="k">writer to the ledger</span></div>
+    <div class="card stat"><span class="n">0</span><span class="k">accounts to create</span></div>
+  </div>
+
+  <h3>Why "share" and not "work unit"</h3>
+  <p>
+    In solo mode a share is not a claim on anything — the block reward goes to
+    whoever finds the block, and shares exist for hashrate estimation and
+    per-rig accountability. The word is kept anyway, deliberately: <em>share</em>
+    is the term every ASIC firmware, monitoring tool and pool dashboard already
+    uses, and the same column and table names carry through unchanged into
+    pps-classic, where shares genuinely are the unit of account. The meaning
+    shifts between modes; the vocabulary does not.
+  </p>
+
+  <div class="note">
+    <span class="label">The thing this project is actually about</span>
+    <p>
+      Auditing your own contribution to a mining pool is normally somewhere
+      between hard and impossible — you are handed a number and asked to trust
+      it. simplepool writes down enough per share that the number can be
+      re-derived from scratch by anyone holding a copy of the database, without
+      trusting the dashboard that reports it. <a href="#audit">Section 11</a>
+      is that argument in SQL.
+    </p>
+  </div>
+</section>
+
+<!-- ========================================================= 2. the modes == -->
+<section id="modes">
+  <h2>The two modes</h2>
+  <p class="section-sub">
+    One config key — <code>pool_mode</code> — decides the shape of the coinbase,
+    what a stratum username must be, and whether any off-chain accounting
+    happens at all.
+  </p>
+
+  <div class="grid-2">
+    <div class="card mode-card solo">
+      <h3><code>pool_mode = solo</code> <span class="tagline">the default</span></h3>
+      <p>
+        Every block is paid, on-chain, in its own coinbase, to the miner who
+        found it. Nothing is pooled. If your rig finds the block you get
+        essentially the whole subsidy plus fees; if it doesn't, nobody on this
+        pool earns anything at that height.
+      </p>
+      <dl>
+        <dt>Stratum username</dt><dd>your Bitcoin address, <code>bc1q…</code> or base58</dd>
+        <dt>Who gets paid</dt><dd>the finder, in the block's coinbase</dd>
+        <dt>When</dt><dd>immediately, with the block — no payout worker exists</dd>
+        <dt>Variance</dt><dd>all yours</dd>
+        <dt>Shares are</dt><dd>a record, not a balance</dd>
+        <dt>Needs</dt><dd>a <code>bitcoind</code>. Nothing else.</dd>
+      </dl>
+    </div>
+
+    <div class="card mode-card pps">
+      <h3><code>pool_mode = pps-classic</code></h3>
+      <p>
+        Every block's coinbase pays a pool-owned BTC wallet. Every accepted
+        share credits your balance at a rate derived from the live block
+        template, whether or not the pool found anything. The operator moves
+        accumulated BTC into a Thunder reserve, and a payout worker drains that
+        reserve to miners.
+      </p>
+      <dl>
+        <dt>Stratum username</dt><dd>a bare base58 Thunder address</dd>
+        <dt>Who gets paid</dt><dd>every miner, per share</dd>
+        <dt>When</dt><dd>daily batch, once your balance clears the minimum</dd>
+        <dt>Variance</dt><dd>the pool's</dd>
+        <dt>Shares are</dt><dd>the unit of account</dd>
+        <dt>Needs</dt><dd><code>bitcoind</code>, the enforcer, a Thunder node</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>&nbsp;</th><th>solo</th><th>pps-classic</th></tr></thead>
+      <tbody>
+        <tr><td>Coinbase outputs</td>
+            <td>miner's address + operator fee</td>
+            <td><code>pool_btc_address</code> + operator fee</td></tr>
+        <tr><td>Per-connection coinbase</td>
+            <td>yes — each miner's <code>cb1</code>/<code>cb2</code> pay <em>that</em> miner</td>
+            <td>no — every miner's coinbase pays the pool</td></tr>
+        <tr><td>Off-chain accounting</td><td>none</td><td><code>pps_credits</code></td></tr>
+        <tr><td>Pool custodies BTC</td><td>never</td><td>yes, between mining and deposit</td></tr>
+        <tr><td>Payout asset</td><td>BTC, on the mainchain</td><td>BTC on Thunder, a BIP300 sidechain</td></tr>
+        <tr><td>Payout worker</td><td>not installed</td><td><code>simplepool-payout.service</code></td></tr>
+        <tr><td>Miner's income</td><td>lumpy and rare, but complete</td><td>smooth and proportional</td></tr>
+        <tr><td>Who eats bad luck</td><td>the miner</td><td>the pool operator</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="warnbox">
+    <span class="label">A third mode existed and was removed</span>
+    <p>
+      <code>pool_mode = pps</code> put a BIP300 drivechain deposit directly in
+      each coinbase, so the pool would never custody BTC at all. It does not
+      work. Regtest and a live forknet both showed the enforcer <strong>does not
+      credit coinbase outputs as deposits</strong>: the block confirms, and the
+      sidechain Ctip never moves — the reward is simply stranded. A canonical
+      deposit transaction has to spend real, mature, spendable UTXOs, and a
+      coinbase does not qualify. That is a consensus rule, not a bug, so the
+      mode was deleted rather than patched. <code>pps-classic</code> is what
+      every working drivechain pool converges on instead.
+    </p>
+  </div>
+</section>
+
+<!-- ========================================================== 3. the stack = -->
+<section id="stack">
+  <h2>The stack</h2>
+  <p class="section-sub">
+    In solo mode everything to the right of <code>bitcoind</code> is optional.
+    In pps-classic the enforcer and a Thunder node join the picture, because
+    that is where miners actually get paid.
+  </p>
+
+  <figure>
+    <div class="svgbox">
+      <svg viewBox="0 0 780 330" role="img" aria-labelledby="stackTitle stackDesc"
+           style="max-width: 780px; margin: 0 auto;">
+        <title id="stackTitle">simplepool component topology</title>
+        <desc id="stackDesc">Miner ASICs connect over stratum to simplepool, which talks
+          to bitcoind for block templates and writes accepted shares into a SQLite file.
+          The dashboard and the Thunder payout worker read that same file; the payout
+          worker also talks to a Thunder node.</desc>
+        <style>
+          .bx  { fill: var(--bg-sunk); stroke: var(--rule-firm); stroke-width: 1.25; rx: 8; }
+          .bx.core { fill: var(--solo-bg); stroke: var(--solo); }
+          .bx.side { fill: var(--pps-bg);  stroke: var(--pps); }
+          .t   { fill: var(--fg); font: 600 13px ui-sans-serif, system-ui, sans-serif; }
+          .ts  { fill: var(--fg-muted); font: 400 11px ui-monospace, monospace; }
+          .ln  { stroke: var(--rule-firm); stroke-width: 1.5; fill: none; }
+          .lbl { fill: var(--fg-faint); font: 400 10.5px ui-monospace, monospace; }
+        </style>
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--rule-firm)"/>
+          </marker>
+        </defs>
+
+        <!-- row 1 -->
+        <rect class="bx"      x="10"  y="40"  width="150" height="64"/>
+        <text class="t"  x="85"  y="66"  text-anchor="middle">Miner ASICs</text>
+        <text class="ts" x="85"  y="84"  text-anchor="middle">stratum v1</text>
+
+        <rect class="bx core" x="210" y="40"  width="150" height="64"/>
+        <text class="t"  x="285" y="66"  text-anchor="middle">simplepool</text>
+        <text class="ts" x="285" y="84"  text-anchor="middle">:3334</text>
+
+        <rect class="bx"      x="410" y="40"  width="160" height="64"/>
+        <text class="t"  x="490" y="66"  text-anchor="middle">bitcoind</text>
+        <text class="ts" x="490" y="84"  text-anchor="middle">(+ enforcer)</text>
+
+        <line class="ln" x1="162" y1="72" x2="206" y2="72" marker-end="url(#ar)"/>
+        <line class="ln" x1="362" y1="72" x2="406" y2="72" marker-end="url(#ar)"/>
+        <line class="ln" x1="406" y1="88" x2="362" y2="88" marker-end="url(#ar)"/>
+        <text class="lbl" x="184" y="62" text-anchor="middle">work</text>
+        <text class="lbl" x="384" y="34" text-anchor="middle">GBT</text>
+        <text class="lbl" x="384" y="120" text-anchor="middle">submitblock</text>
+
+        <!-- row 2 -->
+        <rect class="bx" x="210" y="160" width="150" height="56"/>
+        <text class="t"  x="285" y="184" text-anchor="middle">shares.db</text>
+        <text class="ts" x="285" y="201" text-anchor="middle">SQLite · WAL</text>
+        <line class="ln" x1="285" y1="106" x2="285" y2="156" marker-end="url(#ar)"/>
+        <text class="lbl" x="296" y="136">one writer</text>
+
+        <!-- row 3 -->
+        <rect class="bx" x="10"  y="252" width="150" height="60"/>
+        <text class="t"  x="85"  y="277" text-anchor="middle">dashboard</text>
+        <text class="ts" x="85"  y="294" text-anchor="middle">read-only · :8081</text>
+
+        <rect class="bx side" x="410" y="252" width="160" height="60"/>
+        <text class="t"  x="490" y="277" text-anchor="middle">payout worker</text>
+        <text class="ts" x="490" y="294" text-anchor="middle">pps-classic only</text>
+
+        <rect class="bx side" x="620" y="252" width="150" height="60"/>
+        <text class="t"  x="695" y="277" text-anchor="middle">Thunder node</text>
+        <text class="ts" x="695" y="294" text-anchor="middle">sidechain</text>
+
+        <path class="ln" d="M228,218 L228,240 Q228,252 214,252 L166,252" marker-end="url(#ar)"/>
+        <path class="ln" d="M342,218 L342,240 Q342,252 356,252 L406,252" marker-end="url(#ar)"/>
+        <line class="ln" x1="574" y1="282" x2="616" y2="282" marker-end="url(#ar)"/>
+      </svg>
+    </div>
+    <figcaption>
+      SQLite is the source of truth and simplepool is its only writer; everything
+      downstream reads. In pps-classic the operator also drives BTC → Thunder
+      deposits from the admin dashboard through the enforcer's wallet — the one
+      arrow left off the diagram, because it is a human pressing a button rather
+      than a running data path.
+    </figcaption>
+  </figure>
+
+  <p>
+    Optionally, setting <code>redis_url</code> mirrors accepted shares, rejects,
+    blocks, tip changes and PPS credits onto Redis pub/sub channels
+    (<code>pool:shares</code>, <code>pool:rejects</code>, <code>pool:blocks</code>,
+    <code>pool:tip</code>, <code>pool:credits</code>). SQLite stays authoritative;
+    the publish is fire-and-forget and a Redis outage cannot cost you a share.
+  </p>
+</section>
+
+<!-- ====================================================== 4. life of a share -->
+<section id="lifecycle">
+  <h2>Life of a share</h2>
+  <p class="section-sub">
+    From plugging in an ASIC to a row in the ledger. Identical in both modes
+    except where noted.
+  </p>
+
+  <ol class="steps">
+    <li>
+      <span class="who">miner → pool</span>
+      <h4><code>mining.subscribe</code></h4>
+      <p>
+        The pool allocates this connection a 4-byte <strong>extranonce1</strong> and
+        replies with it. The value comes from an atomic counter XORed with the
+        current millisecond, so two rigs subscribing in the same nanosecond
+        cannot collide, and a rig reconnecting days later after the counter has
+        wrapped still gets something fresh.
+      </p>
+    </li>
+    <li>
+      <span class="who">miner → pool</span>
+      <h4><code>mining.authorize "&lt;address&gt;[.&lt;rig&gt;]"</code></h4>
+      <p>
+        The username is parsed as an address and validated on the spot —
+        bech32 or base58check in solo mode, bare base58 Thunder in pps-classic.
+        An invalid address is rejected with a clear error and written to the
+        <code>rejects</code> table rather than silently accepted. The password is
+        discarded.
+      </p>
+    </li>
+    <li>
+      <span class="who">pool → miner</span>
+      <h4><code>mining.set_difficulty</code> + <code>mining.notify</code></h4>
+      <p>
+        The connection gets a starting difficulty and the current job. In solo
+        mode the job's <code>cb1</code>/<code>cb2</code> are rendered against
+        <em>this</em> miner's address, so two rigs on the same pool are working on
+        genuinely different coinbases. The merkle branches, previous hash, nbits
+        and ntime are shared.
+      </p>
+    </li>
+    <li>
+      <span class="who">pool ↔ bitcoind</span>
+      <h4>Tip watcher</h4>
+      <p>
+        A background thread re-fetches <code>getblocktemplate</code> every
+        <code>bitcoind_poll_interval_ms</code> (default 30 s). On a new tip the
+        job is rebuilt and broadcast to every connection with
+        <code>clean_jobs = true</code>.
+      </p>
+    </li>
+    <li>
+      <span class="who">miner → pool</span>
+      <h4><code>mining.submit</code></h4>
+      <p>
+        Carries <code>job_id</code>, the miner's <code>extranonce2</code>,
+        <code>ntime</code>, <code>nonce</code>, and the exact rolled version bits.
+        The pool does not take the miner's word for the hash: it reassembles the
+        coinbase from the cached <code>cb1</code>/<code>cb2</code> and the two
+        extranonces, recomputes the merkle root, rebuilds the 80-byte header, and
+        double-SHA256s it itself.
+      </p>
+    </li>
+    <li>
+      <span class="who">pool</span>
+      <h4>Two comparisons, one hash</h4>
+      <p>
+        The resulting hash is compared against the connection's <strong>worker
+        target</strong> and against the <strong>network target</strong>. Above the
+        worker target it is rejected as <code>low difficulty</code> and logged in
+        <code>rejects</code>. Below it, a row lands in <code>shares</code>. Below
+        the network target as well, it is <em>also</em> a block.
+      </p>
+    </li>
+    <li>
+      <span class="who">pool → bitcoind</span>
+      <h4>Block submission</h4>
+      <p>
+        A block-shaped share is serialised in full and pushed via
+        <code>submitblock</code>, then recorded in <code>blocks_found</code> with
+        the height, hash, finder, reward and fee. What is recorded is a block
+        <em>candidate</em>: if the node refuses the submission the row is written
+        <code>rejected</code> with its reason, and if it is accepted the row is
+        <code>pending</code> until the block is verified to be in the chain — a
+        later reorg moves it to <code>orphaned</code>. Only
+        <code>confirmed</code> is counted, and only it pays the pool.
+        The share itself is unaffected: it met the thresholds it met, and in
+        pps-classic the pool absorbs the variance either way.
+      </p>
+    </li>
+    <li>
+      <span class="who">pool</span>
+      <h4>Vardiff tick, then the write</h4>
+      <p>
+        If the vardiff window has elapsed the connection is retargeted and gets a
+        fresh <code>mining.set_difficulty</code>. Writes are batched: shares queue
+        into a lock-free ring and a writer thread commits every
+        <code>commit_window_ms</code> (100 ms) or every
+        <code>commit_max_shares</code> (100), whichever comes first.
+      </p>
+    </li>
+  </ol>
+
+  <div class="note">
+    <span class="label">One detail that trips people up</span>
+    <p>
+      A <code>mining.set_difficulty</code> does <strong>not</strong> invalidate the
+      job you are working on. The difficulty only changes the threshold each
+      submitted share is measured against; the current <code>mining.notify</code>
+      stays valid across it, and the pool does not force a re-notify.
+    </p>
+  </div>
+</section>
+
+<!-- ===================================================== 5. the nonce space = -->
+<section id="nonce">
+  <h2>Dividing the search space</h2>
+  <p class="section-sub">
+    The fairness guarantee simplepool makes is narrow and checkable: no two
+    connections are ever searching the same
+    <code>(header, coinbase, nonce)</code> triple.
+  </p>
+
+  <p>
+    A block header is 80 bytes, and only three parts of it can vary while you
+    search: the 4-byte <code>nonce</code>, whichever <code>version</code> bits
+    the pool has permitted you to roll, and the <code>merkle_root</code> — which
+    you change indirectly, by changing the coinbase transaction.
+  </p>
+
+  <h3>The 80-byte header</h3>
+  <div class="bytes">
+    <div class="f"><b>version</b><span>4 B · rollable</span></div>
+    <div class="f"><b>prev_block_hash</b><span>32 B · fixed</span></div>
+    <div class="f"><b>merkle_root</b><span>32 B · via coinbase</span></div>
+    <div class="f"><b>ntime</b><span>4 B</span></div>
+    <div class="f"><b>nbits</b><span>4 B · network target</span></div>
+    <div class="f"><b>nonce</b><span>4 B · the sweep</span></div>
+  </div>
+
+  <h3>Where the extranonce lives</h3>
+  <p>
+    The coinbase <code>scriptSig</code> is assembled at share-check time and
+    carries both halves of the standard stratum split:
+  </p>
+  <div class="bytes">
+    <div class="f"><b>height push</b><span>BIP34</span></div>
+    <div class="f"><b>coinbase_tag</b><span>e.g. <code>/simplepool/</code></span></div>
+    <div class="f pool"><b>extranonce1</b><span>4 B · pool assigns</span></div>
+    <div class="f miner"><b>extranonce2</b><span>4 B · miner sweeps</span></div>
+  </div>
+  <p class="legend">
+    <span><i style="background:var(--solo-bg);border:1px solid var(--solo)"></i>assigned once per connection</span>
+    <span><i style="background:var(--pps-bg);border:1px solid var(--pps)"></i>yours to search</span>
+  </p>
+
+  <p>
+    Together those give each connection <strong>2<sup>64</sup></strong> distinct
+    coinbases before it would need to reconnect for a fresh
+    <code>extranonce1</code> — effectively unbounded at any real hashrate. Each
+    <code>extranonce2</code> value yields a distinct coinbase, therefore a
+    distinct coinbase txid, therefore a distinct merkle root, therefore a fresh
+    2<sup>32</sup> nonce space to sweep.
+  </p>
+
+  <h3>Version rolling</h3>
+  <p>
+    If a miner advertises support via <code>mining.configure</code>, the pool
+    negotiates a version-bit mask — currently <code>0x1fffe000</code>, the 16
+    bits from position 13 to 28. That multiplies the space behind a single
+    <code>(extranonce1, extranonce2)</code> pair by 2<sup>16</sup>, so one
+    <code>extranonce2</code> value covers 2<sup>32</sup> × 2<sup>16</sup> =
+    2<sup>48</sup> ≈ 280 trillion headers.
+  </p>
+  <p>
+    The pool never re-derives a rolled version on its own. The miner states the
+    exact version it hashed, the pool reconstructs <em>that</em> header and
+    re-hashes it, and any bit flipped outside the mask makes the submission
+    invalid.
+  </p>
+
+  <h3>Two rigs, one address</h3>
+  <p>
+    Authorizing as <code>bc1q….basement</code> and <code>bc1q….garage</code>
+    gives you two connections, hence two different <code>extranonce1</code>
+    values, hence no overlapping work — and two separate rows in
+    <code>workers</code>, so the leaderboard and the per-worker drilldown can
+    tell your boxes apart while the dashboard still rolls them up by address.
+  </p>
+</section>
+
+<!-- ====================================================== 6. difficulty ===== -->
+<section id="difficulty">
+  <h2>Difficulty &amp; vardiff</h2>
+  <p class="section-sub">
+    Every share is measured against two thresholds. One decides whether it
+    counts; the other decides whether it is a block.
+  </p>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3 style="margin-top:0">Worker target</h3>
+      <p style="margin-bottom:0">
+        The difficulty the pool is currently holding <em>this connection</em> at,
+        announced with <code>mining.set_difficulty</code>. A hash at or below it
+        is an accepted share. It exists so your rig reports in at a sane rate
+        instead of once a decade.
+      </p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Network target</h3>
+      <p style="margin-bottom:0">
+        The real chain difficulty, straight from the block template. A hash at or
+        below it is a valid block. It is far below any sane worker target, so a
+        block-finding hash necessarily satisfies the share check too.
+      </p>
+    </div>
+  </div>
+
+  <p>Both are 256-bit big-endian numbers, and for a hash <code>h</code>:</p>
+  <pre><code>share accepted  ⇔  h ≤ worker_target
+block found     ⇔  h ≤ network_target</code></pre>
+
+  <h3>What "difficulty 0.016" means</h3>
+  <p>
+    Bitcoin's pdiff-1 target is <code>0xffff × 2<sup>208</sup></code>. A share at
+    difficulty <code>D</code> is one whose hash is below
+    <code>pdiff_1 / D</code>, so given a worker target the difficulty recorded on
+    the share row is simply:
+  </p>
+  <pre><code>difficulty = pdiff_1_target / worker_target</code></pre>
+
+  <h4>Worked example, from a real rig</h4>
+  <pre><code>worker_target = 0x000003e7fc18…            (5 leading hex zeros)
+              = 0x03e7fc18 × 2^204
+
+difficulty    = (0xffff × 2^208) / (0x03e7fc18 × 2^204)
+              = 65535 × 16 / 65407512
+              ≈ 0.01603</code></pre>
+  <p>
+    That is the number stored in <code>shares.difficulty</code> on every row this
+    connection produces, and — in pps-classic — the number your credit is
+    computed from. Hashrate follows from the share rate:
+  </p>
+  <pre><code>shares_per_second = H / (D × 2^32)
+
+14 shares in a minute at D = 0.016
+  → 0.233 shares/s
+  → H = 0.233 × 0.016 × 2^32 ≈ 16 MH/s</code></pre>
+  <p>
+    The dashboard's hashrate column uses exactly this formula over a rolling
+    window (24 h by default), which is why it is an estimate with visible
+    variance rather than a reading off your ASIC.
+  </p>
+
+  <h3>Vardiff</h3>
+  <p>
+    Each connection is retargeted to hold a chosen share rate — 12 shares per
+    minute by default, roughly one every five seconds. The knobs:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>vardiff_enabled</code></td><td>1</td><td>0 pins every connection to <code>initial_diff</code></td></tr>
+        <tr><td><code>vardiff_target_spm</code></td><td>12</td><td>target shares per minute per connection</td></tr>
+        <tr><td><code>vardiff_window_sec</code></td><td>30</td><td>how often to retarget</td></tr>
+        <tr><td><code>vardiff_min</code> / <code>vardiff_max</code></td><td>1 / 1e12</td><td>clamps</td></tr>
+        <tr><td><code>initial_diff</code></td><td>1</td><td>what a connection starts at</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <p>
+      Vardiff changes the reporting rate, not your expected earnings. Over any
+      window, difficulty × share count is what you contributed, and holding a rig
+      at a higher difficulty just means fewer, heavier shares carrying the same
+      total.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ 7. solo ==== -->
+<section id="solo">
+  <h2>Solo mode</h2>
+  <p class="section-sub">
+    <code>pool_mode = solo</code>. The whole payout mechanism is the coinbase
+    transaction. There is no ledger of debts, because the pool never owes anyone
+    anything.
+  </p>
+
+  <h3>The coinbase</h3>
+  <p>
+    Every connection gets a coinbase built against its own payout address, so
+    the block a given rig is hashing on already pays that rig if it lands:
+  </p>
+  <div class="bytes">
+    <div class="f miner"><b>output 0 — the finder</b><span>subsidy + fees, minus <code>fee_bps</code></span></div>
+    <div class="f pool"><b>output 1 — <code>operator_address</code></b><span><code>fee_bps</code> of the reward · default 1%</span></div>
+    <div class="f"><b>output 2 — witness commitment</b><span>when segwit txs are present</span></div>
+  </div>
+  <p>
+    With <code>fee_bps = 0</code> the fee output disappears entirely and the
+    coinbase is a single payout to the miner. The same happens automatically when
+    the computed fee would land below the relay dust threshold (~546 sats): the
+    operator output is dropped rather than made unspendable, and the miner takes
+    the full reward.
+  </p>
+
+  <h3>What you get, precisely</h3>
+  <ul>
+    <li>Find a block → your address receives ~99% of subsidy + fees, on-chain, in that block, confirmed the moment the block is.</li>
+    <li>Don't find a block → nothing. Not a smaller amount; nothing. No other miner on the pool earns at that height either.</li>
+    <li>No inter-miner sharing, no difficulty-weighted accounting, no balance, no withdrawal, no minimum, no pool custody at any point.</li>
+  </ul>
+  <p>
+    The <code>shares</code> and <code>workers</code> tables still fill up. They
+    exist so the dashboard can show a leaderboard, a per-rig drilldown, and the
+    pool's block history — and so that the data model is already the one
+    pps-classic needs. A share here is evidence of work, not a claim.
+  </p>
+
+  <h3>Username</h3>
+  <pre><code>&lt;bitcoin_address&gt;[.&lt;rig_label&gt;]
+
+bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.basement-rig
+bcrt1q….test.alice                            # regtest</code></pre>
+  <p>
+    The address is required and must be valid bech32 (P2WPKH) or base58check
+    (P2PKH / P2SH) — it is decoded at authorize time, and a typo is rejected
+    immediately rather than discovered when a block is found and paid to
+    nowhere. The optional <code>rig_label</code> is alphanumeric plus
+    <code>_</code> and <code>-</code>.
+  </p>
+</section>
+
+<!-- ============================================================= 8. pps ==== -->
+<section id="pps">
+  <h2>pps-classic mode</h2>
+  <p class="section-sub">
+    <code>pool_mode = pps-classic</code>. Every accepted share earns a fixed
+    amount whether or not anyone finds a block. The pool takes the variance; the
+    miner gets a smooth income stream paid out over Thunder.
+  </p>
+
+  <h3>The value flow, end to end</h3>
+  <ol class="steps">
+    <li>
+      <span class="who">on-chain</span>
+      <h4>The coinbase pays the pool</h4>
+      <p>
+        Ordinary output to <code>pool_btc_address</code> for the full
+        net-of-operator-fee reward, plus the operator fee output. No drivechain
+        magic — the pool briefly custodies BTC, which is the tradeoff that makes
+        the rest work at all.
+      </p>
+    </li>
+    <li>
+      <span class="who">per share, automatic</span>
+      <h4>Each accepted share credits <code>pps_credits</code></h4>
+      <p>
+        <code>accrued_sats += floor(difficulty × rate)</code>, written by the C
+        proxy and by nothing else. Both the credit and the rate that produced it
+        are stamped onto the share's own row.
+      </p>
+    </li>
+    <li>
+      <span class="who">operator, manual</span>
+      <h4>BTC is deposited into the Thunder reserve</h4>
+      <p>
+        From the admin dashboard: a real
+        <code>CreateDepositTransaction</code> through the enforcer's wallet,
+        spending accumulated pool UTXOs into <code>OP_DRIVECHAIN</code> +
+        <code>OP_RETURN</code>. This does move the Ctip. Each one is recorded in
+        the <code>deposits</code> table with the txid and the Ctip sequence
+        before and after.
+      </p>
+    </li>
+    <li>
+      <span class="who">payout worker, daily</span>
+      <h4>The reserve is drained to miners</h4>
+      <p>
+        Everyone whose <code>accrued − paid</code> clears
+        <code>PAYOUT_MIN_SATS</code> is paid in a single batched Thunder
+        transaction, once every 24 hours. <a href="#payouts">Section 10</a> is
+        the mechanism.
+      </p>
+    </li>
+  </ol>
+
+  <h3>The rate is derived, not configured</h3>
+  <p>
+    The obvious way to run PPS is to pick a sats-per-difficulty number and hold
+    it. simplepool deliberately doesn't: a fixed rate goes stale the moment
+    difficulty moves, and can quietly invert into paying miners more than each
+    share is worth. Instead the rate is recomputed from every block template:
+  </p>
+  <pre><code>gross = coinbasevalue / network_difficulty     # fair value of one diff-1 share
+rate  = gross × (1 − fee_bps / 10000)         # what the pool actually pays
+
+credit_per_share = floor(difficulty × rate)   # truncated to whole sats</code></pre>
+  <p>
+    So the rate tracks both block value and difficulty automatically, and
+    <code>fee_bps</code> is the only fee knob in the system. Every rate the pool
+    publishes is appended to <code>rate_history</code> together with the template
+    inputs it came from, which is what makes <a href="#audit">check 2</a>
+    possible.
+  </p>
+
+  <div class="warnbox">
+    <span class="label">Do not set <code>pps_sats_per_diff</code></span>
+    <p>
+      It exists only as an escape hatch. A value there is used verbatim and is
+      treated as <em>already net of fee</em> — so it silently bypasses
+      <code>fee_bps</code> — and it cannot track difficulty. The proxy logs the
+      fee your pinned value actually implies and warns when that disagrees with
+      <code>fee_bps</code> by more than 25 bps. Leave it commented out.
+    </p>
+  </div>
+
+  <h3>Username</h3>
+  <pre><code>&lt;thunder_base58_address&gt;[.&lt;rig_label&gt;]
+
+JPbJrEKEaA69dAADY2qfW7dfyYQ
+JPbJrEKEaA69dAADY2qfW7dfyYQ.shed-01</code></pre>
+  <div class="warnbox">
+    <span class="label">Bare base58 only</span>
+    <p>
+      The deposit-format wrapper <code>s9_&lt;base58&gt;_&lt;hex6&gt;</code> —
+      what <code>format-deposit-address</code> hands you — is
+      <strong>rejected at authorize time</strong>. Thunder's own OP_RETURN parser
+      does not recognise it at the byte level, so a miner who accrued a balance
+      against it would have accrued something unpayable. Failing at connect is
+      the kind alternative.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ 9. fees ==== -->
+<section id="fees">
+  <h2>Where the fee lands</h2>
+  <p class="section-sub">
+    <code>fee_bps</code> is one number applied in up to two places, and whether
+    that is one deduction or two depends entirely on your addresses.
+  </p>
+
+  <div class="grid-2">
+    <div class="card mode-card solo">
+      <h3 style="margin-top:.25rem">In solo</h3>
+      <p style="margin-bottom:0">
+        One place only: the coinbase splits <code>fee_bps</code> to
+        <code>operator_address</code> and the rest to the finder. 100 bps = 1%,
+        capped at 1000 bps = 10%.
+      </p>
+    </div>
+    <div class="card mode-card pps">
+      <h3 style="margin-top:.25rem">In pps-classic</h3>
+      <p style="margin-bottom:0">
+        Two places: the coinbase splits <code>fee_bps</code> between
+        <code>operator_address</code> and <code>pool_btc_address</code>,
+        <em>and</em> the PPS rate is reduced by <code>fee_bps</code> before
+        anyone is credited.
+      </p>
+    </div>
+  </div>
+
+  <p>Which makes the choice of addresses a real economic decision:</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Arrangement</th><th>Effect</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>operator_address</code> == <code>pool_btc_address</code></td>
+          <td>the coinbase split is a no-op — the pool receives the whole block — and the fee is collected once, via the rate</td>
+          <td>the pool runs with a <code>fee_bps</code> margin over its expected payout. That margin is the buffer that absorbs bad luck.</td>
+        </tr>
+        <tr>
+          <td>they differ</td>
+          <td>the operator takes the cut on-chain, per block, before the pool entity sees it</td>
+          <td>the pool entity runs at <strong>break-even in expectation with no buffer</strong>, while still carrying full PPS variance. A bad run becomes a shortfall.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    Both are coherent; neither is a bug. Pick deliberately, and if you pick the
+    second one, know that you have separated who collects the fee from who
+    carries the risk.
+  </p>
+</section>
+
+<!-- ========================================================= 10. payouts === -->
+<section id="payouts">
+  <h2>Payouts over Thunder</h2>
+  <p class="section-sub">
+    pps-classic only. The design goal is narrow and unglamorous:
+    <strong>never pay twice, and never claim to have paid when you haven't.</strong>
+  </p>
+
+  <h3>Once a day, in one transaction</h3>
+  <p>
+    Payouts run as a <strong>daily batch</strong>. Once every 24 hours, everyone
+    whose <code>accrued − paid</code> clears <code>PAYOUT_MIN_SATS</code>
+    (10 000 sats by default) goes out together in a <em>single</em> Thunder
+    transaction.
+  </p>
+  <p>
+    Batching is not an optimisation, it is a requirement. Thunder only advances
+    when a mainchain block commits to it, and its wallet cannot spend the change
+    of an unconfirmed transaction — so paying N miners individually would cost N
+    sidechain blocks, and past a handful of miners the queue would drain slower
+    than it fills. The cost of batching is failure isolation: one bad address
+    fails the whole batch. That is an acceptable trade here, because every
+    recipient is an address the proxy already validated at authorize time, and a
+    failed batch credits nobody and strands nobody — the next run simply retries.
+  </p>
+
+  <h3>Three clocks, not one</h3>
+  <p>
+    The daily cadence governs when a payout <em>starts</em>. It deliberately does
+    not govern what happens to a batch already in flight, because two of the
+    states a run can end in are ruined by a long wait:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>After a run that…</th><th>Next tick</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>did nothing, or settled cleanly</td><td><code>PAYOUT_INTERVAL_MS</code> — 24 h</td>
+            <td>the ordinary cadence</td></tr>
+        <tr><td>broadcast a batch, or is still waiting on one</td><td><code>PAYOUT_SETTLE_INTERVAL_MS</code> — 30 s</td>
+            <td>nobody in the batch is credited until a tick sees it in a Thunder block, and the stall-recovery nudge only fires from a tick</td></tr>
+        <tr><td>failed to broadcast, or found the reserve short</td><td><code>PAYOUT_RETRY_INTERVAL_MS</code> — 5 m</td>
+            <td>nothing was sent and nobody was credited, so the run did not happen — it is retried, not skipped to tomorrow</td></tr>
+        <tr><td>could not determine a settlement</td><td>5 m, and loudly</td>
+            <td>terminal until a human reconciles it</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    To pay out early, the admin dashboard has a <strong>Trigger payout now</strong>
+    button. Restarting the worker also runs one immediately.
+  </p>
+
+  <h3><code>paid</code> means mined, not sent</h3>
+  <p>
+    <code>pps_credits.paid_sats</code> moves only when a transaction has actually
+    been observed in a block. Crediting at broadcast was tried and abandoned: a
+    transaction sitting in a mempool has discharged no debt, so counting it as
+    paid makes <code>accrued − paid</code> understate what the pool really owes —
+    measured at 265 BTC for over four hours on a test network — and leaves no way
+    back if the transaction never lands.
+  </p>
+  <p>
+    Telling "confirmed" from "gone" is the hard part, because Thunder offers no
+    single durable answer. Two sources are consulted and only <em>positive</em>
+    evidence from either is accepted: <code>get_transaction</code> reporting a
+    block hash (authoritative but transient — it reads back as
+    <code>null</code> once the chain moves past it), and the wallet UTXO set
+    containing an outpoint bearing our txid (durable, because Thunder only
+    admits confirmed UTXOs). Absence is never read as confirmation, and never as
+    eviction either: "the node forgot it" and "it confirmed a while ago" look
+    identical from outside, and guessing wrong in one direction pays twice. So
+    unknown stays unknown, payouts halt, and a human is asked.
+  </p>
+
+  <h3>The at-most-once protocol</h3>
+  <ol class="steps">
+    <li>
+      <span class="who">write-ahead</span>
+      <h4><code>INSERT INTO payouts_in_flight</code></h4>
+      <p>One row per worker in the batch, <code>txid = ''</code>. From this moment
+         <code>listDue()</code> skips those workers, so nothing can queue them twice.</p>
+    </li>
+    <li>
+      <span class="who">network</span>
+      <h4>Broadcast the batch</h4>
+      <p>One Thunder transaction for everyone. On failure the rows are removed,
+         <code>paid_sats</code> is untouched, and the next run tries again.</p>
+    </li>
+    <li>
+      <span class="who">local</span>
+      <h4>Stamp the txid — and stop</h4>
+      <p>The rows stay in flight. Nobody is credited here. A broadcast is not a
+         settlement.</p>
+    </li>
+    <li>
+      <span class="who">a later tick</span>
+      <h4>Confirmed → one atomic transaction</h4>
+      <p><code>paid_sats +=</code> for every worker in the batch and the in-flight
+         rows are deleted, together, in a single SQLite transaction. It commits
+         whole or not at all — there is no partial credit across a batch.</p>
+    </li>
+  </ol>
+
+  <p>
+    The one genuinely ambiguous state is a crash between steps 1 and 2: a
+    broadcast that happened is indistinguishable from one that did not. Those
+    rows are reported by <code>listStuck()</code> at every start and left for an
+    operator to resolve, because the two possibilities demand opposite actions
+    and nothing on the machine can tell them apart.
+  </p>
+</section>
+
+<!-- ============================================================ 11. audit == -->
+<section id="audit">
+  <h2>Auditing every number</h2>
+  <p class="section-sub">
+    The point of the data model. These checks run against a copy of
+    <code>shares.db</code> and consult nothing live — no API, no dashboard, no
+    trust in the operator.
+  </p>
+
+  <h3>What is written down per share</h3>
+  <p>
+    Each accepted share row carries the difficulty it was measured at, the rate
+    in force when it was accepted (<code>rate_used</code>), and the sats it was
+    credited (<code>credited_sats</code>). Storing the multiplicand alongside the
+    product is the whole trick: the credit can be re-derived years later without
+    knowing what the rate happened to be at the time, and without asking the
+    pool.
+  </p>
+
+  <h3>Four queries</h3>
+  <pre><code>-- 1. Arithmetic. Every credited share must re-derive from the pair stored
+--    on its own row. Nothing current is consulted.
+SELECT COUNT(*) FROM shares
+ WHERE rate_used > 0
+   AND credited_sats &lt;&gt; CAST(difficulty * rate_used AS INTEGER);
+
+-- 2. Provenance. Every rate the pool published must follow from the template
+--    inputs recorded beside it. Catches a rate applied consistently but
+--    derived wrongly — which (1) cannot see.
+SELECT COUNT(*) FROM rate_history
+ WHERE ABS(rate_sats_per_diff
+       - (block_value_sats * 1.0 / network_difficulty)
+         * (1 - fee_bps / 10000.0)) &gt; 1e-9;
+
+-- 3. Linkage. No share may be credited at a rate the pool never published.
+SELECT COUNT(*) FROM shares s
+ WHERE s.rate_used > 0
+   AND s.ts &gt;= (SELECT MIN(ts) FROM rate_history)
+   AND NOT EXISTS (SELECT 1 FROM rate_history r
+                    WHERE r.rate_sats_per_diff = s.rate_used);
+
+-- 4. Solvency. What the pool mined must cover what it owes.
+--    CONFIRMED ONLY: a blocks_found row is a *candidate* until the chain
+--    says otherwise, and a refused or reorged one pays nothing.
+SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
+          FROM blocks_found WHERE status = 'confirmed')
+     - (SELECT COALESCE(SUM(credited_sats),0) FROM shares) AS margin_sats;</code></pre>
+
+  <p>
+    The first three must return <strong>0</strong>. Query 4 should be positive,
+    and close to <code>Σ difficulty × gross × fee_bps/10000</code> once luck is
+    accounted for — a negative result means the pool cannot pay out of what it
+    has earned, which is the number that actually matters.
+  </p>
+  <p>
+    Exact equality in check 1 is the right test rather than a tolerance: the
+    proxy is built without <code>-ffast-math</code>, so SQLite reproduces the
+    same IEEE-754 multiply and truncation bit for bit. Shares accepted before
+    <code>rate_used</code> existed carry 0 and are excluded from checks 1 and 3 —
+    their <code>credited_sats</code> is still authoritative, there is simply no
+    stored multiplicand to check it against, and the audit page reports them as
+    <em>unverifiable</em> rather than as failures.
+  </p>
+
+  <h3>Luck, quantified</h3>
+  <pre><code>SELECT ROUND((SELECT SUM(difficulty) FROM shares)
+             / (SELECT network_difficulty FROM pool_meta)) AS expected_blocks,
+       (SELECT COUNT(*) FROM blocks_found
+         WHERE status = 'confirmed')                       AS actual_blocks;</code></pre>
+  <p>
+    A wide gap on a chain the pool is genuinely hashing is worth chasing before
+    anything else — <code>SELECT status, COUNT(*) FROM blocks_found GROUP BY
+    status</code> says how the candidates settled. <code>rejected</code> means
+    the node refused the submission (its reason is in <code>submit_error</code>),
+    <code>orphaned</code> means it was accepted and then reorged out, and
+    <code>pending</code> means nothing has been able to verify it yet — a normal
+    resting state against a backend that serves only
+    <code>getblocktemplate</code> and <code>submitblock</code>. None of the three
+    earns anything.
+  </p>
+
+  <h3>Block-withholding audit</h3>
+  <p>
+    A miner can hash honestly, submit every share, and quietly discard the one
+    submission that happens to be a block — collecting PPS credit while
+    contributing nothing. <code>payout/audit.js</code> is a standalone read-only
+    CLI that looks for it: over a window, each worker's expected block count is
+    <code>pool_blocks × (worker_diff / pool_diff)</code>, and
+    <code>z = (expected − actual) / √expected</code>. It flags a worker when
+    <code>expected ≥ 5</code> and <code>z ≥ 3</code> — about a 1-in-740 false
+    positive rate under honest Poisson sampling. No schema changes; safe to run
+    while the proxy is writing.
+  </p>
+
+  <div class="note">
+    <span class="label">Why it can be run by anyone</span>
+    <p>
+      SQLite runs in WAL mode with exactly one writer. Take a snapshot with
+      <code>sqlite3 shares.db ".backup snap.db"</code> — atomic, and safe while
+      the pool is writing — and every query above works on the copy. A plain
+      <code>cp</code> of a WAL database is <em>not</em> safe; use
+      <code>.backup</code>.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================= 12. data == -->
+<section id="data">
+  <h2>The data model</h2>
+  <p class="section-sub">
+    One SQLite file, <code>data/shares.db</code>, in WAL mode. The proxy is the
+    only writer; the dashboard and the audit tools only read.
+  </p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Table</th><th>Written by</th><th>What it holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>workers</code></td><td>proxy</td>
+            <td>one row per <code>address[.rig]</code> seen, with the payout address kept separately so the dashboard can roll up across rigs</td></tr>
+        <tr><td><code>shares</code></td><td>proxy</td>
+            <td>one row per accepted share: worker, timestamp, difficulty, hash, <code>is_block</code>, and in pps-classic <code>credited_sats</code> + <code>rate_used</code></td></tr>
+        <tr><td><code>rejects</code></td><td>proxy</td>
+            <td>one row per rejected submission with the reason — bad address, stale job, low difficulty</td></tr>
+        <tr><td><code>blocks_found</code></td><td>proxy</td>
+            <td>height, hash, finder, finder address, <code>reward_sats</code>, <code>fee_sats</code></td></tr>
+        <tr><td><code>rate_history</code></td><td>proxy</td>
+            <td>every PPS rate published, with the template inputs it was derived from — the basis of audit check 2</td></tr>
+        <tr><td><code>pool_meta</code></td><td>proxy</td>
+            <td>the effective rate and network difficulty. The dashboard reads the rate from here rather than from its own config, so an audit can never disagree with the process that did the crediting</td></tr>
+        <tr><td><code>templates</code></td><td>proxy</td>
+            <td>one row per materially distinct block template, pruned by <code>templates_retention_days</code></td></tr>
+        <tr><td><code>node_status</code></td><td>proxy</td>
+            <td>backend height and tip, for the dashboard's node card</td></tr>
+        <tr><td><code>pps_credits</code></td><td>proxy <em>and</em> payout worker</td>
+            <td><code>accrued_sats</code> (proxy only, monotonic) and <code>paid_sats</code> (payout worker only, monotonic). Owed = the difference</td></tr>
+        <tr><td><code>payouts_in_flight</code></td><td>payout worker</td>
+            <td>the write-ahead log that makes payouts at-most-once</td></tr>
+        <tr><td><code>payouts</code>, <code>tx_attempts</code></td><td>payout worker</td>
+            <td>settled payouts, and every transaction attempt with its stage and raw bytes for forensics</td></tr>
+        <tr><td><code>deposits</code></td><td>dashboard</td>
+            <td>one row per operator-triggered BTC → Thunder deposit, with Ctip sequence before and after</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <span class="label">Invariants held by code, not by constraints</span>
+    <p>
+      <code>accrued_sats</code> and <code>paid_sats</code> must both only ever
+      increase, and each has exactly one writer. A decrease in either means
+      somebody edited the database by hand — which is worth knowing, and is why
+      it is stated here rather than enforced by a trigger that would hide it.
+    </p>
+  </div>
+</section>
+
+<!-- ========================================================== 13. connect == -->
+<section id="connect">
+  <h2>Connect a miner</h2>
+  <p class="section-sub">
+    There is nothing to sign up for. Point the ASIC at the host and put your
+    address in the username field.
+  </p>
+
+  <div class="grid-2">
+    <div class="card mode-card solo">
+      <h3 style="margin-top:.25rem">Solo</h3>
+      <pre style="margin-bottom:0"><code>URL       stratum+tcp://pool.example.com:3334
+Worker    bc1qw508d6…kv8f3t4.rig-01
+Password  (anything — it is discarded)</code></pre>
+    </div>
+    <div class="card mode-card pps">
+      <h3 style="margin-top:.25rem">pps-classic</h3>
+      <pre style="margin-bottom:0"><code>URL       stratum+tcp://pool.example.com:3334
+Worker    JPbJrEKEaA69dAADY2qfW7dfyYQ.rig-01
+Password  (anything — it is discarded)</code></pre>
+    </div>
+  </div>
+
+  <p>
+    Stratum is raw TCP, not HTTP, so it does not pass through the pool's nginx.
+    Miners connect straight to <code>host:3334</code>; only the dashboard is
+    behind the reverse proxy. If you need TLS on stratum itself, that is an
+    nginx <code>stream {}</code> block or <code>stunnel</code>, not something the
+    pool does for you.
+  </p>
+
+  <h3>If a connection is refused</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+      <tbody>
+        <tr><td>Authorize fails immediately</td>
+            <td>The username isn't a valid address <em>for this mode</em> — a BTC address on a pps-classic pool, a Thunder address on a solo pool, or the <code>s9_…_…</code> deposit wrapper. Check the <code>rejects</code> table for the reason.</td></tr>
+        <tr><td>Shares rejected as <code>low difficulty</code></td>
+            <td>Normal in small numbers. Persistent means the rig is ignoring <code>mining.set_difficulty</code>.</td></tr>
+        <tr><td>Shares rejected as <code>stale share</code></td>
+            <td>The job expired — a new tip arrived. Expected around block boundaries.</td></tr>
+        <tr><td>Connects, no work</td>
+            <td>The pool has no template: its <code>bitcoind</code> is unreachable or still syncing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- =========================================================== 14. config == -->
+<section id="config">
+  <h2>Configuration</h2>
+  <p class="section-sub">
+    One <code>key = value</code> file, <code>proxy.conf</code>. The keys that
+    change behaviour rather than tuning it:
+  </p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>pool_mode</code></td><td><code>solo</code></td>
+            <td><code>solo</code> or <code>pps-classic</code>. Decides the coinbase shape and what a username must be.</td></tr>
+        <tr><td><code>operator_address</code></td><td>—</td>
+            <td><strong>Required.</strong> Receives the <code>fee_bps</code> cut. The proxy refuses to start without it.</td></tr>
+        <tr><td><code>fee_bps</code></td><td><code>100</code></td>
+            <td>Fee in basis points; 100 = 1%, hard cap 1000 = 10%. <code>0</code> drops the fee output entirely.</td></tr>
+        <tr><td><code>pool_btc_address</code></td><td>—</td>
+            <td>pps-classic only, and required there: the coinbase pays here.</td></tr>
+        <tr><td><code>pps_sats_per_diff</code></td><td><em>unset</em></td>
+            <td>Leave it unset. See the warning in <a href="#pps">section 8</a>.</td></tr>
+        <tr><td><code>listen_addr</code> / <code>listen_port</code></td><td><code>0.0.0.0</code> / <code>3334</code></td>
+            <td>Where stratum listens.</td></tr>
+        <tr><td><code>bitcoind_url</code></td><td>—</td>
+            <td>JSON-RPC endpoint for <code>getblocktemplate</code> / <code>submitblock</code>.</td></tr>
+        <tr><td><code>bitcoind_user</code> / <code>bitcoind_pass</code></td><td>—</td>
+            <td>Optional — omit <em>both</em> for an unauthenticated backend and the call goes out with no auth header. Cookie auth is not supported.</td></tr>
+        <tr><td><code>bitcoind_poll_interval_ms</code></td><td><code>30000</code></td>
+            <td>Template refresh. On a drivechain pool this is also the worst-case delay before a sidechain's BMM request can reach a job — lower it to 5000–10000 if sidechains need to merge-mine reliably.</td></tr>
+        <tr><td><code>coinbase_tag</code></td><td><code>/simplepool/</code></td>
+            <td>Short string baked into the coinbase scriptSig.</td></tr>
+        <tr><td><code>db_path</code></td><td><code>./data/shares.db</code></td>
+            <td>The ledger.</td></tr>
+        <tr><td><code>commit_window_ms</code> / <code>commit_max_shares</code></td><td><code>100</code> / <code>100</code></td>
+            <td>Write batching — commit on whichever comes first.</td></tr>
+        <tr><td><code>templates_retention_days</code></td><td><code>30</code></td>
+            <td>How much template history the dashboard keeps. <code>0</code> keeps everything.</td></tr>
+        <tr><td><code>redis_url</code></td><td><em>empty</em></td>
+            <td>Set to mirror events onto Redis pub/sub. Empty disables it.</td></tr>
+        <tr><td><code>log_level</code></td><td><code>info</code></td>
+            <td><code>debug</code> logs every RPC request and raw response.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>
+    The payout worker is configured entirely by environment variables, not by
+    this file — <code>PAYOUT_INTERVAL_MS</code>,
+    <code>PAYOUT_SETTLE_INTERVAL_MS</code>, <code>PAYOUT_MIN_SATS</code>,
+    <code>THUNDER_FROM_ADDRESS</code> and friends. The Thunder reserve address is
+    deliberately <em>not</em> a proxy key: the coinbase never touches Thunder, so
+    only the dashboard and the payout worker have any business knowing it.
+  </p>
+</section>
+
+<!-- ========================================================== 15. operate == -->
+<section id="operate">
+  <h2>Running one</h2>
+  <p class="section-sub">
+    One line on a fresh Ubuntu or Debian server, then a single command for
+    everything after.
+  </p>
+
+  <pre><code>curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scripts/install.sh | sudo bash</code></pre>
+
+  <p>
+    The installer downloads the published build for the machine's architecture,
+    verifies it against the release <code>SHA256SUMS</code>, then asks for the
+    pool mode, your bitcoind RPC, your addresses, a dashboard domain and admin
+    password, and whether to set up nginx, TLS and the firewall. It writes
+    <code>proxy.conf</code>, loads the schema, installs three systemd units, and
+    tells you what miners should connect to. Every answer is saved, so re-running
+    it is how you change your mind about any of them. Pass
+    <code>--from-source</code> to clone and compile instead.
+  </p>
+
+  <pre><code>simplepoolctl status            # services, ports, versions, ledger totals
+simplepoolctl doctor            # binary runs? bitcoind answers? DB writable?
+simplepoolctl logs payout -f    # one service, or all of them
+sudo simplepoolctl restart proxy
+sudo simplepoolctl upgrade      # next release, then restart
+sudo simplepoolctl uninstall    # --purge also deletes the ledger</code></pre>
+
+  <h3>What runs</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Unit</th><th>Mode</th><th>Job</th></tr></thead>
+      <tbody>
+        <tr><td><code>simplepool.service</code></td><td>both</td><td>the stratum proxy — the only thing that is strictly required</td></tr>
+        <tr><td><code>simplepool-dashboard.service</code></td><td>both</td><td>read-only public stats on :8081, plus <code>/admin</code> behind basic auth</td></tr>
+        <tr><td><code>simplepool-payout.service</code></td><td>pps-classic</td><td>the daily Thunder payout batch</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Which commit is running</h3>
+  <p>
+    The build commit is compiled into the binary, so <code>simplepool
+    --version</code> reports what is <em>actually executing</em> rather than what
+    the source tree next to it currently says. A build from a tree with
+    uncommitted changes says so on its own line, because in that case the commit
+    printed above it does not describe the binary. The dashboard's
+    <code>/api/versions</code> answers the same question for the whole stack —
+    simplepool, the enforcer, Thunder, bitcoind — over plain HTTP with no auth.
+  </p>
+</section>
+
+<!-- =========================================================== 16. limits == -->
+<section id="limits">
+  <h2>What it can't do</h2>
+  <p class="section-sub">
+    Stated plainly, because a pool that only advertises its guarantees is
+    telling you half the story.
+  </p>
+
+  <ul>
+    <li>
+      <strong>It cannot prove a miner hashed anything.</strong> It can only check
+      the work it was shown. A rig that finds a block and drops it on the floor
+      looks identical to an unlucky one on any individual sample — which is why
+      the <a href="#audit">withholding audit</a> is statistical, and why it needs
+      an expectation of at least five blocks before it will say anything.
+    </li>
+    <li>
+      <strong>In pps-classic the pool custodies BTC.</strong> Between mining a
+      block and depositing into Thunder, the reward sits in a pool-controlled
+      wallet. The design that avoided this — a drivechain deposit in the coinbase
+      — does not work at the consensus level. This is a real trust assumption and
+      it is not engineered away.
+    </li>
+    <li>
+      <strong>Deposits are manual.</strong> An operator presses a button per
+      deposit. If nobody does, the reserve runs dry and payouts skip with a
+      logged warning until someone notices.
+    </li>
+    <li>
+      <strong>An ambiguous crash needs a human.</strong> A crash between writing
+      the in-flight rows and broadcasting leaves a state where "it was sent" and
+      "it wasn't" are indistinguishable. The worker refuses to guess, halts, and
+      says so.
+    </li>
+    <li>
+      <strong>The Thunder payout fee is a flat 100 sats</strong> per batch for
+      now, pending observable fee dynamics on that chain.
+    </li>
+    <li>
+      <strong>Solo mode is solo.</strong> If your rig doesn't find the block, you
+      earn nothing for that height. That is the design, not a shortfall.
+    </li>
+  </ul>
+</section>
+
+</main>
+</div><!-- /.layout -->
+</div><!-- /.wrap -->
+
+<footer>
+  <div class="wrap">
+    <p>
+      <strong>simplepool</strong> — a solo and PPS Bitcoin mining pool in C11, by
+      Roberto Santacroce. MIT licensed.
+    </p>
+    <p>
+      This page is a single self-contained HTML file with no scripts and no
+      external assets; save it, serve it, or print it. The authoritative
+      documents it summarises live in the repository:
+      <code>README.md</code> (overview),
+      <code>INSTALL.md</code> (installation),
+      <code>NONCE_AND_SHARES.md</code> (share and payout math),
+      <code>CLASSIC_PAYOUTS.md</code> (the pps-classic design and the
+      coinbase-deposit finding),
+      <code>OPERATOR_GUIDE.md</code> (day-to-day operations) and
+      <code>VERIFY.md</code> (the verification checklist).
+      Where this page and those disagree, they are right.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

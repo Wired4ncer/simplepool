@@ -44,10 +44,80 @@ int store_record_reject(store_t *s, const char *worker_name,
 /* Record a block found. Thread-safe.
  * finder_address may be NULL (legacy callers); reward_sats/fee_sats may be
  * 0 to skip recording. */
+/* Lifecycle of a block candidate. A share that meets network difficulty is
+ * only ever a *candidate*: submitblock can refuse it, and even an accepted
+ * one can be reorged out. Only CONFIRMED means the pool mined a block that
+ * is in the chain, and only CONFIRMED may be counted as pool revenue —
+ * summing rewards across every row is what silently disabled the solvency
+ * check. PENDING is not a transient: against a backend that answers only
+ * getblocktemplate/submitblock there may be nothing that can verify a block
+ * for some time, and "not yet verified" must count as nothing. */
+#define STORE_BLOCK_PENDING    0
+#define STORE_BLOCK_CONFIRMED  1
+#define STORE_BLOCK_ORPHANED   2
+#define STORE_BLOCK_REJECTED   3
+
+/* The text written to blocks_found.status. Never NULL. */
+const char *store_block_status_text(int status);
+
+/* A candidate still in play: not yet resolved, or confirmed but not yet deep
+ * enough to be final. */
+typedef struct {
+    char hash[80];
+    int  height;
+} store_block_candidate_t;
+
+/* Candidates worth re-checking against the node, most recent first, at most
+ * `cap` of them. Rows already `rejected` or `orphaned` are settled, and a
+ * `confirmed` row past `final_depth` confirmations is treated as final and
+ * stops being re-checked. Returns how many were written, or negative on
+ * error. Rows older than the node path reaches are handled in bulk by
+ * store_reconcile_blocks_from_templates(). */
+int store_list_unresolved_blocks(store_t *s, int tip_height, int final_depth,
+                                 store_block_candidate_t *out, size_t cap);
+
+/* Set one candidate's verdict. `checked_via` is 'node' or 'tips' — which
+ * source answered, the same distinction pool_meta.network_source draws. */
+int store_set_block_status(store_t *s, const char *hash, int status,
+                           int confirmations, const char *checked_via);
+
+/* Classify candidates from the templates table alone — no RPC.
+ *
+ * Every getblocktemplate poll is an observation of the node's tip: a template
+ * building height H+1 with prev_hash X says the tip at H was X. `templates`
+ * keeps one row per materially distinct template, so it is a historical chain
+ * of tips this pool actually saw, and comparing a candidate against the most
+ * recent observation at its height+1 says whether it is still the chain's.
+ *
+ * This is the only path available against a backend that serves nothing but
+ * getblocktemplate and submitblock, and it is also how a table of pre-existing
+ * rows gets classified in bulk. A candidate whose height+1 was never observed
+ * stays pending — which counts as nothing — rather than being guessed at.
+ *
+ * Writes the resulting totals (not deltas) to the out params when non-NULL. */
+int store_reconcile_blocks_from_templates(store_t *s, int tip_height,
+                                          int *confirmed, int *orphaned,
+                                          int *pending);
+
+/* Collapse rows that share a block hash, then create the UNIQUE index on it.
+ *
+ * Deliberately not a migration: CREATE UNIQUE INDEX fails outright on a table
+ * that already holds duplicates, and the migration runner only tolerates
+ * "duplicate column" — so as a migration it would silently never exist on the
+ * databases that needed it. Duplicates arise because the stratum dedupe guard
+ * is an in-memory ring that empties on restart, so the same solution can be
+ * recorded twice. The surviving row keeps the earliest sighting but inherits
+ * any resolved status its duplicates reached. */
+int store_finalize_block_hash_index(store_t *s);
+
+/* `status` is one of STORE_BLOCK_*; `submit_error` is the reason string from
+ * submitblock and may be NULL for anything but a rejected candidate. A
+ * height <= 0 is refused outright. */
 int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        const char *hash, const char *finder_name,
                        const char *finder_address,
-                       int64_t reward_sats, int64_t fee_sats);
+                       int64_t reward_sats, int64_t fee_sats,
+                       int status, const char *submit_error);
 
 /* Record an accepted share with the miner's payout_address so the worker
  * row can be tagged. payout_address may be NULL (legacy/tests). The
@@ -84,6 +154,24 @@ int store_record_credit(store_t *s, const char *worker_name,
  * rate_source is "derived" or "override". gross is fair value before the
  * fee; rate is net of it. effective_fee_bps is what the pair actually
  * implies, which under an override need not equal fee_bps. */
+/* The pool's identity: which chain it builds coinbases for, the tag it
+ * stamps into them, and the addresses the money goes to. Upserts the same
+ * id=1 row as store_record_pool_meta() but touches only these columns, so
+ * call order between the two does not matter.
+ *
+ * Written once at startup, because none of it changes while the process
+ * runs — and it is written to the DB at all because the dashboard must not
+ * hold its own copy of the proxy's config. network_source is "node" when
+ * getblockchaininfo answered and "inferred" when the network was read off
+ * the operator address instead. Pass a NULL/empty pool_btc_address in solo
+ * mode; it is stored as NULL so "not applicable" reads differently from
+ * "configured blank". */
+int store_record_pool_identity(store_t *s, const char *network,
+                               const char *network_source,
+                               const char *coinbase_tag,
+                               const char *operator_address,
+                               const char *pool_btc_address);
+
 int store_record_pool_meta(store_t *s, const char *pool_mode, int fee_bps,
                            const char *rate_source,
                            double rate_sats_per_diff,

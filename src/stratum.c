@@ -8,6 +8,11 @@
  * "recent jobs" kept alive ~60s for late submits. Connection threads take
  * read locks for notify/submit lookups.
  *
+ * Jobs are reference counted. Anything that reads a job only while holding
+ * the lock that guards its slot (send_current_notify, current_net_diff) needs
+ * nothing more; find_job hands out a counted reference because a submit
+ * outlives the lock, and the tip watcher frees jobs from under it otherwise.
+ *
  * Vardiff adjusts each connection's difficulty toward cfg.vardiff_target_spm
  * shares/minute, clamped so the share target never exceeds the network
  * target (see vardiff_maybe_retarget).
@@ -25,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -44,6 +50,9 @@
 /* Process-wide ring, so it has to cover every live connection's recent
  * submissions across every server rather than just one's. */
 #define SHARE_DEDUPE_RING 16384
+/* Matches store.c's REASON_MAX so a submitblock reason survives the trip to
+ * the DB intact rather than being truncated twice. */
+#define REASON_TEXT_MAX   128
 /* The retention ring is sized in stratum.h, because main.c's payout-plan ring
  * must be able to cover every job that is still solvable. */
 #define RECENT_JOBS    STRATUM_RECENT_JOBS
@@ -141,15 +150,19 @@ struct stratum_job {
 
     uint64_t created_ms;    /* for retention ring */
 
-    /* Reference count. find_job() hands a job to a submit handler that then
-     * works with it for a long time — coinbase render, merkle fold, and on a
-     * solve a full block assembly that walks every template transaction —
-     * while the tip watcher is free to retire and free that same job (TTL
-     * sweep or ring wrap). Borrowing the pointer under a lock and using it
-     * after unlocking was a use-after-free during block assembly, i.e. at the
-     * exact moment a block is found. Owners: the current_job slot, each
-     * recent[] slot, and every outstanding find_job() caller. */
-    atomic_uint refs;
+    /* References held. The server holds one for current_job and one for each
+     * ring slot; a submit handler holds one for as long as it is reading the
+     * job. Destroyed when the last is dropped.
+     *
+     * Without this a submit read a job the tip watcher had already freed:
+     * find_job() released its lock before returning the pointer, and
+     * retire_job() frees on every new template. On a chain where templates
+     * arrive several times a second the ring turns over in seconds, so the
+     * window was wide open — it produced blocks_found rows carrying a freed
+     * job's height and value (0, 2, 550 and rewards of 1.29M BTC on the
+     * production pool), and a garbage network_target_be can make any hash
+     * look like a solved block. */
+    _Atomic int refs;
 };
 
 static void job_destroy(stratum_job_t *j);
@@ -170,7 +183,9 @@ stratum_job_t *stratum_job_new(
 {
     stratum_job_t *j = calloc(1, sizeof(*j));
     if (!j) return NULL;
-    atomic_init(&j->refs, 1u);
+    /* Set before anything can `goto fail`: the failure path releases, and a
+     * count of 0 there would decrement past zero and leak instead of free. */
+    atomic_init(&j->refs, 1);
     snprintf(j->job_id, sizeof(j->job_id), "%s", job_id ? job_id : "");
     j->version = version;
     if (prev_hash_le) memcpy(j->prev_hash_le, prev_hash_le, 32);
@@ -214,6 +229,13 @@ fail:
     return NULL;
 }
 
+/* Take a reference. Callers must hold whichever lock protects the pointer
+ * they are reading it from, so the job cannot be destroyed between the load
+ * and the increment. */
+static void stratum_job_retain(stratum_job_t *j) {
+    if (j) atomic_fetch_add_explicit(&j->refs, 1, memory_order_relaxed);
+}
+
 /* Actually deallocate. Only stratum_job_free(), at the last reference. */
 static void job_destroy(stratum_job_t *j) {
     if (!j) return;
@@ -234,15 +256,21 @@ static void job_destroy(stratum_job_t *j) {
 /* Take one reference. See the header: set_job consumes one, so publishing the
  * same job to a second server needs one taken first. */
 stratum_job_t *stratum_job_ref(stratum_job_t *j) {
-    if (j) atomic_fetch_add(&j->refs, 1u);
+    stratum_job_retain(j);
     return j;
 }
 
 /* Drop one reference; deallocate at zero. Named "free" because that is what it
- * is to every caller outside this file — a job handed back is a job released. */
+ * is to every caller outside this file — a job handed back is a job released.
+ *
+ * acq_rel on the decrement and an acquire fence before destroying: every other
+ * holder's writes must be visible to whichever thread happens to run the
+ * destructor. Taken from upstream 440eb60. */
 void stratum_job_free(stratum_job_t *j) {
     if (!j) return;
-    if (atomic_fetch_sub(&j->refs, 1u) == 1u) job_destroy(j);
+    if (atomic_fetch_sub_explicit(&j->refs, 1, memory_order_acq_rel) != 1) return;
+    atomic_thread_fence(memory_order_acquire);
+    job_destroy(j);
 }
 
 int stratum_job_set_payouts(stratum_job_t *j,
@@ -347,9 +375,15 @@ struct stratum_conn {
 
     /* Vardiff window state — counts accepted shares since vd_window_start_ms.
      * Every cfg.vardiff_window_sec the rate is compared to vardiff_target_spm
-     * and `difficulty` is multiplied/divided to converge on the target. */
+     * and `difficulty` is multiplied/divided to converge on the target.
+     *
+     * vd_window_min_achieved is the smallest difficulty any share in the
+     * window actually achieved (HUGE_VAL until the first share lands). It
+     * detects a miner whose own local difficulty floor sits far above what
+     * we assigned it — see vardiff_maybe_retarget. */
     uint64_t vd_window_start_ms;
     uint32_t vd_window_shares;
+    double   vd_window_min_achieved;
 
     /* Difficulty this miner asked for, via the stratum password `d=<n>` or
      * mining.suggest_difficulty. 0 = none requested.
@@ -559,6 +593,19 @@ static int buf_append_json_line(char **buf, size_t *len, cJSON *obj) {
     return rc;
 }
 
+/* Is PPS accrual currently suspended? While it is, work handed to this pool
+ * earns nothing, so the pool says so rather than banking it silently. */
+static int pps_gated(const stratum_server_t *s) {
+    return s->cfg.pps_enabled && s->cfg.pps_refuse_shares_below_min &&
+           s->cfg.pps_gate &&
+           atomic_load_explicit(s->cfg.pps_gate, memory_order_relaxed) != 0;
+}
+
+#define PPS_GATED_MSG \
+    "pool is not crediting shares right now: network difficulty is below " \
+    "the minimum this pool will pay PPS at. Point your miner elsewhere " \
+    "until it retargets."
+
 /* ---- job retention ring ---- */
 
 static void retire_job(stratum_server_t *s, stratum_job_t *j) {
@@ -581,19 +628,21 @@ static void retire_job(stratum_server_t *s, stratum_job_t *j) {
     pthread_mutex_unlock(&s->recent_lock);
 }
 
-/* Find a job by id under read lock (current) or recent ring. Returned
- * pointer is borrowed — only valid while caller holds appropriate locks
- * (current_job: rdlock; recent: recent_lock). For simplicity we return
- * a reference that is safe so long as set_job hasn't replaced it; in this
- * design submit handlers complete quickly and shares for retired jobs are
- * rare. */
+/* Find a job by id in the current slot or the recent ring.
+ *
+ * Returns a COUNTED reference: the caller owns it and must
+ * stratum_job_free() it. The retain happens under the same lock that guards
+ * the slot, so the job cannot be destroyed between finding it and claiming
+ * it. Returning a borrowed pointer here — the previous behaviour — meant a
+ * submit could still be reading a job that retire_job() had freed on the tip
+ * watcher thread, which is a use-after-free in a network-facing path. */
 static stratum_job_t *find_job(stratum_server_t *s, const char *job_id) {
     if (!job_id) return NULL;
     /* current */
     pthread_rwlock_rdlock(&s->job_lock);
     stratum_job_t *cur = s->current_job;
     if (cur && strcmp(cur->job_id, job_id) == 0) {
-        atomic_fetch_add(&cur->refs, 1u);   /* before unlocking, always */
+        stratum_job_retain(cur);
         pthread_rwlock_unlock(&s->job_lock);
         return cur;
     }
@@ -603,7 +652,7 @@ static stratum_job_t *find_job(stratum_server_t *s, const char *job_id) {
     for (size_t i = 0; i < RECENT_JOBS; ++i) {
         if (s->recent[i] && strcmp(s->recent[i]->job_id, job_id) == 0) {
             stratum_job_t *r = s->recent[i];
-            atomic_fetch_add(&r->refs, 1u);
+            stratum_job_retain(r);
             pthread_mutex_unlock(&s->recent_lock);
             return r;
         }
@@ -853,6 +902,14 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
     return g > 60000 ? g : 60000;
 }
 
+/* How many shares a window needs before its minimum achieved difficulty is
+ * treated as evidence of the miner's own floor rather than small-sample
+ * noise, how far above the assigned difficulty that floor has to sit before
+ * we act, and how close under the observed floor we then aim. */
+#define VD_FLOOR_MIN_SAMPLES 5
+#define VD_FLOOR_TRIGGER     4.0
+#define VD_FLOOR_BACKOFF     0.95
+
 /* Vardiff: every cfg.vardiff_window_sec, look at how many shares the
  * connection submitted in that window and rescale its difficulty so the
  * rate converges on cfg.vardiff_target_spm shares/minute. Called from
@@ -862,6 +919,55 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
  *   ratio = observed_spm / target_spm
  *   if  ratio in [0.5, 2.0] → leave it (avoid jitter)
  *   else                    → new_diff = old_diff * ratio, clamped
+ *
+ * The rate loop alone cannot correct a miner that enforces its own local
+ * difficulty floor above the difficulty we assigned it. Below that floor the
+ * miner's submission rate does not depend on our difficulty at all — it
+ * submits whatever beats its own target — so the loop has no gradient to
+ * follow, and any share rate that happens to land inside the deadband is a
+ * fixed point. A miner floored at 256 while assigned 1 therefore sits at 1
+ * forever, and since a share is credited at the difficulty we assigned
+ * (share_diff = c->difficulty in handle_submit), the pool books 1/256th of
+ * the work it actually received: a hashrate estimate 256x low, and on a
+ * pps-classic pool a payout 256x short.
+ *
+ * So alongside the rate loop, watch the difficulty the shares actually
+ * achieve. Every share in the window achieving far more than we asked for is
+ * a direct measurement of that floor, with none of the rate loop's
+ * ambiguity, so raise the assigned difficulty to just under it.
+ *
+ * Aim just under the observed minimum — but only just, because the two ways
+ * of missing the floor are not symmetric. Land above it and the accounting
+ * stays exact: the miner keeps submitting everything that beats its own
+ * floor, the pool accepts the fraction that also beats the assigned
+ * difficulty, and crediting each of those at the assigned value books exactly
+ * the work performed. Land below it and every share is accepted but credited
+ * at less than it achieved, which is the under-crediting this whole check
+ * exists to remove, just at a smaller factor. Overshooting costs the miner
+ * rejected submissions; undershooting costs it money.
+ *
+ * So a small backoff, not a generous one. The observed minimum already sits
+ * above the floor — a share clearing floor D achieves D/u for u uniform on
+ * (0,1], so the smallest of n of them lands near D*(n+1)/n — which is what
+ * leaves the result hovering around the floor instead of well under it.
+ * Correcting that overshoot away would center the estimate and, by the
+ * asymmetry above, credit worse.
+ *
+ * VD_FLOOR_TRIGGER is what stops this from ratcheting. Assigning above the
+ * floor does raise the next window's observed minimum, but the next retarget
+ * only fires if that minimum still clears four times the assigned difficulty,
+ * which after a correct jump it does not. It is also what a well-matched
+ * miner has to clear on every share in a window to trip this by chance, which
+ * at five shares is about one window in thirty thousand — and costs it only a
+ * difficulty briefly set too high, which the rate loop then walks back down
+ * and which credits it correctly meanwhile.
+ *
+ * Note this deliberately does not count rejected submissions toward the
+ * window. A stale or unknown-job reject is not work at the assigned
+ * difficulty, and a low-difficulty reject is by definition work that missed
+ * it; feeding either into the rate would push the difficulty up on miners
+ * whose real problem is job latency.
+ *
  * Always emits a single mining.set_difficulty when diff changes. The
  * client picks it up for the next job notify; we don't force a re-notify
  * because handle_submit keeps accepting shares at the old difficulty for
@@ -875,6 +981,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     if (c->vd_window_start_ms == 0) {
         c->vd_window_start_ms = now;
         c->vd_window_shares = 0;
+        c->vd_window_min_achieved = HUGE_VAL;
         return;
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
@@ -929,6 +1036,33 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         }
         if (new_diff > old_diff * max_step) new_diff = old_diff * max_step;
         if (new_diff < old_diff / max_step) new_diff = old_diff / max_step;
+    }
+
+    /* Every share this window cleared a difficulty far above the one we
+     * assigned: the miner is filtering locally at a floor of its own. Raise
+     * to just under the floor we measured. Uncapped by the 4x step above —
+     * that cap damps an extrapolation from a share rate, whereas this is a
+     * value we watched every share in the window exceed.
+     *
+     * The comparison is against old_diff, the difficulty actually in force
+     * while these shares were mined, not against the rate loop's proposal.
+     * An accepted share always achieves at least the difficulty it was
+     * accepted under, so the window minimum is always >= old_diff; testing
+     * it against a proposal the rate loop has just cut by 4x would fire on
+     * every such cut and pin the difficulty of every miner that legitimately
+     * slowed down. */
+    int from_floor = 0;
+    if (c->vd_window_shares >= VD_FLOOR_MIN_SAMPLES &&
+        isfinite(c->vd_window_min_achieved) &&
+        c->vd_window_min_achieved > old_diff * VD_FLOOR_TRIGGER) {
+        double floor_diff = c->vd_window_min_achieved * VD_FLOOR_BACKOFF;
+        if (floor_diff > new_diff) {
+            new_diff = floor_diff;
+            from_floor = 1;
+        }
+    }
+
+    if (new_diff != old_diff) {
         if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
         if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
         /* A miner-requested difficulty is a floor: vardiff may raise this
@@ -950,16 +1084,27 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         if (net_diff > 0.0 && new_diff > net_diff) new_diff = net_diff;
     }
 
+    double window_floor = c->vd_window_min_achieved;
+
     /* Reset the window regardless of whether we changed diff. */
     c->vd_window_start_ms = now;
     c->vd_window_shares = 0;
+    c->vd_window_min_achieved = HUGE_VAL;
 
     if (new_diff != old_diff) {
         c->difficulty = new_diff;
         c->prev_difficulty = old_diff;
         c->diff_changed_ms = now;
-        LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (%.1f spm observed, %.1f target)",
-                 c->worker_name, old_diff, new_diff, observed_spm, target_spm);
+        if (from_floor) {
+            LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (miner floor: every "
+                     "share in the window cleared difficulty %.0f, %.1f spm "
+                     "observed)",
+                     c->worker_name, old_diff, new_diff, window_floor,
+                     observed_spm);
+        } else {
+            LOG_INFO("stratum: vardiff %s: %.0f -> %.0f (%.1f spm observed, %.1f target)",
+                     c->worker_name, old_diff, new_diff, observed_spm, target_spm);
+        }
         send_set_difficulty(buf, len, new_diff);
     }
 }
@@ -1270,6 +1415,17 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
         return emit_response(buf, len, id, NULL, err);
     }
+    /* Refuse before taking the address: the miner learns at connect time,
+     * which is the only point at which they can still do something about it. */
+    if (pps_gated(s)) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, worker, now_ms(),
+                             "pps accrual suspended (difficulty below floor)");
+        }
+        cJSON *err = make_error(24, PPS_GATED_MSG);
+        return emit_response(buf, len, id, NULL, err);
+    }
+
     memcpy(c->payout_address, worker, addr_len);
     c->payout_address[addr_len] = '\0';
 
@@ -1378,6 +1534,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     /* Arm vardiff window for this connection. */
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;
+    c->vd_window_min_achieved = HUGE_VAL;
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
@@ -1488,47 +1645,15 @@ oom:
 #undef APPEND
 }
 
-static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
-                         cJSON *params, char **buf, size_t *len) {
-    /* Both refusals below answer the miner with an error, so they count as
-     * rejects on ITS dashboard. Recording them keeps our reject table and the
-     * miner's own numbers describing the same events — without this a miner
-     * refused on every submit reads as simply absent here. */
-    if (!c->authorized) {
-        if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx,
-                             c->worker_name[0] ? c->worker_name
-                                               : "(unauthorized)",
-                             now_ms(), "unauthorized");
-        }
-        cJSON *err = make_error(24, "unauthorized");
-        return emit_response(buf, len, id, NULL, err);
-    }
-    if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
-        if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "bad params");
-        }
-        cJSON *err = make_error(20, "bad params");
-        return emit_response(buf, len, id, NULL, err);
-    }
-    const char *worker = cJSON_GetArrayItem(params, 0)->valuestring;
-    const char *jid    = cJSON_GetArrayItem(params, 1)->valuestring;
-    const char *en2    = cJSON_GetArrayItem(params, 2)->valuestring;
-    const char *ntime  = cJSON_GetArrayItem(params, 3)->valuestring;
-    const char *nonce  = cJSON_GetArrayItem(params, 4)->valuestring;
-    (void)worker;
-
-    stratum_job_t *job = find_job(s, jid);
-    if (!job) {
-        if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "stale or unknown job");
-        }
-        cJSON *err = make_error(21, "stale or unknown job");
-        return emit_response(buf, len, id, NULL, err);
-    }
-
+/* The body of mining.submit, with `job` guaranteed live for the duration.
+ *
+ * Split from handle_submit so the reference find_job() hands back is released
+ * on exactly one path. This function has nine exits, and a release on each is
+ * a leak — or a double free — waiting for the next edit. */
+static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                           cJSON *params, stratum_job_t *job,
+                           const char *en2, const char *ntime,
+                           const char *nonce, char **buf, size_t *len) {
     /* Version rolling (BIP310): the optional 6th submit param carries the
      * version the miner actually hashed. Keep the job's version bits outside
      * the negotiated mask and take the miner's bits inside it; with no param
@@ -1541,7 +1666,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         uint32_t rolled = 0;
         if (!cJSON_IsString(v) || parse_u32_hex(v->valuestring, &rolled) != 0) {
             cJSON *err = make_error(20, "bad version hex");
-            stratum_job_free(job);   /* release find_job's reference */
             return emit_response(buf, len, id, NULL, err);
         }
         uint32_t mask = c->version_mask ? c->version_mask : VERSION_ROLLING_MASK;
@@ -1549,21 +1673,22 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             (int32_t)(((uint32_t)job->version & ~mask) | (rolled & mask));
     }
 
-    if (dedupe_check_and_add(c, jid, en2, ntime, nonce,
+    /* job->job_id rather than the submitted string: find_job matched them
+     * exactly, and the job is the one thing here guaranteed to outlive the
+     * call. */
+    if (dedupe_check_and_add(c, job->job_id, en2, ntime, nonce,
                              (uint32_t)submit_version)) {
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
                              "duplicate share");
         }
         cJSON *err = make_error(22, "duplicate share");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
     uint32_t ntime_v, nonce_v;
     if (parse_u32_hex(ntime, &ntime_v) != 0 || parse_u32_hex(nonce, &nonce_v) != 0) {
         cJSON *err = make_error(20, "bad ntime/nonce hex");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1571,7 +1696,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     uint8_t *en2_bytes = hex_to_bytes_alloc(en2, &en2_len);
     if (!en2_bytes) {
         cJSON *err = make_error(20, "bad extranonce2 hex");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1592,7 +1716,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              "bad extranonce2 size");
         }
         cJSON *err = make_error(20, "bad extranonce2 size");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1617,7 +1740,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              "coinbase render failed");
         }
         cJSON *err = make_error(25, "coinbase render failed");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1627,7 +1749,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (!cb) {
         pthread_mutex_unlock(&c->state_lock);
         free(en2_bytes);
-        stratum_job_free(job);   /* release find_job's reference */
         return -1;
     }
     size_t off = 0;
@@ -1643,7 +1764,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * under the same lock as the rest of the vardiff set, so the tip watcher
      * cannot retarget between reading one and reading another. */
     double job_diff = 0.0;
-    const int have_job_diff = conn_job_diff_lookup(c, jid, &job_diff);
+    const int have_job_diff = conn_job_diff_lookup(c, job->job_id, &job_diff);
     pthread_mutex_unlock(&c->state_lock);
     free(en2_bytes);
 
@@ -1732,7 +1853,6 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         free(cb);
         cJSON *err = make_error(23, "low difficulty");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
@@ -1755,15 +1875,20 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              "duplicate share");
         }
         cJSON *err = make_error(22, "duplicate share");
-        stratum_job_free(job);   /* release find_job's reference */
         return emit_response(buf, len, id, NULL, err);
     }
 
     char block_hash_hex[65] = {0};
-    /* Did the NODE take this block onto the best chain? Stays 0 unless
-     * on_block says so, which also covers the case where the block could not
-     * be assembled and was never submitted at all. */
-    int  block_accepted = 0;
+    /* Whether the NODE took the candidate onto the best chain. Only
+     * meaningful when is_block. Defaults to accepted so a server with no
+     * on_block hook (tests) behaves as before; every real path below assigns
+     * it from the submission, including the assembly-failure path.
+     *
+     * ⚠️ That default is load-bearing in the other direction too: payout
+     * settlement is gated on this flag (see on_block_found), so a production
+     * server MUST install an on_block hook. main.c always does. */
+    int  block_accepted = 1;
+    char submit_err[REASON_TEXT_MAX] = {0};
     if (is_block) {
         bytes_to_hex(hash_be, 32, block_hash_hex);
         if (!meets_worker) {
@@ -1774,13 +1899,22 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         char *block_hex = assemble_block_hex(job, cb, cb_len, header);
         if (block_hex) {
-            if (s->cfg.on_block)
-                block_accepted = (s->cfg.on_block(s->cfg.ctx, block_hex) == 0);
+            if (s->cfg.on_block) {
+                int rc = s->cfg.on_block(s->cfg.ctx, block_hex,
+                                         submit_err, sizeof submit_err);
+                block_accepted = (rc == 0);
+            }
             free(block_hex);
         } else {
-            LOG_ERROR("stratum: could not assemble the block for '%s' at "
-                      "height %u — nothing was submitted", c->worker_name,
-                      job->height);
+            /* Nothing was submitted, so nothing can have been accepted.
+             * Falling through as "found" here would file a block the node
+             * was never even shown. */
+            block_accepted = 0;
+            snprintf(submit_err, sizeof submit_err, "block assembly failed");
+        }
+        if (!block_accepted) {
+            LOG_WARN("stratum: candidate from '%s' at height %u was not "
+                     "accepted: %s", c->worker_name, job->height, submit_err);
         }
     }
     free(cb);
@@ -1793,31 +1927,45 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         s->cfg.on_share(s->cfg.ctx, c->worker_name, c->payout_address,
                         ts_now, share_diff, is_block, sent_hash_hex);
     }
-    /* Tick vardiff: count this accepted share toward the window. May emit
-     * a mining.set_difficulty notification if the window has elapsed. */
+    /* Tick vardiff: count this accepted share toward the window, and track
+     * the difficulty it actually achieved. Reading the hash as a target
+     * gives exactly that: how much harder than difficulty 1 this solution
+     * was. The running minimum is what exposes a miner filtering at a local
+     * floor above its assigned difficulty.
+     *
+     * May emit a mining.set_difficulty notification if the window elapsed. */
     pthread_mutex_lock(&c->state_lock);
     c->vd_window_shares++;
+    double achieved = target_to_diff(hash_be);
+    if (achieved < c->vd_window_min_achieved) {
+        c->vd_window_min_achieved = achieved;
+    }
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
     pthread_mutex_unlock(&c->state_lock);
-    /* ⛔ Gated on the NODE accepting the block, not on the pool solving it.
+    /* ⛔ This fires for EVERY candidate, accepted or not, and `accepted` is
+     * what separates the two. Recording a candidate and paying for one are
+     * different acts, and only the second may be gated here.
      *
      * Two miners can solve the same height milliseconds apart. submitblock
      * takes the first and answers the second "inconclusive": a valid block
-     * that is not in the chain. Recording that as found writes a second
-     * blocks_found row for one height and — far worse — settles the
-     * proportional plan against a reward nobody was ever paid, which breaks
-     * the zero-sum invariant the no-custody design rests on.
+     * that is not in the chain. Settling the proportional plan against that
+     * pays a turn for a reward nobody ever received, which breaks the
+     * zero-sum invariant the no-custody design rests on — so the settlement
+     * in on_block_found_cb() is gated on `accepted`. The blocks_found ROW is
+     * still written, with status rejected and the node's reason, because a
+     * refusal we do not record is a refusal we cannot explain later.
      *
      * This is rare at real difficulty and routine at minimum difficulty, which
      * is exactly the window this pool exists to mine. Found by
      * tests/test_burst_regtest.sh. */
     if (is_block && !block_accepted) {
         LOG_INFO("stratum: block %s from '%s' at height %u was NOT accepted by "
-                 "the node — not recording it as found, not settling payouts. "
-                 "The share itself still counts.",
-                 block_hash_hex, c->worker_name, job->height);
+                 "the node (%s) — recording it as a rejected candidate, not "
+                 "settling payouts. The share itself still counts.",
+                 block_hash_hex, c->worker_name, job->height,
+                 submit_err[0] ? submit_err : "no reason given");
     }
-    if (is_block && block_accepted && s->cfg.on_block_found) {
+    if (is_block && s->cfg.on_block_found) {
         int64_t fee_sats = 0;
         if (s->cfg.fee_bps > 0 && s->cfg.operator_address[0]) {
             fee_sats = (job->value_sats * (int64_t)s->cfg.fee_bps) / 10000;
@@ -1827,10 +1975,70 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,
                               c->payout_address, ts_now, job->height,
                               job->job_id, block_hash_hex,
-                              reward_sats, fee_sats);
+                              reward_sats, fee_sats,
+                              block_accepted, submit_err);
     }
-    stratum_job_free(job);   /* release find_job's reference */
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
+}
+
+static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                         cJSON *params, char **buf, size_t *len) {
+    /* Both refusals below answer the miner with an error, so they count as
+     * rejects on ITS dashboard. Recording them keeps our reject table and the
+     * miner's own numbers describing the same events — without this a miner
+     * refused on every submit reads as simply absent here. */
+    if (!c->authorized) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx,
+                             c->worker_name[0] ? c->worker_name
+                                               : "(unauthorized)",
+                             now_ms(), "unauthorized");
+        }
+        cJSON *err = make_error(24, "unauthorized");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "bad params");
+        }
+        cJSON *err = make_error(20, "bad params");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    const char *worker = cJSON_GetArrayItem(params, 0)->valuestring;
+    const char *jid    = cJSON_GetArrayItem(params, 1)->valuestring;
+    const char *en2    = cJSON_GetArrayItem(params, 2)->valuestring;
+    const char *ntime  = cJSON_GetArrayItem(params, 3)->valuestring;
+    const char *nonce  = cJSON_GetArrayItem(params, 4)->valuestring;
+    (void)worker;
+
+    /* A miner that authorized before the gate closed is still connected and
+     * still hashing. Accepting those shares would bank work the pool has
+     * already decided not to pay for. */
+    if (pps_gated(s)) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "pps accrual suspended (difficulty below floor)");
+        }
+        cJSON *err = make_error(24, PPS_GATED_MSG);
+        return emit_response(buf, len, id, NULL, err);
+    }
+
+    /* Counted reference: the tip watcher may retire and free this job while
+     * the submit below is still reading it. */
+    stratum_job_t *job = find_job(s, jid);
+    if (!job) {
+        if (s->cfg.on_reject) {
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
+                             "stale or unknown job");
+        }
+        cJSON *err = make_error(21, "stale or unknown job");
+        return emit_response(buf, len, id, NULL, err);
+    }
+
+    int rc = submit_with_job(s, c, id, params, job, en2, ntime, nonce, buf, len);
+    stratum_job_free(job);
+    return rc;
 }
 
 int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
@@ -1874,6 +2082,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->server = s;
     c->fd = -1;
     c->difficulty = s ? s->cfg.initial_diff : 1.0;
+    c->vd_window_min_achieved = HUGE_VAL;
     pthread_mutex_init(&c->state_lock, NULL);
     pthread_mutex_init(&c->write_lock, NULL);
     return c;
@@ -1885,6 +2094,46 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
     pthread_mutex_destroy(&c->state_lock);
     pthread_mutex_destroy(&c->write_lock);
     free(c);
+}
+
+stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id) {
+    return find_job(s, job_id);
+}
+uint32_t stratum_job_height_for_test(const stratum_job_t *j) {
+    return j ? j->height : 0;
+}
+int64_t stratum_job_value_sats_for_test(const stratum_job_t *j) {
+    return j ? j->value_sats : 0;
+}
+
+/* Render (or reuse) this connection's coinbase for the current job and hand
+ * back the pieces a submit is hashed from, plus the connection's assigned
+ * difficulty. Tests use it to compute the hash a given nonce would produce,
+ * which is the only way to pick shares achieving a chosen difficulty instead
+ * of whatever the first nonce happens to land on — and simulating a miner
+ * that filters at its own difficulty floor needs exactly that. */
+int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
+                                   const char *job_id,
+                                   const uint8_t **cb1, size_t *cb1_len,
+                                   const uint8_t **cb2, size_t *cb2_len,
+                                   const uint8_t **en1) {
+    if (!s || !c || !job_id) return -1;
+    int rc = -1;
+    pthread_rwlock_rdlock(&s->job_lock);
+    stratum_job_t *j = s->current_job;
+    if (j && strcmp(j->job_id, job_id) == 0 &&
+        conn_render_coinbase(s, c, j) == 0) {
+        *cb1 = c->cb1; *cb1_len = c->cb1_len;
+        *cb2 = c->cb2; *cb2_len = c->cb2_len;
+        *en1 = c->extranonce1;
+        rc = 0;
+    }
+    pthread_rwlock_unlock(&s->job_lock);
+    return rc;
+}
+
+double stratum_conn_difficulty_for_test(const stratum_conn_t *c) {
+    return c ? c->difficulty : 0.0;
 }
 
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c) {

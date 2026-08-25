@@ -136,4 +136,51 @@ pool_mode = solo
 # with fee_bps. Prefer leaving it unset.
 # pps_sats_per_diff = 1000
 
+# pps-classic — READ THIS BEFORE RUNNING PPS ON A NEW CHAIN.
+#
+# The derived rate is block_value / network_difficulty, which is a share's
+# expected value. That is correct only while every share the pool produces has
+# a real chance of becoming a block — which needs difficulty to be calibrated
+# to hashrate. On a young chain it is not: difficulty starts at 1 and climbs,
+# and until it catches up the pool produces solutions far faster than the chain
+# can accept blocks. The formula does not know that, and prices every share as
+# though it were worth a whole block.
+#
+# This is not theoretical. A 40 TH/s pool on a forknet that began at difficulty
+# 1 accrued 15,561,471 BTC of liability in under four hours, against 943.60 BTC
+# it had actually mined. Nothing was paid out only because the payout worker
+# had not run yet.
+#
+# Set the floor to the difficulty at which YOUR pool alone would find one block
+# per block interval:
+#
+#     pps_min_network_difficulty = hashrate_in_H/s * block_interval_sec / 2^32
+#
+#   10 TH/s  ->  ~1,400,000        100 TH/s ->  ~14,000,000
+#   40 TH/s  ->  ~5,600,000          1 PH/s ->  ~140,000,000
+#
+# That is a FLOOR, not a target — you share the chain with other miners, so the
+# genuinely safe difficulty is higher. Below it the proxy credits nothing and,
+# by default, refuses new miners rather than taking work it will not pay for.
+# It resumes on its own once the chain retargets, and logs the difficulty it
+# observes to be necessary either way.
+#
+# 0 (the default) disables the check. That is only safe on a chain whose
+# difficulty is already calibrated: mainnet, testnet, signet. The proxy also
+# applies an automatic ceiling that caps accrual at what the chain can mint,
+# but that needs a minute of hashrate history — it cannot protect the first
+# shares after a restart. This floor is what does.
+# pps_min_network_difficulty = 5600000
+
+# Target seconds between blocks. 600 for Bitcoin and every chain forked from
+# it. Only change this for a chain that genuinely retargets to a different
+# interval — it feeds both the floor above and the issuance ceiling.
+# block_interval_sec = 600
+
+# While accrual is suspended by the floor, refuse mining.authorize and reject
+# submits, so miners point elsewhere instead of hashing uncredited. Default on.
+# Turn it off only if the miners are yours and you know they are working for
+# nothing.
+# pps_refuse_shares_below_min = 1
+
 log_level = info

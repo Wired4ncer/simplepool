@@ -68,6 +68,14 @@ void bitcoind_client_free(bitcoind_client_t *c);
  * error. Useful at startup. */
 int bitcoind_ping(bitcoind_client_t *c, char *errbuf, size_t errlen);
 
+/* Which chain the backend reports (getblockchaininfo `chain`): "main",
+ * "test", "signet" or "regtest". Returns 0 and fills `out` on success.
+ * Negative when the backend does not implement getblockchaininfo — the CUSF
+ * enforcer does not — in which case the caller must infer the network some
+ * other way rather than assert one. */
+int bitcoind_get_chain(bitcoind_client_t *c, char *out, size_t cap,
+                       char *errbuf, size_t errlen);
+
 /* Fetch a block template. Allocates the result; caller must call
  * bitcoind_template_free. Returns 0 ok, negative on error. */
 int bitcoind_get_block_template(bitcoind_client_t *c,
@@ -90,6 +98,23 @@ int bitcoind_get_block_template_lp(bitcoind_client_t *c,
  * error. errbuf gets the rejection reason on negative. */
 int bitcoind_submit_block(bitcoind_client_t *c, const char *block_hex,
                           char *errbuf, size_t errlen);
+
+/* Returned when the backend does not implement the method at all, as opposed
+ * to failing to answer it. The CUSF enforcer serves exactly getblocktemplate
+ * and submitblock, so callers must treat this as a routine answer and fall
+ * back — not as an error to retry. */
+#define BITCOIND_ERR_UNSUPPORTED (-32)
+
+/* The hash of the block at `height` on the backend's active chain, written to
+ * `out` as lowercase hex. This is how a block the pool submitted is checked
+ * to still be in the chain: a hash that differs from ours means ours was
+ * reorged out.
+ *
+ * Returns 0 on success, BITCOIND_ERR_UNSUPPORTED when the backend does not
+ * serve getblockhash, and another negative value on a real failure. */
+int bitcoind_get_block_hash(bitcoind_client_t *c, int height,
+                            char *out, size_t cap,
+                            char *errbuf, size_t errlen);
 
 void bitcoind_template_free(bitcoind_template_t *t);
 

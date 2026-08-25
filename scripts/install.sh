@@ -1,18 +1,35 @@
 #!/usr/bin/env bash
 #
 # simplepool installer — run this ON the Linux server you want the pool
-# to live on. Interactive by default: it asks for the install directory,
-# service user, pool mode (solo / pps-classic), bitcoind RPC,
-# addresses, dashboard domain, admin password, nginx/TLS and firewall,
-# shows a summary, then does the whole install.
+# to live on. Interactive by default: it asks where to install, which pool
+# mode (solo / pps-classic), your bitcoind RPC, addresses, dashboard domain,
+# admin password, nginx/TLS and firewall, shows a summary, then does the
+# whole install and tells you what miners should connect to.
 #
-# Sibling script: scripts/deploy-to-server.sh drives an *already
-# installed* box from your workstation (git pull + rebuild + restart).
-# This one bootstraps a fresh box from nothing.
+# One line on a fresh Ubuntu/Debian box:
+#
+#   curl -fsSL https://raw.githubusercontent.com/LayerTwo-Labs/simplepool/main/scripts/install.sh | sudo bash
+#
+# Two ways to get the code, asked during the interview:
+#
+#   release  (default) download the published tarball for this machine's
+#            architecture, check it against the release SHA256SUMS, unpack it.
+#            No compiler, no git clone, no waiting on a build.
+#   source   git clone + `make`. What you want to run an unreleased branch,
+#            or on an architecture with no published build.
+#
+# Either way the result is the same tree at $ROOT, so everything after that
+# step — config, database, systemd, nginx — is one code path.
+#
+# Afterwards, `simplepoolctl` (installed to /usr/local/bin) is how you drive
+# the box: status, logs, doctor, upgrade, uninstall.
+#
+# Sibling script: scripts/deploy-to-server.sh drives an *already installed*
+# box from your workstation. This one bootstraps a fresh box from nothing.
 #
 # Usage:
 #   sudo ./scripts/install.sh                      # ask me everything
-#   curl -fsSL <raw-url>/install.sh | sudo bash    # standalone; clones the repo
+#   curl -fsSL <raw-url>/install.sh | sudo bash    # standalone
 #
 # Non-interactive (CI / re-runs) — every prompt has a matching flag:
 #   sudo ./scripts/install.sh --non-interactive --yes \
@@ -23,6 +40,9 @@
 #        --hostname pool.example.com --admin-user admin
 #
 # Flags:
+#   --from-release [<tag>]    install a published release (default; omit the
+#                             tag for the latest)
+#   --from-source             git clone + make instead
 #   --root <dir>              install directory        (default /home/simplepool)
 #   --user <name>             service user             (default simplepool)
 #   --repo <url> --branch <b> source to clone/update   (default upstream/main)
@@ -36,6 +56,7 @@
 #                                   deposits + payout worker source)
 #   --thunder-rpc-url <url>         default http://127.0.0.1:6009
 #   --pps-sats-per-diff <n>         default 1000
+#   --payout-interval-hours <n>     how often payouts run (default 24)
 #   --hostname <fqdn>         dashboard domain (nginx vhost + TLS)
 #   --dashboard-port <n>      default 8081 (loopback; nginx fronts it)
 #   --admin-user <name>       default admin
@@ -43,7 +64,7 @@
 #   --tls --email <addr>      run certbot --nginx after the vhost lands
 #   --no-dashboard --no-payout --no-nginx --no-firewall --no-deps
 #   --enable-firewall         `ufw enable` (OpenSSH is always allowed first)
-#   --run-tests               run `make test` after the build
+#   --run-tests               run `make test` after the build (source installs)
 #   --non-interactive         never prompt; use flags + saved answers
 #   --yes                     skip the final confirmation
 #
@@ -59,8 +80,46 @@ set -euo pipefail
     exit 1
 }
 
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# The headline install path is `curl ... | sudo bash`, where there is no file
+# on disk to point at: BASH_SOURCE[0] is not a readable path, so re-execing
+# ourselves and reading our own comment block for --help both have to be
+# handled rather than assumed away.
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    PIPED=0
+else
+    SELF=""
+    PIPED=1
+fi
+
+usage() {
+    if [[ "$PIPED" == "0" ]]; then
+        sed -n '2,73p' "$SELF" | sed 's/^# \{0,1\}//'
+    else
+        # Piped: our source is gone from stdin, so there is nothing to read
+        # back. Point at the copy that definitely exists.
+        cat <<'USAGE'
+simplepool installer.
+
+  curl -fsSL <raw-url>/install.sh | sudo bash                  # interactive
+  curl -fsSL <raw-url>/install.sh | sudo bash -s -- --help     # you are here
+
+Flags can be passed after `-s --`. The full list is in the script's header:
+  https://github.com/LayerTwo-Labs/simplepool/blob/main/scripts/install.sh
+and the walkthrough is in INSTALL.md.
+USAGE
+    fi
+}
+
 if [[ $EUID -ne 0 ]]; then
+    if [[ "$PIPED" == "1" ]]; then
+        # stdin is already consumed, so we cannot re-exec ourselves. Say what
+        # to type instead of failing somewhere deeper with a permissions error.
+        echo "install.sh needs root, and a piped script cannot re-run itself." >&2
+        echo "Pipe into 'sudo bash', not 'bash':" >&2
+        echo "  curl -fsSL <raw-url>/install.sh | sudo bash" >&2
+        exit 1
+    fi
     command -v sudo >/dev/null 2>&1 || { echo "run as root (no sudo found)" >&2; exit 1; }
     echo "==> re-executing under sudo"
     exec sudo -E bash "$SELF" "$@"
@@ -83,8 +142,18 @@ die()  { echo "${RED}fatal: $*${OFF}" >&2; exit 1; }
 # ------------------------------------------------------------- defaults -----
 ROOT=""
 SVC_USER=""
-REPO_URL="https://github.com/rsantacroce/simplepool.git"
+# The canonical repo. Releases, container images and CI all live here; the
+# author's personal remote is a mirror and has no published releases, so
+# defaulting to it would make --from-release fail on a fresh box.
+REPO_SLUG="LayerTwo-Labs/simplepool"
+REPO_URL="https://github.com/${REPO_SLUG}.git"
 BRANCH="main"
+# release = download a published tarball; source = git clone + make.
+# Left empty so the interview can pick a context-aware default (a checkout
+# you are standing in means source; a piped one-liner means release) without
+# overwriting a saved answer or a flag.
+SOURCE=""
+RELEASE_TAG=""          # empty = whatever the latest release is
 MODE=""
 STRATUM_PORT="3334"
 BITCOIND_URL=""
@@ -97,6 +166,7 @@ POOL_BTC_ADDRESS=""
 THUNDER_ADDRESS=""
 THUNDER_RPC_URL="http://127.0.0.1:6009"
 PPS_SATS_PER_DIFF=""   # empty = derive from the block template (recommended)
+PAYOUT_INTERVAL_HOURS="24"
 FQDN=""
 DASH_PORT="8081"
 PUBLIC_STRATUM_URL=""
@@ -144,6 +214,17 @@ while [[ $# -gt 0 ]]; do
         --thunder-address)   THUNDER_ADDRESS="$2"; shift 2 ;;
         --thunder-rpc-url)   THUNDER_RPC_URL="$2"; shift 2 ;;
         --pps-sats-per-diff) PPS_SATS_PER_DIFF="$2"; shift 2 ;;
+        --payout-interval-hours) PAYOUT_INTERVAL_HOURS="$2"; shift 2 ;;
+        # --from-release takes an OPTIONAL tag, so the next argument is only
+        # consumed when it looks like one ("v0.2.0" or "0.2.0"). Anything
+        # else — another flag, or nothing at all — leaves the tag empty and
+        # resolves to the latest release.
+        --from-release)      SOURCE="release"
+                             if [[ "${2:-}" == v* || "${2:-}" =~ ^[0-9] ]]; then
+                                 RELEASE_TAG="$2"; shift 2
+                             else shift; fi ;;
+        --release-tag)       SOURCE="release"; RELEASE_TAG="$2"; shift 2 ;;
+        --from-source)       SOURCE="source"; shift ;;
         --hostname)          FQDN="$2"; shift 2 ;;
         --dashboard-port)    DASH_PORT="$2"; shift 2 ;;
         --admin-user)        ADMIN_USER="$2"; shift 2 ;;
@@ -159,7 +240,7 @@ while [[ $# -gt 0 ]]; do
         --run-tests)         RUN_TESTS=1; shift ;;
         --non-interactive)   INTERACTIVE=0; ASSUME_YES=1; shift ;;
         --yes|-y)            ASSUME_YES=1; shift ;;
-        -h|--help)           sed -n '2,51p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)           usage; exit 0 ;;
         *) die "unknown arg: $1  (try --help)" ;;
     esac
 done
@@ -242,8 +323,14 @@ echo "${DIM}Answers are saved to $STATE_FILE and reused next time.${OFF}"
 # Where does the code live? If we're running from inside a checkout, that
 # checkout is the default; otherwise we'll clone.
 IN_CHECKOUT=""
-CANDIDATE="$(cd "$(dirname "$SELF")/.." && pwd)"
-[[ -f "$CANDIDATE/Makefile" && -f "$CANDIDATE/schema.sql" ]] && IN_CHECKOUT="$CANDIDATE"
+if [[ "$PIPED" == "0" ]]; then
+    CANDIDATE="$(cd "$(dirname "$SELF")/.." && pwd)"
+    [[ -f "$CANDIDATE/Makefile" && -f "$CANDIDATE/schema.sql" ]] && IN_CHECKOUT="$CANDIDATE"
+fi
+# Running from a checkout you already have means you probably want that
+# checkout built. Arriving via the one-liner means there is nothing to build
+# from, so a published release is the only answer that works out of the box.
+[[ -n "$SOURCE" ]] || SOURCE="$([[ -n "$IN_CHECKOUT" ]] && echo source || echo release)"
 
 echo
 echo "${BOLD}-- location --${OFF}"
@@ -254,7 +341,15 @@ DEFAULT_USER="simplepool"
 [[ "$DEFAULT_USER" == "root" ]] && DEFAULT_USER="${SUDO_USER:-simplepool}"
 ask SVC_USER "service user (created if missing)" "$DEFAULT_USER"
 
-if [[ ! -f "$ROOT/Makefile" ]]; then
+echo
+echo "${BOLD}-- where the code comes from --${OFF}"
+ask_choice SOURCE "how should simplepool get onto this box?" \
+    "release|download the published build for this machine — no compiler, no clone" \
+    "source|git clone and compile from source (unreleased branches, other arches)"
+
+if [[ "$SOURCE" == "release" ]]; then
+    ask RELEASE_TAG "release tag (blank = the latest release)" "$RELEASE_TAG"
+elif [[ ! -f "$ROOT/Makefile" ]]; then
     say "$ROOT has no checkout — it will be cloned"
     ask REPO_URL "git repository to clone" "$REPO_URL"
     ask BRANCH   "branch"                  "$BRANCH"
@@ -345,7 +440,13 @@ if [[ "$MODE" == "solo" ]]; then
 else
     [[ -z "$DO_PAYOUT" ]] && DO_PAYOUT=1
     ask_yn DO_PAYOUT "install the Thunder payout worker?"
-    [[ "$DO_PAYOUT" == "1" ]] && ask THUNDER_RPC_URL "Thunder RPC url" "$THUNDER_RPC_URL"
+    if [[ "$DO_PAYOUT" == "1" ]]; then
+        ask THUNDER_RPC_URL "Thunder RPC url" "$THUNDER_RPC_URL"
+        # This is the batch cadence miners experience. It does not affect how
+        # quickly an already-broadcast payout is confirmed and credited —
+        # that runs on its own 30s clock inside the worker.
+        ask PAYOUT_INTERVAL_HOURS "how often should payouts run, in hours" "$PAYOUT_INTERVAL_HOURS"
+    fi
 fi
 [[ -z "$DO_PAYOUT" ]] && DO_PAYOUT=0
 
@@ -370,8 +471,17 @@ DB_PATH="$ROOT/data/shares.db"
 [[ "$MODE" == "pps-classic" && -z "$POOL_BTC_ADDRESS" ]] && \
     warn "pps-classic without pool_btc_address — the proxy will refuse to start"
 
-STEP_TOTAL=10
-[[ "$RUN_TESTS" == "1" ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
+[[ "$SOURCE" =~ ^(release|source)$ ]] || die "invalid source: $SOURCE (release|source)"
+[[ "$PAYOUT_INTERVAL_HOURS" =~ ^[0-9]+$ && "$PAYOUT_INTERVAL_HOURS" -ge 1 ]] || \
+    die "--payout-interval-hours must be a whole number of hours >= 1 (got: $PAYOUT_INTERVAL_HOURS)"
+PAYOUT_INTERVAL_MS=$(( PAYOUT_INTERVAL_HOURS * 3600 * 1000 ))
+
+STEP_TOTAL=11
+# Both source-selection paths cost exactly one step (download, or clone) plus
+# one more (verify the prebuilt binary, or build it), so the base is the same
+# either way. The C test suite is the only extra, and it needs a source tree
+# to build from.
+[[ "$RUN_TESTS" == "1" && "$SOURCE" == "source" ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
 [[ "$DO_NGINX"  == "1" ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
 [[ "$DO_UFW"    == "1" ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
 
@@ -380,7 +490,11 @@ echo
 echo "${BOLD}-- summary --${OFF}"
 printf "    %-22s %s\n" "install dir"     "$ROOT"
 printf "    %-22s %s\n" "service user"    "$SVC_USER"
-printf "    %-22s %s\n" "branch"          "${BRANCH:-<working tree untouched>}"
+if [[ "$SOURCE" == "release" ]]; then
+    printf "    %-22s %s\n" "source"     "release ${RELEASE_TAG:-<latest>} from ${REPO_SLUG}"
+else
+    printf "    %-22s %s\n" "source"     "build from ${BRANCH:-<working tree untouched>}"
+fi
 printf "    %-22s %s\n" "pool mode"       "$MODE"
 printf "    %-22s %s\n" "stratum"         "0.0.0.0:$STRATUM_PORT"
 printf "    %-22s %s\n" "bitcoind"        "$BITCOIND_URL"
@@ -391,7 +505,7 @@ printf "    %-22s %s\n" "fee"             "${FEE_BPS} bps"
 printf "    %-22s %s\n" "database"        "$DB_PATH"
 printf "    %-22s %s\n" "dashboard"       "$([[ $DO_DASH == 1 ]] && echo "yes (:$DASH_PORT${FQDN:+, $FQDN})" || echo no)"
 printf "    %-22s %s\n" "nginx / TLS"     "$([[ $DO_NGINX == 1 ]] && echo "yes$([[ $DO_TLS == 1 ]] && echo ' + certbot')" || echo no)"
-printf "    %-22s %s\n" "payout worker"   "$([[ $DO_PAYOUT == 1 ]] && echo "yes ($THUNDER_RPC_URL)" || echo no)"
+printf "    %-22s %s\n" "payout worker"   "$([[ $DO_PAYOUT == 1 ]] && echo "yes ($THUNDER_RPC_URL, every ${PAYOUT_INTERVAL_HOURS}h)" || echo no)"
 printf "    %-22s %s\n" "firewall"        "$([[ $DO_UFW == 1 ]] && echo "rules$([[ $ENABLE_UFW == 1 ]] && echo ' + enable')" || echo skip)"
 echo
 
@@ -408,9 +522,13 @@ install -d -m 0755 "$STATE_DIR"
 {
     echo "# simplepool install answers — written by scripts/install.sh"
     echo "# contains secrets; root-only, 0600."
-    for v in ROOT SVC_USER REPO_URL BRANCH MODE STRATUM_PORT BITCOIND_URL \
+    # simplepoolctl reads this file too — DB_PATH, SOURCE and RELEASE_TAG are
+    # here so it can report and upgrade without re-deriving any of them.
+    for v in ROOT SVC_USER REPO_SLUG REPO_URL BRANCH SOURCE RELEASE_TAG \
+             MODE STRATUM_PORT BITCOIND_URL \
              BITCOIND_USER BITCOIND_PASS OPERATOR_ADDRESS FEE_BPS COINBASE_TAG \
              POOL_BTC_ADDRESS THUNDER_ADDRESS THUNDER_RPC_URL PPS_SATS_PER_DIFF \
+             PAYOUT_INTERVAL_HOURS DB_PATH \
              FQDN DASH_PORT PUBLIC_STRATUM_URL ADMIN_USER ADMIN_PASSWORD EMAIL \
              DO_TLS DO_DASH DO_PAYOUT DO_NGINX DO_UFW DO_DEPS RUN_TESTS; do
         printf '%s=%q\n' "$v" "${!v-}"
@@ -484,17 +602,24 @@ if [[ "$DO_DEPS" == "1" ]]; then
         apt)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -q
-            apt-get install -yq \
-                build-essential git curl unzip ca-certificates python3 \
-                libsqlite3-dev libcurl4-openssl-dev libhiredis-dev sqlite3 \
-                openssl ufw
+            # A release install skips the compiler and git, but still needs
+            # the shared libraries the binary links against. It asks for the
+            # -dev packages rather than the runtime ones because those are
+            # the names that stay put across distro releases: libhiredis-dev
+            # is libhiredis-dev everywhere, while the runtime package is
+            # libhiredis0.14 on 22.04 and libhiredis1.1.0 on 24.04.
+            PKGS=(curl ca-certificates tar gzip python3 openssl ufw sqlite3
+                  libsqlite3-dev libcurl4-openssl-dev libhiredis-dev)
+            [[ "$SOURCE" == "source" ]] && PKGS+=(build-essential git unzip)
+            apt-get install -yq "${PKGS[@]}"
             [[ "$DO_NGINX" == "1" ]] && apt-get install -yq nginx
             [[ "$DO_TLS"   == "1" ]] && apt-get install -yq certbot python3-certbot-nginx
             ;;
         dnf)
-            dnf install -y \
-                gcc gcc-c++ make git curl unzip ca-certificates python3 \
-                sqlite-devel libcurl-devel hiredis-devel sqlite openssl
+            PKGS=(curl ca-certificates tar gzip python3 openssl sqlite
+                  sqlite-devel libcurl-devel hiredis-devel)
+            [[ "$SOURCE" == "source" ]] && PKGS+=(gcc gcc-c++ make git unzip)
+            dnf install -y "${PKGS[@]}"
             [[ "$DO_NGINX" == "1" ]] && dnf install -y nginx
             [[ "$DO_TLS"   == "1" ]] && dnf install -y certbot python3-certbot-nginx
             ;;
@@ -540,41 +665,147 @@ fi
 SVC_HOME="$(getent passwd "$SVC_USER" | cut -d: -f6)"
 [[ -d "$SVC_HOME" ]] || SVC_HOME="$ROOT"
 
-# ============================ 4. source code ================================
-step "source code in $ROOT"
-# git refuses to operate on a tree owned by another user ("dubious
-# ownership"), so take ownership before touching it — a previous run as
-# root may well have left root-owned objects here.
-[[ -d "$ROOT" ]] && chown -R "$SVC_USER:$SVC_USER" "$ROOT"
-if [[ -d "$ROOT/.git" ]]; then
-    if [[ -n "$BRANCH" ]]; then
-        say "fetching origin/$BRANCH"
-        as_user git -C "$ROOT" fetch origin --prune
-        as_user git -C "$ROOT" checkout "$BRANCH"
-        as_user git -C "$ROOT" reset --hard "origin/$BRANCH"
-    else
-        say "working tree left as-is"
+# ============================ 4. get the code ===============================
+# Which prebuilt tarball this machine can run.
+release_arch() {
+    local m
+    m="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+    case "$m" in
+        amd64|x86_64)  echo amd64 ;;
+        arm64|aarch64) echo arm64 ;;
+        *) die "no published build for $m — re-run with --from-source to compile here" ;;
+    esac
+}
+
+# Ask GitHub what the newest release is. Kept separate from the download so a
+# tag the operator typed is never silently replaced by a different one.
+latest_release_tag() {
+    curl -fsSL --max-time 20 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+fetch_release() {
+    local arch tag ver base tmp tarball
+    arch="$(release_arch)"
+
+    tag="$RELEASE_TAG"
+    if [[ -z "$tag" ]]; then
+        say "asking github for the latest release of ${REPO_SLUG}"
+        tag="$(latest_release_tag || true)"
+        [[ -n "$tag" ]] || die "could not find a published release for ${REPO_SLUG}.
+    If none has been cut yet, build from source instead:  --from-source"
     fi
-elif [[ -f "$ROOT/Makefile" ]]; then
-    say "non-git checkout — left as-is"
-else
+    RELEASE_TAG="$tag"
+    ver="${tag#v}"
+    base="https://github.com/${REPO_SLUG}/releases/download/${tag}"
+    tarball="simplepool-${ver}-linux-${arch}.tar.gz"
+
+    tmp="$(mktemp -d)"
+    # A partial download must not be left behind looking like a good one.
+    # EXIT rather than RETURN, because die() exits outright and a RETURN trap
+    # would never fire. The path is expanded NOW, not at exit: $tmp is local
+    # to this function and would be empty by the time the trap runs, making
+    # the cleanup `rm -rf ""` — which fails, and would take the script's exit
+    # status down with it on an otherwise successful install.
+    trap "rm -rf '$tmp'" EXIT
+
+    say "downloading $tarball ($tag)"
+    curl -fL --progress-bar --max-time 600 -o "$tmp/$tarball" "$base/$tarball" \
+        || die "could not download $base/$tarball
+    Check that release $tag has a build for $arch, or use --from-source."
+
+    # The checksum is not decoration: this binary is about to run as a service
+    # with the pool's payout addresses in its config, and it arrived over the
+    # network. A release without SHA256SUMS is treated as a failure, not as a
+    # reason to skip the check.
+    say "verifying against SHA256SUMS"
+    curl -fsSL --max-time 60 -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" \
+        || die "release $tag has no SHA256SUMS — refusing to install an unverified binary"
+    grep -q " \{1,2\}${tarball}\$" "$tmp/SHA256SUMS" \
+        || die "SHA256SUMS for $tag does not mention $tarball — refusing to install"
+    ( cd "$tmp" && sha256sum -c --ignore-missing SHA256SUMS ) \
+        || die "checksum mismatch on $tarball — the download is corrupt or tampered with"
+
+    tar -xzf "$tmp/$tarball" -C "$tmp"
+    local unpacked
+    unpacked="$tmp/simplepool-${ver}-linux-${arch}"
+    [[ -f "$unpacked/Makefile" && -x "$unpacked/build/simplepool" ]] \
+        || die "$tarball did not unpack into the expected layout"
+
     install -d -o "$SVC_USER" -g "$SVC_USER" "$ROOT"
-    say "cloning $REPO_URL ($BRANCH)"
-    as_user git clone --branch "$BRANCH" "$REPO_URL" "$ROOT"
+    # Copy rather than replace: data/, proxy.conf and the *.bak files are not
+    # in the tarball (they are gitignored), so an overlay upgrades the code
+    # and leaves the ledger and the operator's config exactly where they are.
+    cp -a "$unpacked/." "$ROOT/"
+    say "unpacked $tag into $ROOT"
+    sed 's/^/    /' "$ROOT/RELEASE" 2>/dev/null || true
+}
+
+if [[ "$SOURCE" == "release" ]]; then
+    step "download release"
+    # Overlaying a tarball onto a checkout produces a tree that is neither:
+    # git reports every file as modified and the next `git pull` fights the
+    # release. Say so instead of creating it.
+    [[ -d "$ROOT/.git" ]] && die "$ROOT is a git checkout, and a release tarball would be laid on top of it.
+    Pick one:  --from-source   (build this checkout)
+               --root <dir>    (install the release somewhere else)"
+    fetch_release
+else
+    step "source code in $ROOT"
+    # git refuses to operate on a tree owned by another user ("dubious
+    # ownership"), so take ownership before touching it — a previous run as
+    # root may well have left root-owned objects here.
+    [[ -d "$ROOT" ]] && chown -R "$SVC_USER:$SVC_USER" "$ROOT"
+    if [[ -d "$ROOT/.git" ]]; then
+        if [[ -n "$BRANCH" ]]; then
+            say "fetching origin/$BRANCH"
+            as_user git -C "$ROOT" fetch origin --prune
+            as_user git -C "$ROOT" checkout "$BRANCH"
+            as_user git -C "$ROOT" reset --hard "origin/$BRANCH"
+        else
+            say "working tree left as-is"
+        fi
+    elif [[ -f "$ROOT/Makefile" ]]; then
+        say "non-git checkout — left as-is"
+    else
+        install -d -o "$SVC_USER" -g "$SVC_USER" "$ROOT"
+        say "cloning $REPO_URL ($BRANCH)"
+        as_user git clone --branch "$BRANCH" "$REPO_URL" "$ROOT"
+    fi
 fi
-[[ -f "$ROOT/Makefile" && -f "$ROOT/schema.sql" ]] || die "$ROOT does not look like a simplepool checkout"
+[[ -f "$ROOT/Makefile" && -f "$ROOT/schema.sql" ]] || die "$ROOT does not look like a simplepool tree"
 # An earlier root-run build leaves root-owned objects behind; fix the tree.
 chown -R "$SVC_USER:$SVC_USER" "$ROOT"
 
-# ============================== 5. build ====================================
-step "build the C proxy"
-as_user make -C "$ROOT" -j"$(nproc)"
-[[ -x "$ROOT/build/simplepool" ]] || die "build produced no binary at $ROOT/build/simplepool"
-say "built $ROOT/build/simplepool ($(stat -c %s "$ROOT/build/simplepool") bytes)"
+# ============================== 5. the binary ===============================
+if [[ "$SOURCE" == "release" ]]; then
+    step "check the prebuilt binary runs here"
+    # The one thing a prebuilt binary can fail at on a specific box is
+    # dynamic linking — a too-old glibc, or a missing libhiredis. Finding
+    # that out now beats finding it out from a crash-looping unit.
+    if ! "$ROOT/build/simplepool" --version >/dev/null 2>&1; then
+        warn "$("$ROOT/build/simplepool" --version 2>&1 | head -3)"
+        # `|| true`: grep finding nothing must not pre-empt the die() below,
+        # which is the message that actually tells the operator what to do.
+        [[ -n "$(command -v ldd)" ]] && { ldd "$ROOT/build/simplepool" 2>&1 | grep -i "not found" | sed 's/^/    /' || true; }
+        die "the prebuilt binary will not run on this machine.
+    Usually an unsatisfied shared library or a glibc older than the build host's.
+    Re-run with --from-source to compile against this system instead."
+    fi
+    say "$("$ROOT/build/simplepool" --version 2>/dev/null | head -1)"
+else
+    step "build the C proxy"
+    as_user make -C "$ROOT" -j"$(nproc)"
+    [[ -x "$ROOT/build/simplepool" ]] || die "build produced no binary at $ROOT/build/simplepool"
+    say "built $ROOT/build/simplepool ($(stat -c %s "$ROOT/build/simplepool") bytes)"
+    # A source install has no RELEASE file, and a stale one left over from a
+    # previous release install would misreport what is running.
+    rm -f "$ROOT/RELEASE"
 
-if [[ "$RUN_TESTS" == "1" ]]; then
-    step "C test suite"
-    as_user make -C "$ROOT" test
+    if [[ "$RUN_TESTS" == "1" ]]; then
+        step "C test suite"
+        as_user make -C "$ROOT" test
+    fi
 fi
 
 # =========================== 6. node modules ================================
@@ -754,6 +985,13 @@ if [[ "$DO_PAYOUT" == "1" ]]; then
         echo "Environment=PAYOUT_DB_PATH=${DB_PATH}"
         echo "Environment=THUNDER_RPC_URL=${THUNDER_RPC_URL}"
         echo "Environment=THUNDER_FROM_ADDRESS=${THUNDER_ADDRESS}"
+        echo "# Payout runs are a batch: every ${PAYOUT_INTERVAL_HOURS}h everyone over"
+        echo "# PAYOUT_MIN_SATS goes out in one Thunder transaction."
+        echo "Environment=PAYOUT_INTERVAL_MS=${PAYOUT_INTERVAL_MS}"
+        echo "# Settlement is a separate, much shorter clock on purpose: nobody in a"
+        echo "# broadcast batch is credited until a tick sees it confirmed in a Thunder"
+        echo "# block, so this must not follow the cadence above. Left at the worker's"
+        echo "# defaults (30s / 5m) unless you have a reason to move them."
     } > "$PDROPIN"
     chmod 0644 "$PDROPIN"
     if [[ -z "$THUNDER_ADDRESS" ]]; then
@@ -826,7 +1064,19 @@ if [[ "$DO_UFW" == "1" ]]; then
     say "${DASH_PORT}/tcp deliberately NOT opened — nginx fronts the dashboard"
 fi
 
-# ============================ 12. start services ============================
+# ========================== 12. simplepoolctl ===============================
+step "simplepoolctl"
+# The operator's entry point from here on. It reads $STATE_FILE for
+# everything about this box, so installing it is a copy, not a configuration.
+if [[ -f "$ROOT/scripts/simplepoolctl" ]]; then
+    install -m 0755 "$ROOT/scripts/simplepoolctl" /usr/local/bin/simplepoolctl
+    say "installed /usr/local/bin/simplepoolctl"
+    say "${DIM}status | logs | doctor | upgrade | uninstall${OFF}"
+else
+    warn "$ROOT/scripts/simplepoolctl not found — skipping (older tree?)"
+fi
+
+# ============================ 13. start services ============================
 step "enable + start services"
 # A unit that crash-loops must not abort the install — the status block
 # below is more useful than a bare `set -e` exit.
@@ -900,6 +1150,18 @@ if [[ "$DO_DASH" == "1" ]]; then
 fi
 say "config:             $ROOT/proxy.conf"
 say "database:           $DB_PATH"
-say "logs:               journalctl -u simplepool -f"
+if [[ "$SOURCE" == "release" ]]; then
+    say "installed:          release ${RELEASE_TAG} (${ROOT}/RELEASE)"
+else
+    say "installed:          built from source (${BRANCH:-working tree})"
+fi
+[[ "$DO_PAYOUT" == "1" ]] && say "payouts:            every ${PAYOUT_INTERVAL_HOURS}h"
+echo
+say "${BOLD}next:${OFF}"
+say "  simplepoolctl status        what is running, on which ports"
+say "  simplepoolctl doctor        check the things that break in production"
+say "  simplepoolctl logs -f       follow every service at once"
+say "  simplepoolctl upgrade       move to the next release"
+echo
 say "re-run this script any time — it reuses your answers from $STATE_FILE"
 echo

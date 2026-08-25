@@ -1,9 +1,17 @@
 <%# Top nav for the public (read-only) dashboard.
     Locals: active ('overview'|'blocks'|'templates'|'worker'). %>
 <% const _pactive = (typeof active === 'string') ? active : ''; %>
+<%# The chip used to read "stratum stats", which every page already looks
+    like. It now carries the two facts that change what the numbers below
+    mean — which chain, and how miners get paid — so they survive a
+    screenshot of just the header. Full detail is in pool-identity. %>
+<% const _pm = (typeof pool !== 'undefined' && pool) ? pool : null; %>
 <header class="top">
     <a href="/" class="brand">simplepool</a>
-    <span class="tag">stratum stats</span>
+    <span class="tag<%= (_pm && _pm.network && _pm.network !== 'main') ? ' tag-test' : '' %>">
+        <%= _pm && _pm.network   ? _pm.network   : 'network?' %> ·
+        <%= _pm && _pm.pool_mode ? _pm.pool_mode : 'mode?' %>
+    </span>
     <nav class="topnav">
         <a href="/"       class="<%= _pactive === 'overview' ? 'active' : '' %>">Overview</a>
         <a href="/blocks" class="<%= _pactive === 'blocks'   ? 'active' : '' %>">Blocks</a>
@@ -20,4 +28,5 @@
     </form>
 </header>
 
+<%- include('pool-identity') %>
 <%- include('health-banner') %>

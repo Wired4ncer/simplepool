@@ -13,6 +13,10 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # This job had no limit and stalled for 29 minutes inside `apt-get update`
+    # before a human cancelled it. A build-and-unit-test of a 13-file C project
+    # has no business taking longer than this.
+    timeout-minutes: 15
     # Match build_docker.yaml: CI runs only in the LayerTwo-Labs org repo, so
     # pushing to a personal repo doesn't spend Actions minutes. Remove this line
     # if you *do* want build/test CI to run on your own fork too.
@@ -22,13 +26,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            libsqlite3-dev \
-            libcurl4-openssl-dev \
-            libhiredis-dev
+        timeout-minutes: 5
+        # No `apt-get update` — see .github/scripts/apt-install.sh for why.
+        run: >
+          .github/scripts/apt-install.sh
+          build-essential
+          libsqlite3-dev
+          libcurl4-openssl-dev
+          libhiredis-dev
 
       - name: Build
         run: make -j"$(nproc)"

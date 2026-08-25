@@ -407,18 +407,95 @@ export function reportStuck(ctx, log, staleAfterSec = 300) {
     }
 }
 
+/* How long to wait before the next tick, given what this one did.
+ *
+ * The payout run itself is a daily batch — that is the cadence miners see,
+ * and it is what `intervalMs` means. But two of the states a tick can end in
+ * must not wait a day, and both are invisible from the interval alone:
+ *
+ *   - A batch was broadcast and has not confirmed. Nobody in it is credited
+ *     until a later tick sees it in a Thunder block (see settlePending), and
+ *     the stall-recovery nudge only fires from a tick. Re-checking on the
+ *     daily clock would leave a real, already-sent payout uncredited for up
+ *     to 24 hours and would let a missed BMM request sit unrecovered for the
+ *     same. So an outstanding batch is re-checked on `settleIntervalMs`.
+ *
+ *   - A tick tried and got nowhere: the transfer failed, or the reserve did
+ *     not cover what is owed. Nothing was broadcast and nobody was credited,
+ *     so this is not a completed run and the queue is still full. It comes
+ *     back on `retryIntervalMs` rather than tomorrow — long enough not to
+ *     spin on a stuck reserve, short enough that a transient RPC failure
+ *     doesn't cost a day.
+ *
+ * An undetermined settlement is deliberately grouped with the retries: it is
+ * terminal until an operator reconciles it, and re-logging that at the
+ * settle cadence would be pure noise.
+ *
+ * Everything else — nothing due, or a batch that settled cleanly — waits the
+ * full interval. */
+export function nextDelayMs(cfg, res) {
+    if (res?.reason === 'undetermined')       return cfg.retryIntervalMs;
+    if (res?.waiting_on || res?.txid)         return cfg.settleIntervalMs;
+    if (res?.failed > 0 || res?.reserve_short) return cfg.retryIntervalMs;
+    return cfg.intervalMs;
+}
+
+/* setTimeout keeps its delay in a signed 32-bit int. Anything larger wraps
+ * and the timer fires IMMEDIATELY — so a config asking for, say, monthly
+ * payouts would not slow the loop down, it would turn it into a spin that
+ * broadcasts on every tick. Long waits are therefore served in chunks. */
+const MAX_TIMEOUT_MS = 2_147_483_647;   /* ~24.8 days */
+
+/* One hop of a possibly-too-long wait: what to hand setTimeout now, and what
+ * is still owed afterwards. Pulled out so the clamp is testable without a
+ * timer. */
+export function timerStep(ms) {
+    return ms > MAX_TIMEOUT_MS
+        ? { wait: MAX_TIMEOUT_MS, remaining: ms - MAX_TIMEOUT_MS }
+        : { wait: ms, remaining: 0 };
+}
+
+export const humanMs = ms =>
+    ms >= 3600000 ? `${+(ms / 3600000).toFixed(2)}h`
+  : ms >= 60000   ? `${+(ms / 60000).toFixed(2)}m`
+  :                 `${+(ms / 1000).toFixed(2)}s`;
+
 export function startLoop(ctx, log) {
     let stopped = false;
     let timer = null;
 
     const tick = async () => {
         if (stopped) return;
+        let res = null;
         try {
-            await runOnce(ctx, log);
+            res = await runOnce(ctx, log);
         } catch (e) {
             log.error(`payout: unexpected error: ${e.stack || e.message}`);
+            /* An exception is not a completed run: come back on the retry
+             * clock rather than sleeping off the whole daily interval. */
+            res = { failed: 1 };
         }
-        if (!stopped) timer = setTimeout(tick, ctx.cfg.intervalMs);
+        if (!stopped) {
+            const delay = nextDelayMs(ctx.cfg, res);
+            /* Only worth a line when it isn't the ordinary cadence — that is
+             * exactly when an operator wondering "why hasn't it paid yet"
+             * needs to see which clock the worker is on. */
+            if (delay !== ctx.cfg.intervalMs) {
+                log.info(`payout: next tick in ${humanMs(delay)}`);
+            } else {
+                log.debug?.(`payout: next run in ${humanMs(delay)}`);
+            }
+            arm(delay);
+        }
+    };
+
+    /* Schedule `tick` in at most MAX_TIMEOUT_MS hops, so a long interval is
+     * actually waited out rather than wrapping to zero. */
+    const arm = (ms) => {
+        const { wait, remaining } = timerStep(ms);
+        timer = remaining > 0
+            ? setTimeout(() => { if (!stopped) arm(remaining); }, wait)
+            : setTimeout(tick, wait);
     };
 
     tick();

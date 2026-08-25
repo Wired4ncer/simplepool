@@ -159,11 +159,16 @@ The **"Deposit to Thunder"** card on `/admin/deposits`:
 
 [payout/audit.js](payout/audit.js) — standalone read-only CLI. For each
 worker over a window:
-`expected_blocks = pool_blocks × (worker_accrued_diff / pool_accrued_diff)`;
+`expected_solutions = pool_solutions × (worker_accrued_diff / pool_accrued_diff)`;
 `z = (expected − actual) / sqrt(expected)`. Flags suspicious when
 `expected ≥ 5` and `z ≥ 3` (~1-in-740 false positives under honest
 Poisson sampling). No schema changes; safe to run while the proxy is
 writing.
+
+Counted from `shares.is_block`, **not** from confirmed blocks. Withholding is
+about what a miner submitted; a solution the node refused or the chain reorged
+out was still submitted. So this number legitimately exceeds the "Blocks
+found" the dashboard reports, which counts only what reached the chain.
 
 ## Locked-in decisions
 
@@ -218,8 +223,15 @@ SELECT COUNT(*) FROM shares s
 -- 4. Solvency. What the pool mined must cover what it owes. The margin
 --    decomposes into the fee plus luck; a negative result means the pool
 --    cannot pay out of what it has earned.
-SELECT (SELECT SUM(reward_sats) + SUM(fee_sats) FROM blocks_found)
-     - (SELECT SUM(credited_sats) FROM shares) AS margin_sats;
+--
+--    CONFIRMED ONLY. A row in blocks_found is a block *candidate*: submitblock
+--    may have refused it, and the chain may have reorged it out. Neither pays
+--    anything, so summing every row credits the pool with revenue that never
+--    existed — on a low-difficulty chain that is almost the whole table, and
+--    it makes this query answer "solvent" no matter what is owed.
+SELECT (SELECT COALESCE(SUM(reward_sats),0) + COALESCE(SUM(fee_sats),0)
+          FROM blocks_found WHERE status = 'confirmed')
+     - (SELECT COALESCE(SUM(credited_sats),0) FROM shares) AS margin_sats;
 ```
 
 The first three must all return **0**. Query 4 should be positive and close
@@ -228,8 +240,24 @@ to `Σ difficulty × gross × fee_bps/10000` once luck is accounted for:
 ```sql
 SELECT ROUND((SELECT SUM(difficulty) FROM shares)
              / (SELECT network_difficulty FROM pool_meta)) AS expected_blocks,
-       (SELECT COUNT(*) FROM blocks_found)                 AS actual_blocks;
+       (SELECT COUNT(*) FROM blocks_found
+         WHERE status = 'confirmed')                       AS actual_blocks;
 ```
+
+A large gap between `expected_blocks` and `actual_blocks` on a chain the pool
+is genuinely hashing is worth chasing before anything else — check how the
+candidates settled:
+
+```sql
+SELECT status, COUNT(*), COALESCE(SUM(reward_sats),0) AS would_have_paid
+FROM   blocks_found GROUP BY status;
+```
+
+`rejected` means the node refused the submission (its reason is in
+`submit_error`); `orphaned` means it was accepted and then reorged out;
+`pending` means nothing has been able to verify it yet, which is a normal
+resting state against a backend that serves only `getblocktemplate` and
+`submitblock`. None of the three earns anything.
 
 Exact equality in (1) is the right test rather than a tolerance: the proxy
 builds without `-ffast-math`, so SQLite reproduces the same IEEE-754 multiply

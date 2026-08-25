@@ -178,6 +178,7 @@ THUNDER_RPC_URL=http://127.0.0.1:6009 \
 THUNDER_FROM_ADDRESS=any \
 PAYOUT_MIN_SATS=10000 \
 PAYOUT_INTERVAL_MS=2000 \
+PAYOUT_SETTLE_INTERVAL_MS=2000 \
 node /Users/rob/projects/simplepool/payout/index.js
 ```
 
@@ -221,6 +222,7 @@ THUNDER_RPC_URL=http://127.0.0.1:16009 \
 THUNDER_FROM_ADDRESS=any \
 PAYOUT_MIN_SATS=10000 \
 PAYOUT_INTERVAL_MS=2000 \
+PAYOUT_SETTLE_INTERVAL_MS=2000 \
 node /Users/rob/projects/simplepool/payout/index.js
 ```
 

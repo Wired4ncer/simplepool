@@ -11,3 +11,10 @@
 # another file containing bitcoind RPC credentials into a PUBLIC repo's
 # working tree, one `git add -A` away from being committed.
 /proxy.conf.bak.*
+# Release tarballs built by scripts/release.sh. They contain a full copy of
+# the tree plus a binary; nothing here belongs in the repo.
+/dist/
+# macOS Finder droppings. They appear in any directory the user has opened,
+# and a `git add -A` sweeps them into a public repo.
+.DS_Store
+**/.DS_Store

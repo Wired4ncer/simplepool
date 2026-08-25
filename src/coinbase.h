@@ -181,6 +181,18 @@ void coinbase_parts_free(coinbase_parts_t *p);
 int coinbase_count_outputs(const char *tx_hex, int *spendable_out,
                            int *op_return_out);
 
+/* The network an address encodes ("main", "regtest", "test/signet",
+ * "test/signet/regtest"), or NULL when it parses as neither bech32 nor
+ * base58check. Coarser than getblockchaininfo's `chain`: several networks
+ * share version bytes and HRPs, and this reports only what the encoding
+ * proves. Useful when the block-template backend cannot be asked. */
+const char *coinbase_address_network(const char *addr);
+
+/* Whether a chain name — from getblockchaininfo or from
+ * coinbase_address_network() — means mainnet. Anything unrecognised counts
+ * as a test chain, so a name we don't know never reads as "main". */
+int coinbase_network_is_mainnet(const char *network);
+
 /* Internal helpers exposed for tests. */
 int coinbase_address_to_script(const char *addr,
                                uint8_t *out, size_t cap, size_t *out_len,

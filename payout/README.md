@@ -36,7 +36,9 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
 | `THUNDER_RPC_URL` | yes | — | Thunder JSON-RPC endpoint, e.g. `http://127.0.0.1:6009` |
 | `THUNDER_FROM_ADDRESS` | yes | — | pool reserve address; must equal the dashboard's `POOL_THUNDER_RESERVE_ADDRESS` |
 | `THUNDER_RPC_USER` / `THUNDER_RPC_PASS` | no | — | basic-auth if your Thunder node has it (default Thunder build has none) |
-| `PAYOUT_INTERVAL_MS` | no | 30000 | how often to scan |
+| `PAYOUT_INTERVAL_MS` | no | 86400000 (24h) | how often a payout run starts — the batch cadence miners see |
+| `PAYOUT_SETTLE_INTERVAL_MS` | no | 30000 | how often an already-broadcast batch is re-checked while it waits for a Thunder block |
+| `PAYOUT_RETRY_INTERVAL_MS` | no | 300000 | how long to wait after a tick that tried and got nowhere (transfer failed / reserve short) |
 | `PAYOUT_MIN_SATS` | no | 10000 | skip workers below this owed balance |
 | `PAYOUT_MAX_PER_TICK` | no | 50 | cap workers paid per scan |
 | `PAYOUT_DRY_RUN` | no | — | `1` = log only |
@@ -63,6 +65,30 @@ queue would drain slower than it fills. The cost is failure isolation: one bad
 address fails the whole batch. That is the right trade — every recipient is an
 address the proxy validated at authorize time, and a failed batch credits
 nobody and strands nobody.
+
+## Three clocks, not one
+
+Payouts run **once a day**. That is `PAYOUT_INTERVAL_MS`, and it is the only
+cadence a miner ever sees: a single batched transaction every 24h paying
+everyone over `PAYOUT_MIN_SATS`.
+
+The daily interval deliberately does not govern what happens to a batch that
+has already gone out, because two of the states a tick can end in are ruined
+by a long wait:
+
+| after a tick that… | next tick in | why |
+| --- | --- | --- |
+| did nothing, or settled a batch cleanly | `PAYOUT_INTERVAL_MS` (24h) | the ordinary daily cadence |
+| broadcast a batch, or is still waiting on one | `PAYOUT_SETTLE_INTERVAL_MS` (30s) | nobody in the batch is credited until a tick sees it in a Thunder block, and the stall-recovery nudge only fires from a tick |
+| failed to broadcast, or found the reserve short | `PAYOUT_RETRY_INTERVAL_MS` (5m) | nothing was sent and nobody was credited — the run did not happen, so it is retried rather than skipped to tomorrow |
+| could not determine a settlement | `PAYOUT_RETRY_INTERVAL_MS` (5m) | terminal until an operator reconciles; re-logging it every 30s for a day buries everything else |
+
+`nextDelayMs()` in [lib/payout.js](lib/payout.js) is the whole decision, and
+[test/cadence.test.js](test/cadence.test.js) pins each row of that table.
+
+To force a run without waiting for the next one, use the dashboard's
+**Trigger payout now** button (or `POST /payout/run` on the worker's admin
+HTTP surface) — restarting the service also ticks immediately.
 
 ## `paid` means mined, not sent
 
@@ -216,13 +242,23 @@ PAYOUT_DB_PATH=../data/shares.db node audit.js --json    # for cron / slack
 ```
 
 For each worker over the window:
-- **expected_blocks** = `pool_blocks * (worker_accrued / pool_accrued)`
-- **actual_blocks**   = blocks they actually found
-- **z**               = `(expected - actual) / sqrt(expected)`
+- **expected_solutions** = `pool_solutions * (worker_accrued / pool_accrued)`
+- **actual_solutions**   = network-target solutions they actually submitted
+- **z**                  = `(expected - actual) / sqrt(expected)`
 
 A worker is flagged `suspicious` when:
-- `expected_blocks >= 5` (below this, randomness dominates), AND
+- `expected_solutions >= 5` (below this, randomness dominates), AND
 - `z >= 3` (≈1-in-740 false-positive rate under honest mining)
+
+**Solutions, not blocks.** These counts come from `shares.is_block` and are
+deliberately *not* filtered to confirmed blocks the way the dashboard's block
+counts are. The question here is whether a miner is quietly discarding the
+submission that solves a block, so what matters is what they submitted — a
+miner whose solution the node refused, or whose block was reorged out, has
+withheld nothing. Filtering on confirmed would flag honest miners on exactly
+the low-difficulty chains where orphans are routine. Expect this number to
+exceed the dashboard's "Blocks found"; both are correct, and they answer
+different questions.
 
 Run on a cron and pipe the `--json` output to your alert sink of choice.
 The audit reads the DB only — safe to run while the proxy is writing.

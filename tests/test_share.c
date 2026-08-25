@@ -205,7 +205,108 @@ static void test_pps_rate(void) {
     CHECK(pps_rate_from_template(subsidy, 111157.0, -1)    == 0.0);
 }
 
+/* A difficulty small enough to overflow the target conversion must saturate,
+ * not produce whatever the compiler felt like.
+ *
+ * DIFF1_TARGET's top 16 bytes are ~7.9e28, so anything below ~2.3e-10 makes
+ * the scaled target exceed 2^128. The old clamp tried to pin it to 2^128 - 1,
+ * a value no double can hold, so the conversion was undefined — and the two
+ * plausible outcomes are opposites: a zero target rejects every share, an
+ * all-ones target accepts every share. UBSan flags the conversion; this pins
+ * the answer. */
+static void test_tiny_difficulty_saturates_the_target(void) {
+    uint8_t target[32];
+    for (double d = 1e-10; d > 1e-300; d /= 1e10) {
+        worker_diff_to_target(d, target);
+        int all_ff = 1, all_00 = 1;
+        for (int i = 0; i < 32; ++i) {
+            if (target[i] != 0xff) all_ff = 0;
+            if (target[i] != 0x00) all_00 = 0;
+        }
+        /* An impossibly small difficulty means an impossibly easy target.
+         * Never the reverse. */
+        CHECK(!all_00);
+        if (d <= 1e-11) CHECK(all_ff);
+    }
+    /* And the ordinary range is untouched. */
+    worker_diff_to_target(1.0, target);
+    CHECK(target[0] == 0x00 && target[4] == 0xff && target[5] == 0xff);
+}
+
+/* The PPS guards, checked against what the production pps pool actually did.
+ *
+ * avonpool ran at 40.15 TH/s — 9,349 difficulty/s — on a forknet that started
+ * at difficulty 1 and retargeted upward. block_value/difficulty priced every
+ * difficulty-1 share at 3.09 BTC, and in under four hours the pool accrued
+ * 15,561,471 BTC of liability against 943.60 BTC it had actually mined. */
+static void test_pps_min_safe_difficulty(void) {
+    /* The boundary is where this pool alone finds one block per interval. */
+    CHECK(fabs(pps_min_safe_difficulty(9349.2676, 600) - 5609560.56) < 1.0);
+    /* No measurement is not a licence to proceed — callers must read 0 as
+     * "unknown", never as "safe". */
+    CHECK(pps_min_safe_difficulty(0.0, 600) == 0.0);
+    CHECK(pps_min_safe_difficulty(-1.0, 600) == 0.0);
+    CHECK(pps_min_safe_difficulty(100.0, 0) == 0.0);
+    /* A chain the pool cannot outrun needs no protection. */
+    CHECK(pps_min_safe_difficulty(9349.0, 600) < 127479855693691.0);
+}
+
+static void test_pps_issuance_ceiling(void) {
+    const int64_t VALUE = 312500000;   /* 3.125 BTC, the forknet subsidy */
+    const int T = 600;
+
+    /* Difficulty 1, and the pool presenting 117 difficulty/s: fair value says
+     * 3.09 BTC a share, the chain can mint 3.125 BTC per 600s. The ceiling
+     * has to bring the rate down by roughly the ratio between them. */
+    double fair = pps_rate_from_template(VALUE, 1.0, 100);
+    double capped = pps_rate_apply_issuance_ceiling(fair, VALUE, 117.0, T);
+    CHECK(fair > 309000000.0);
+    CHECK(capped < fair / 50000.0);
+    /* What the pool would accrue over an hour can no longer exceed what the
+     * chain mints in an hour. */
+    double accrued_per_hour = capped * 117.0 * 3600.0;
+    double issued_per_hour  = (double)VALUE * 3600.0 / (double)T;
+    CHECK(accrued_per_hour <= issued_per_hour * 1.001);
+
+    /* On a properly calibrated chain the ceiling is inert: mainnet difficulty
+     * against the same pool leaves fair value untouched. */
+    double m_fair = pps_rate_from_template(VALUE, 127479855693691.0, 100);
+    CHECK(pps_rate_apply_issuance_ceiling(m_fair, VALUE, 9349.0, T) == m_fair);
+
+    /* With no measurement it cannot judge, so it must not silently clamp to
+     * zero and stop paying honest miners. */
+    CHECK(pps_rate_apply_issuance_ceiling(m_fair, VALUE, 0.0, T) == m_fair);
+    CHECK(pps_rate_apply_issuance_ceiling(m_fair, VALUE, 9349.0, 0) == m_fair);
+    /* Nothing to cap. */
+    CHECK(pps_rate_apply_issuance_ceiling(0.0, VALUE, 117.0, T) == 0.0);
+}
+
+/* The concrete regression: replay the difficulty-1 era through the ceiling and
+ * check the liability lands near what the chain could actually pay. */
+static void test_ceiling_would_have_stopped_the_blowup(void) {
+    const int64_t VALUE = 312500000;
+    const int T = 600;
+    const double SECONDS = 330.0;      /* ~5.5 min at difficulty 1 */
+    const double SHARES  = 38509.0;    /* what the pool submitted */
+    const double dps = SHARES / SECONDS;
+
+    double fair = pps_rate_from_template(VALUE, 1.0, 100);
+    double unguarded_btc = fair * SHARES / 1e8;
+    CHECK(unguarded_btc > 100000.0);   /* the actual outcome: millions */
+
+    double capped = pps_rate_apply_issuance_ceiling(fair, VALUE, dps, T);
+    double guarded_btc = capped * SHARES / 1e8;
+    /* At most what the chain minted in that window, which is 0.55 blocks. */
+    double mintable_btc = (double)VALUE / 1e8 * SECONDS / (double)T;
+    CHECK(guarded_btc <= mintable_btc * 1.001);
+    CHECK(guarded_btc > 0.0);          /* miners still earn something */
+}
+
 int main(void) {
+    test_pps_min_safe_difficulty();
+    test_pps_issuance_ceiling();
+    test_ceiling_would_have_stopped_the_blowup();
+    test_tiny_difficulty_saturates_the_target();
     test_dsha256();
     test_nbits();
     test_worker_diff();

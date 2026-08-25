@@ -1,0 +1,72 @@
+<%# What this pool actually is, on every page.
+
+    None of it is derivable from the stratum URL a miner was handed: the port
+    looks identical whether the coinbase is being built for mainnet or for
+    regtest, whether a block pays the finder or the pool wallet, and whoever
+    the fee goes to. So it is stated, not left to the operator to explain.
+
+    Reads res.locals.pool (stats.poolMeta). Null until the proxy has written
+    pool_meta — a DB restored from an old release, or a proxy that has not
+    restarted since this landed — and the addresses are shown in full rather
+    than truncated, because "verify where the money goes" is the whole point
+    and half an address verifies nothing. %>
+<% const _p = (typeof pool !== 'undefined' && pool) ? pool : null; %>
+<% const _mode = _p && _p.pool_mode ? _p.pool_mode : null; %>
+<% const _net  = _p && _p.network   ? _p.network   : null; %>
+<section class="poolid<%= _net && _net !== 'main' ? ' poolid-test' : '' %>">
+    <% if (!_p || (!_net && !_mode)) { %>
+        <span class="poolid-unknown">
+            pool identity unknown — the proxy has not written it yet.
+            Restart <code>simplepool</code> to publish which network, mode and
+            addresses this pool is running.
+        </span>
+    <% } else { %>
+        <span class="poolid-item">
+            <label>network</label>
+            <% if (_net) { %>
+                <strong><%= _net %></strong>
+                <% if (_p.network_source === 'inferred') { %>
+                    <em class="poolid-note"
+                        title="The block-template backend does not implement getblockchaininfo — the CUSF enforcer serves only getblocktemplate and submitblock — so this was read off the operator address, which cannot tell testnet from signet.">inferred</em>
+                <% } %>
+            <% } else { %>
+                <strong class="poolid-unknown">unknown</strong>
+            <% } %>
+        </span>
+
+        <span class="poolid-item">
+            <label>mode</label>
+            <% if (_mode === 'pps-classic') { %>
+                <strong title="Every accepted share is credited at a fixed rate per unit of difficulty, whether or not it becomes a block. Blocks pay the pool's own BTC wallet."><%= _mode %></strong>
+            <% } else if (_mode) { %>
+                <strong title="Each block's coinbase pays the miner who found it, directly. No share credit accrues between blocks."><%= _mode %></strong>
+            <% } else { %>
+                <strong class="poolid-unknown">unknown</strong>
+            <% } %>
+            <% if (_p.fee_bps) { %>
+                <em class="poolid-note">fee <%= (_p.fee_bps / 100).toFixed(2) %>%</em>
+            <% } %>
+        </span>
+
+        <% if (_p.coinbase_tag) { %>
+        <span class="poolid-item">
+            <label>tag</label>
+            <strong class="mono"><%= _p.coinbase_tag %></strong>
+        </span>
+        <% } %>
+
+        <% if (_p.operator_address) { %>
+        <span class="poolid-item">
+            <label title="Where the <%= (_p.fee_bps || 0) / 100 %>% fee output of every block this pool finds is paid.">operator</label>
+            <strong class="mono poolid-addr"><%= _p.operator_address %></strong>
+        </span>
+        <% } %>
+
+        <% if (_p.pool_btc_address) { %>
+        <span class="poolid-item">
+            <label title="Under pps-classic the net-of-fee block reward is paid here, to the pool's own wallet, and later deposited to Thunder for payout.">pool wallet</label>
+            <strong class="mono poolid-addr"><%= _p.pool_btc_address %></strong>
+        </span>
+        <% } %>
+    <% } %>
+</section>

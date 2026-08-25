@@ -40,6 +40,54 @@ a:hover { text-decoration: underline; }
 .brand { font-weight: 700; font-size: 18px; color: var(--fg); text-decoration: none; }
 .tag { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; }
 
+/* "About the numbers" card. The <h3>/<pre> styling used to be inline style=
+ * attributes on the one hardcoded copy; it moved here when the card became a
+ * partial with three bodies, rather than being repeated three times. */
+.about-h3 { margin-top: 1em; margin-bottom: 0.25em; }
+.about-pre {
+    margin: 0;
+    padding: 0.5em;
+    background: #0002;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 12px;
+}
+.about-note { margin-top: 0.5em; }
+
+/* Pool identity strip — sits between the header and the health banner on
+ * every page. Deliberately quiet: it is reference material a miner reads
+ * once and then ignores, not an alert. The one exception is a non-mainnet
+ * network, which gets a warn-coloured rule, because "why is my payout not
+ * arriving" and "this pool is mining signet" are the same question. */
+.poolid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 20px;
+    align-items: baseline;
+    padding: 7px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    font-size: 12px;
+    color: var(--muted);
+}
+.poolid-test { border-left: 3px solid var(--warn); }
+.poolid-item { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.poolid-item label {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 10px;
+    color: var(--muted);
+    opacity: 0.8;
+}
+.poolid-item strong { color: var(--fg); font-weight: 600; }
+.poolid-note { color: var(--warn); font-style: normal; font-size: 11px; }
+/* Addresses are shown in full — a truncated one cannot be checked against
+ * anything — so they have to be allowed to wrap rather than widen the page. */
+.poolid-addr { font-weight: 400; word-break: break-all; }
+.poolid-unknown { color: var(--warn); }
+.tag-test { color: var(--warn); }
+.top-admin .tag-test { color: #ffe9c0; }
+
 .topnav {
     display: flex;
     gap: 14px;
@@ -136,6 +184,13 @@ table.lb tr.block { background: rgba(77, 138, 77, 0.18); }
 table.lb tr:hover { background: rgba(255, 255, 255, 0.02); }
 
 .muted { color: var(--muted); }
+
+/* Block-candidate verdicts. Only "in chain" is a block the pool was paid for;
+ * orphaned and rejected are ordinary outcomes rather than errors — amber, not
+ * red — but they must never read as successes, and "unverified" stays muted
+ * because it is not a claim either way. */
+.blk-ok  { color: var(--block); }
+.blk-bad { color: var(--warn); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .small { font-size: 12px; }
 

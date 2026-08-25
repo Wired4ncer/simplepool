@@ -201,6 +201,45 @@ typedef struct {
      * into paying miners more than the pool earns, so prefer derived. */
     double pps_sats_per_diff;
 
+    /* Minimum network difficulty at which PPS accrual is allowed to run.
+     *
+     * The PPS rate is block_value / network_difficulty, which is the expected
+     * value of a share — correct only while every share the pool produces has
+     * an independent chance of becoming a block. That holds when difficulty is
+     * calibrated to hashrate. It stops holding when the pool produces
+     * solutions faster than the chain accepts blocks, and then the rate is
+     * overstated by exactly that ratio.
+     *
+     * The threshold is the difficulty at which this pool ALONE would find one
+     * block per block interval:
+     *
+     *     min_difficulty = pool_hashrate * block_interval_sec / 2^32
+     *
+     * A 40 TH/s pool on a 600s chain needs difficulty >= ~5,600,000. Below it,
+     * accrual is refused. That is a floor, not a target: the pool shares the
+     * chain with other miners, so the genuinely safe difficulty is higher.
+     *
+     * 0 disables the check, which is only safe on a chain whose difficulty is
+     * already calibrated — mainnet, testnet, signet. On a young forknet during
+     * its difficulty ramp, leaving this at 0 is how a pool accrues millions of
+     * BTC of liability in minutes. The proxy logs the value it observes to be
+     * necessary, so a wrong setting is visible rather than silent. */
+    double pps_min_network_difficulty;
+
+    /* Target seconds between blocks on this chain — 600 for Bitcoin and every
+     * chain derived from it. Used for the difficulty floor above and for the
+     * issuance ceiling, which caps accrual at what the chain can actually mint
+     * (one block_value per interval, across all miners on earth). */
+    int block_interval_sec;
+
+    /* Refuse mining.authorize while accrual is gated off by the floor.
+     *
+     * Default on, and deliberately so: a miner whose shares are accepted but
+     * not credited is working for free without being told. Turning it off
+     * accepts shares that earn nothing, which is only reasonable if the miners
+     * are yours and you know why. */
+    int pps_refuse_shares_below_min;
+
     /* logging */
     int  log_level;            /* 0..3 */
 } proxy_config_t;

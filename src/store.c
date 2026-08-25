@@ -86,9 +86,25 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  finder_id       INTEGER REFERENCES workers(id),"
     "  finder_address  TEXT,"
     "  reward_sats     INTEGER,"
-    "  fee_sats        INTEGER"
+    "  fee_sats        INTEGER,"
+    /* A row is a *candidate* until something says otherwise. Only
+     * status='confirmed' means "this pool mined a block that is in the
+     * chain" — every count and every solvency sum must filter on it.
+     * 'rejected' is a candidate submitblock refused; 'orphaned' one that
+     * was accepted and later reorged out; 'pending' one nothing has
+     * verified yet, which under a backend that answers only
+     * getblocktemplate/submitblock is a normal steady state, not a
+     * transient. Pending is never revenue.
+     * checked_via records who answered: 'node' (getblockhash) or 'tips'
+     * (the observed chain of getblocktemplate prev_hashes), the same
+     * distinction pool_meta.network_source draws. */
+    "  status          TEXT NOT NULL DEFAULT 'pending',"
+    "  confirmations   INTEGER NOT NULL DEFAULT 0,"
+    "  submit_error    TEXT,"
+    "  checked_via     TEXT"
     ");"
     "CREATE INDEX IF NOT EXISTS blocks_found_ts_idx ON blocks_found(ts);"
+    "CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status);"
     /* Single-row mirror of the upstream bitcoind tip. Updated on every
      * tip-watcher poll. The dashboard reads this for 'latest block' /
      * 'time since last block' without needing any RPC of its own. */
@@ -112,6 +128,20 @@ static const char *SCHEMA_SQL_PARTS[] = {
      * override can differ from the configured fee_bps. */
     "CREATE TABLE IF NOT EXISTS pool_meta ("
     "  id                  INTEGER PRIMARY KEY CHECK (id = 1),"
+    /* Pool identity. Config, not measurement, so it is written once at
+     * startup rather than on the template path. It lives here because the
+     * dashboard has no other honest source for it: a miner pointed at the
+     * stratum port cannot see which chain the coinbase is built for, whose
+     * tag is in it, or where the money goes, and a second copy in the
+     * dashboard's own environment is exactly the drift this table exists
+     * to prevent. network_source records whether getblockchaininfo
+     * answered ('node') or the network was read off the operator address
+     * ('inferred'), which cannot tell testnet from signet. */
+    "  network             TEXT,"
+    "  network_source      TEXT,"    /* 'node' | 'inferred' */
+    "  coinbase_tag        TEXT,"
+    "  operator_address    TEXT,"    /* fee_bps recipient */
+    "  pool_btc_address    TEXT,"    /* pps-classic only; NULL in solo */
     "  pool_mode           TEXT,"
     "  fee_bps             INTEGER,"
     "  rate_source         TEXT,"
@@ -311,6 +341,32 @@ static const char *MIGRATIONS_SQL[] = {
     "  last_settled_ts INTEGER"
     ")",
     "CREATE INDEX IF NOT EXISTS prop_ledger_ts_idx ON prop_ledger(last_settled_ts)",
+    /* Pool identity. An upgraded DB has these NULL until the proxy restarts
+     * and writes them, which is why the dashboard renders "unknown" rather
+     * than guessing — a banner that asserts the wrong network is worse than
+     * one that admits it doesn't know yet. */
+    "ALTER TABLE pool_meta    ADD COLUMN network          TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN network_source   TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN coinbase_tag     TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN operator_address TEXT",
+    "ALTER TABLE pool_meta    ADD COLUMN pool_btc_address TEXT",
+    /* Block accounting. Every pre-existing row becomes 'pending' — which
+     * counts as nothing — rather than being assumed good: the rows were
+     * written unconditionally, including for candidates submitblock had
+     * already refused, so trusting them is what disabled the solvency
+     * guard in the first place. A reconciliation pass classifies them.
+     *
+     * The UNIQUE index on hash is deliberately NOT here. It fails outright
+     * on a table that already holds duplicate hashes, and the runner below
+     * only special-cases "duplicate column" — every other error is a
+     * warning and carry on, so putting it here would leave the index
+     * silently absent on exactly the databases that needed it. It belongs
+     * after the dedupe, in the reconciliation pass. */
+    "ALTER TABLE blocks_found ADD COLUMN status        TEXT NOT NULL DEFAULT 'pending'",
+    "ALTER TABLE blocks_found ADD COLUMN confirmations INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE blocks_found ADD COLUMN submit_error  TEXT",
+    "ALTER TABLE blocks_found ADD COLUMN checked_via   TEXT",
+    "CREATE INDEX IF NOT EXISTS blocks_found_status_idx ON blocks_found(status)",
 };
 
 /* Retries for one batch. busy_timeout (5s) bounds each attempt, so the worst
@@ -339,6 +395,7 @@ typedef struct {
     int      height;
     int64_t  reward_sats;       /* EV_BLOCK only */
     int64_t  fee_sats;          /* EV_BLOCK only */
+    uint8_t  block_status;      /* EV_BLOCK only: STORE_BLOCK_* */
     int64_t  delta_sats;        /* EV_CREDIT only */
     double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
     char     worker_name[WORKER_NAME_MAX];
@@ -583,9 +640,22 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_int64(s->st_insert_block, 7, ev->fee_sats);
         else
             sqlite3_bind_null(s->st_insert_block, 7);
+        sqlite3_bind_text(s->st_insert_block, 8,
+                          store_block_status_text(ev->block_status), -1,
+                          SQLITE_STATIC);
+        if (ev->reason[0])
+            sqlite3_bind_text(s->st_insert_block, 9, ev->reason, -1,
+                              SQLITE_TRANSIENT);
+        else
+            sqlite3_bind_null(s->st_insert_block, 9);
         if (sqlite3_step(s->st_insert_block) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
-        } else {
+        } else if (sqlite3_changes(s->db) > 0 &&
+                   ev->block_status != STORE_BLOCK_REJECTED) {
+            /* Candidates submitblock refused are recorded but not counted:
+             * the whole point of this column is that they are not blocks.
+             * An OR IGNORE that changed nothing is a duplicate hash, which
+             * is not a new block either. */
             atomic_fetch_add(&s->blocks_committed, 1);
         }
         sqlite3_reset(s->st_insert_block);
@@ -807,10 +877,16 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "VALUES (?, ?, ?, ?, ?, ?, ?)";
     static const char *Q_INS_REJECT =
         "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
+    /* OR IGNORE so a re-found hash cannot fail the step. The dedupe guard
+     * in stratum is an in-memory ring that empties on restart, so the same
+     * solution can legitimately arrive twice; once the unique index exists
+     * that would otherwise land in pg_errors and vanish. sqlite3_changes()
+     * below tells a real insert from an ignored duplicate. */
     static const char *Q_INS_BLOCK =
-        "INSERT INTO blocks_found "
-        "  (ts, height, hash, finder_id, finder_address, reward_sats, fee_sats) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)";
+        "INSERT OR IGNORE INTO blocks_found "
+        "  (ts, height, hash, finder_id, finder_address, reward_sats, fee_sats,"
+        "   status, submit_error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
     /* Single-row upsert keyed on id=1. tip_observed_at is only set when
      * the tip actually changes (height or hash differ from the stored
      * row), so 'time since last tip change' stays meaningful across
@@ -947,12 +1023,231 @@ int store_record_reject(store_t *s, const char *worker_name,
     return 0;
 }
 
+const char *store_block_status_text(int status) {
+    switch (status) {
+    case STORE_BLOCK_CONFIRMED: return "confirmed";
+    case STORE_BLOCK_ORPHANED:  return "orphaned";
+    case STORE_BLOCK_REJECTED:  return "rejected";
+    default:                    return "pending";
+    }
+}
+
+int store_list_unresolved_blocks(store_t *s, int tip_height, int final_depth,
+                                 store_block_candidate_t *out, size_t cap)
+{
+    if (!s || !out || cap == 0) return -1;
+    /* Deliberately narrower than the templates pass: only pending and
+     * confirmed rows, and only while shallow. Re-checking every orphan over
+     * RPC forever would be one call per settled row per tick — on a
+     * low-difficulty chain that is the whole table. Restoring an orphan after
+     * a second reorg is left to the templates pass, which does it in bulk SQL
+     * for nothing. */
+    static const char *Q =
+        "SELECT hash, height FROM blocks_found "
+        " WHERE status IN ('pending','confirmed') "
+        "   AND confirmations < ? "
+        "   AND height <= ? "
+        " ORDER BY height DESC, id DESC LIMIT ?";
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_int(st, 1, final_depth);
+    sqlite3_bind_int(st, 2, tip_height);
+    sqlite3_bind_int(st, 3, (int)cap);
+    while (n < (int)cap && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *h = sqlite3_column_text(st, 0);
+        if (!h) continue;
+        snprintf(out[n].hash, sizeof(out[n].hash), "%s", (const char *)h);
+        out[n].height = sqlite3_column_int(st, 1);
+        n++;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    return n;
+}
+
+int store_set_block_status(store_t *s, const char *hash, int status,
+                           int confirmations, const char *checked_via)
+{
+    if (!s || !hash) return -1;
+    static const char *Q =
+        "UPDATE blocks_found SET status = ?, confirmations = ?, checked_via = ? "
+        " WHERE hash = ?";
+    sqlite3_stmt *st = NULL;
+    pthread_mutex_lock(&s->node_tip_mu);
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->node_tip_mu);
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    sqlite3_bind_text(st, 1, store_block_status_text(status), -1, SQLITE_STATIC);
+    sqlite3_bind_int (st, 2, confirmations < 0 ? 0 : confirmations);
+    if (checked_via)
+        sqlite3_bind_text(st, 3, checked_via, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(st, 3);
+    sqlite3_bind_text(st, 4, hash, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+/* Count rows in one status. Caller holds node_tip_mu. */
+static int count_blocks_with_status(store_t *s, const char *status) {
+    static const char *Q = "SELECT COUNT(*) FROM blocks_found WHERE status = ?";
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, status, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+int store_reconcile_blocks_from_templates(store_t *s, int tip_height,
+                                          int *confirmed, int *orphaned,
+                                          int *pending)
+{
+    if (!s) return -1;
+    /* Compare against the LATEST observation at height+1, not merely any of
+     * them. After a reorg both the winning and the losing prev_hash have been
+     * seen at that height, so "a template exists whose prev_hash is ours" would
+     * keep calling a reorged-out block confirmed forever. The newest row is
+     * what the node believes now.
+     *
+     * Every non-rejected status is in the WHERE, so the pass is idempotent and
+     * symmetric: a confirmed block is demoted when it is reorged out — losing
+     * the chain has to take the reward back, not merely fail to grant it — and
+     * an orphan is promoted again if a later reorg restores it. Only 'rejected'
+     * is terminal: the node never accepted that candidate, so no amount of
+     * reorganising can put it in the chain. */
+    static const char *Q_RESOLVE =
+        "WITH tip_at AS ("
+        "  SELECT b.id AS bid,"
+        "         (SELECT t.prev_hash FROM templates t"
+        "           WHERE t.height = b.height + 1"
+        "           ORDER BY t.id DESC LIMIT 1) AS observed"
+        "    FROM blocks_found b"
+        "   WHERE b.status <> 'rejected'"
+        ") "
+        "UPDATE blocks_found SET"
+        "  status = CASE WHEN (SELECT observed FROM tip_at WHERE bid = blocks_found.id)"
+        "                     = blocks_found.hash THEN 'confirmed' ELSE 'orphaned' END,"
+        "  checked_via = 'tips',"
+        "  confirmations = CASE WHEN (SELECT observed FROM tip_at WHERE bid = blocks_found.id)"
+        "                            = blocks_found.hash"
+        "                       THEN MAX(0, ? - blocks_found.height + 1) ELSE 0 END "
+        " WHERE status <> 'rejected'"
+        "   AND (SELECT observed FROM tip_at WHERE bid = blocks_found.id) IS NOT NULL";
+
+    /* A height at or above the tip cannot be a block in the chain, and a
+     * height of 0 was never valid. Neither is verifiable, and leaving them
+     * pending would leave junk looking merely unverified. */
+    static const char *Q_IMPOSSIBLE =
+        "UPDATE blocks_found SET status = 'orphaned', confirmations = 0,"
+        "       checked_via = 'tips' "
+        " WHERE status <> 'rejected' AND (height <= 0 OR height > ?)";
+
+    pthread_mutex_lock(&s->node_tip_mu);
+    char *err = NULL;
+    sqlite3_stmt *st = NULL;
+    int rc = 0;
+    if (sqlite3_prepare_v2(s->db, Q_RESOLVE, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, tip_height);
+        if (sqlite3_step(st) != SQLITE_DONE) rc = -2;
+        sqlite3_finalize(st);
+    } else {
+        rc = -2;
+    }
+    st = NULL;
+    if (tip_height > 0 &&
+        sqlite3_prepare_v2(s->db, Q_IMPOSSIBLE, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, tip_height);
+        if (sqlite3_step(st) != SQLITE_DONE) rc = -2;
+        sqlite3_finalize(st);
+    }
+    sqlite3_free(err);
+    if (confirmed) *confirmed = count_blocks_with_status(s, "confirmed");
+    if (orphaned)  *orphaned  = count_blocks_with_status(s, "orphaned");
+    if (pending)   *pending   = count_blocks_with_status(s, "pending");
+    pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != 0) atomic_fetch_add(&s->pg_errors, 1);
+    return rc;
+}
+
+int store_finalize_block_hash_index(store_t *s) {
+    if (!s) return -1;
+    /* Carry any resolved verdict onto the row that will survive, so collapsing
+     * duplicates cannot lose a confirmation. */
+    static const char *Q_PROMOTE =
+        "UPDATE blocks_found SET status = ("
+        "  SELECT b2.status FROM blocks_found b2"
+        "   WHERE b2.hash = blocks_found.hash AND b2.status <> 'pending'"
+        "   ORDER BY b2.id LIMIT 1) "
+        " WHERE status = 'pending' AND EXISTS ("
+        "  SELECT 1 FROM blocks_found b3"
+        "   WHERE b3.hash = blocks_found.hash AND b3.status <> 'pending')";
+    /* Keep the earliest sighting of each hash — that is when the pool
+     * actually found it. Competing candidates at one height have DIFFERENT
+     * hashes and are all kept: several rows per height is expected on a
+     * low-difficulty chain, and status is what stops them counting. */
+    static const char *Q_DEDUPE =
+        "DELETE FROM blocks_found WHERE id NOT IN ("
+        "  SELECT MIN(id) FROM blocks_found GROUP BY hash)";
+    static const char *Q_INDEX =
+        "CREATE UNIQUE INDEX IF NOT EXISTS blocks_found_hash_idx "
+        "  ON blocks_found(hash)";
+
+    pthread_mutex_lock(&s->node_tip_mu);
+    int rc = 0;
+    char *err = NULL;
+    if (sqlite3_exec(s->db, Q_PROMOTE, NULL, NULL, &err) != SQLITE_OK) {
+        LOG_WARN("store: block hash promote failed: %s", err ? err : "?");
+        rc = -2;
+    }
+    sqlite3_free(err); err = NULL;
+    if (sqlite3_exec(s->db, Q_DEDUPE, NULL, NULL, &err) != SQLITE_OK) {
+        LOG_WARN("store: block hash dedupe failed: %s", err ? err : "?");
+        rc = -2;
+    }
+    sqlite3_free(err); err = NULL;
+    if (sqlite3_exec(s->db, Q_INDEX, NULL, NULL, &err) != SQLITE_OK) {
+        /* Loud: a missing unique index is exactly the silent failure this
+         * function exists to avoid. */
+        LOG_ERROR("store: blocks_found unique hash index NOT created: %s",
+                  err ? err : "?");
+        rc = -2;
+    }
+    sqlite3_free(err);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    return rc;
+}
+
 int store_record_block(store_t *s, uint64_t ts_ms, int height,
                        const char *hash, const char *finder_name,
                        const char *finder_address,
-                       int64_t reward_sats, int64_t fee_sats)
+                       int64_t reward_sats, int64_t fee_sats,
+                       int status, const char *submit_error)
 {
     if (!s || !hash) return -1;
+    /* A coinbase height of zero is never valid. bitcoind_parse_template
+     * already refuses a template without a numeric height, so reaching here
+     * with 0 means the template was not parsed — record nothing and say so
+     * rather than filing a block at a height that cannot exist. */
+    if (height <= 0) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -1;
+    }
     event_t ev;
     memset(&ev, 0, sizeof(ev));
     ev.kind = EV_BLOCK;
@@ -960,6 +1255,9 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
     ev.height = height;
     ev.reward_sats = reward_sats;
     ev.fee_sats = fee_sats;
+    ev.block_status = (uint8_t)status;
+    if (submit_error)
+        strncpy(ev.reason, submit_error, REASON_MAX - 1);
     strncpy(ev.hash, hash, HASH_STR_MAX - 1);
     if (finder_name) strncpy(ev.worker_name, finder_name, WORKER_NAME_MAX - 1);
     if (finder_address)
@@ -1030,6 +1328,58 @@ int store_record_node_tip(store_t *s, int height, const char *hash,
     int rc = sqlite3_step(s->st_upsert_node_tip);
     sqlite3_reset(s->st_upsert_node_tip);
     pthread_mutex_unlock(&s->node_tip_mu);
+    if (rc != SQLITE_DONE) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    return 0;
+}
+
+int store_record_pool_identity(store_t *s, const char *network,
+                               const char *network_source,
+                               const char *coinbase_tag,
+                               const char *operator_address,
+                               const char *pool_btc_address)
+{
+    if (!s) return -1;
+    /* Upserts the same id=1 row as store_record_pool_meta(), but only the
+     * identity columns — the two never write each other's fields, so
+     * whichever runs first is harmless. Notably this does NOT touch
+     * updated_at: that timestamp means "when the rate was last refreshed",
+     * and identity is written once at startup, so stamping it here would
+     * make a stalled template path look alive.
+     *
+     * pool_btc_address is stored as NULL rather than "" in solo mode, so a
+     * reader can tell "not applicable in this mode" from "configured
+     * blank". */
+    static const char *Q =
+        "INSERT INTO pool_meta (id, network, network_source, coinbase_tag,"
+        "  operator_address, pool_btc_address) "
+        "VALUES (1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "  network = excluded.network,"
+        "  network_source = excluded.network_source,"
+        "  coinbase_tag = excluded.coinbase_tag,"
+        "  operator_address = excluded.operator_address,"
+        "  pool_btc_address = excluded.pool_btc_address";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        atomic_fetch_add(&s->pg_errors, 1);
+        return -2;
+    }
+    pthread_mutex_lock(&s->node_tip_mu);
+    sqlite3_bind_text(st, 1, network          ? network          : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, network_source   ? network_source   : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, coinbase_tag     ? coinbase_tag     : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, operator_address ? operator_address : "", -1, SQLITE_TRANSIENT);
+    if (pool_btc_address && pool_btc_address[0]) {
+        sqlite3_bind_text(st, 5, pool_btc_address, -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(st, 5);
+    }
+    int rc = sqlite3_step(st);
+    pthread_mutex_unlock(&s->node_tip_mu);
+    sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         atomic_fetch_add(&s->pg_errors, 1);
         return -2;

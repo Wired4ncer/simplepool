@@ -1,0 +1,173 @@
+# Cut a simplepool release: build the binary for each supported architecture,
+# wrap it in a tarball, and publish the lot as a GitHub Release.
+#
+# The tarball is what `scripts/install.sh --from-release` downloads, so this
+# workflow is the thing standing behind the one-line install. It is also the
+# only place the published artifacts are produced — a maintainer never uploads
+# a hand-built binary, because a hand-built binary has no attested link back
+# to a commit.
+#
+# Trigger:
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag must match VERSION in the Makefile. That is checked, not assumed:
+# the version is compiled into the binary and reported by `--version`, so a
+# mismatch would ship a release whose own binary disagrees with its name.
+#
+# workflow_dispatch builds the tarballs and uploads them as workflow
+# artifacts without creating a Release — a dry run of the whole path.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Same guard as the other workflows: releases are cut from the canonical
+    # org repo, so a personal fork doesn't spend Actions minutes or publish
+    # artifacts under its own name.
+    if: github.repository_owner == 'LayerTwo-Labs'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 sets the glibc floor at 2.35, so the binary also runs on
+          # 24.04 and on Debian 12. Building on the newest runner instead
+          # would silently exclude every older box.
+          - runner: ubuntu-22.04
+            arch: amd64
+          # Free ARM runners are available to public repositories. If this
+          # label is ever unavailable, delete this entry — fail-fast is off,
+          # so the amd64 release still goes out.
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # release.sh runs `git archive HEAD` and records the commit, so it
+          # needs real history rather than a detached blob.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        timeout-minutes: 5
+        # No `apt-get update` — see .github/scripts/apt-install.sh for why.
+        run: >
+          .github/scripts/apt-install.sh
+          build-essential
+          libsqlite3-dev
+          libcurl4-openssl-dev
+          libhiredis-dev
+
+      - name: Check the tag matches the Makefile VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          makefile_version="$(sed -n 's/^VERSION[[:space:]]*:=[[:space:]]*//p' Makefile | head -1)"
+          if [ "$tag" != "$makefile_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Makefile VERSION=$makefile_version." \
+                 "The version is compiled into the binary, so releasing this would ship" \
+                 "artifacts whose own --version disagrees with the release name." \
+                 "Bump VERSION in the Makefile (in a PR), then re-tag."
+            exit 1
+          fi
+
+      - name: Build tarball
+        run: scripts/release.sh --arch ${{ matrix.arch }} --out dist
+
+      - name: Smoke-test the tarball
+        # A tarball that doesn't unpack into a runnable binary is worse than
+        # no release at all, because the failure lands on an operator running
+        # a one-liner on a fresh box.
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tar -xzf dist/*.tar.gz -C "$work"
+          root="$(find "$work" -maxdepth 1 -mindepth 1 -type d)"
+          test -f "$root/RELEASE"
+          test -f "$root/schema.sql"
+          test -f "$root/scripts/install.sh"
+          test -x "$root/scripts/simplepoolctl"
+          test -f "$root/deploy/systemd/simplepool.service"
+          test -d "$root/dashboard" && test -d "$root/payout"
+          # Only meaningful on the native runner; an arm64 binary cannot be
+          # executed on an amd64 host and vice versa.
+          "$root/build/simplepool" --version
+          cat "$root/RELEASE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simplepool-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # `always()` so a single architecture failing to build still lets the
+    # other one ship, rather than losing the release entirely.
+    if: always() && startsWith(github.ref, 'refs/tags/v') && github.repository_owner == 'LayerTwo-Labs'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: simplepool-*
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          cd staging
+          ls -la
+          # At least one architecture must have made it through.
+          ls *.tar.gz >/dev/null
+          # One SHA256SUMS covering every tarball, so an operator can verify a
+          # download with a single file regardless of which arch they took.
+          cat *.tar.gz.sha256 > SHA256SUMS
+          rm -f *.tar.gz.sha256
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/scripts/install.sh | sudo bash"
+            echo '```'
+            echo
+            echo "The installer downloads the tarball below, verifies it against \`SHA256SUMS\`,"
+            echo "and interviews you for the rest. See [INSTALL.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/INSTALL.md)."
+            echo
+            echo "## Verify a download by hand"
+            echo
+            echo '```sh'
+            echo "sha256sum -c --ignore-missing SHA256SUMS"
+            echo '```'
+            echo
+            echo "Binaries are built on Ubuntu 22.04 (glibc 2.35), so they also run on"
+            echo "Ubuntu 24.04 and Debian 12. Each tarball carries a \`RELEASE\` file and a"
+            echo "\`build/simplepool.build.json\` pinning the binary to this commit by sha256."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --title "simplepool $version" \
+            --notes-file notes.md \
+            staging/*
