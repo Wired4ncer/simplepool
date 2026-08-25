@@ -341,13 +341,25 @@ struct stratum_conn {
     double   pol_initial_diff;
     double   pol_vardiff_min;
     double   pol_vardiff_max;
-    /* The floor this port *promises*, as distinct from pol_vardiff_min, which
-     * merely bounds the rate loop. Only a listener that spelled out min_diff
-     * sets it, and unlike every other floor it survives the network-difficulty
-     * ceiling: a marketplace measures the difficulty on the wire and cancels
-     * an order that arrives under what the port advertised. See
-     * clamp_assigned_difficulty. */
-    double   pol_min_diff;
+    /* ⛔ NO pol_min_diff. Upstream carries a per-listener floor that outranks
+     * the network-difficulty ceiling, so a port keeps the difficulty it
+     * advertised to a marketplace even when the chain is easier. We take the
+     * field in the config (for parity) and deliberately do NOT honour it.
+     *
+     * The reason is arithmetic, not caution. If the share target D exceeds the
+     * network target N, every share that arrives IS a block — but shares arrive
+     * at H/(D·2^32) instead of H/(N·2^32), because the miner discards anything
+     * above the stratum target locally and never submits it. Block discovery
+     * falls by exactly N/D. On a chain whose difficulty is briefly in the
+     * thousands — a minimum-difficulty window after a fork, which is precisely
+     * when this pool most wants to be mining — a rental port pinned at 500,000
+     * would throw away blocks by two or three orders of magnitude.
+     *
+     * The marketplace risk the promise avoids is real but bounded: an order
+     * cannot be served until the chain ramps back up, which we say plainly.
+     * Trading certain block loss for that is the wrong direction, and it is
+     * worst in the window that matters most. The network clamp stays
+     * authoritative. See conn_vardiff_min for the floor we DO honour. */
     int      pol_port;
     char     pol_label[32];
 
@@ -972,6 +984,23 @@ static uint64_t diff_grace_ms(const stratum_server_t *s) {
  * because handle_submit keeps accepting shares at the old difficulty for
  * a grace period (diff_grace_ms). */
 /* CALLER MUST HOLD c->state_lock. */
+/* The vardiff bounds IN FORCE FOR THIS CONNECTION.
+ *
+ * ⛔ Under the old two-server model the rental port had its own stratum_cfg_t,
+ * so `s->cfg.vardiff_min` WAS the rental floor for a rental connection. With
+ * one server serving every port there is a single cfg, and reading it directly
+ * silently drops the per-port policy: a rental miner would start at 500,000 and
+ * then be dragged by vardiff down to the home-miner floor — which is exactly
+ * the invalid-share ramp a marketplace cancels an order for. Every bound check
+ * must go through here. */
+static double conn_vardiff_min(const stratum_server_t *s, const stratum_conn_t *c) {
+    return (c && c->pol_vardiff_min > 0.0) ? c->pol_vardiff_min : s->cfg.vardiff_min;
+}
+
+static double conn_vardiff_max(const stratum_server_t *s, const stratum_conn_t *c) {
+    return (c && c->pol_vardiff_max > 0.0) ? c->pol_vardiff_max : s->cfg.vardiff_max;
+}
+
 static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
                                    uint64_t now,
                                    char **buf, size_t *len)
@@ -1082,8 +1111,9 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     }
 
     if (new_diff != old_diff) {
-        if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
-        if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
+        double vd_min = conn_vardiff_min(s, c), vd_max = conn_vardiff_max(s, c);
+        if (new_diff < vd_min) new_diff = vd_min;
+        if (new_diff > vd_max) new_diff = vd_max;
         /* A miner-requested difficulty is a floor: vardiff may raise this
          * connection above it, never below. Without this the request lasts
          * exactly one window — vardiff sees a rate under target (which is
@@ -1512,12 +1542,13 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
          * initial_diff sits below its vardiff_min is a valid configuration
          * (it starts easy and lets the first retarget lift it), and the
          * rental port sets initial_diff to the floor explicitly anyway. */
-        if (hint > 0.0 && s->cfg.vardiff_min > 0.0 &&
-            hint < s->cfg.vardiff_min) {
+        double hint_floor = conn_vardiff_min(s, c);
+        if (hint > 0.0 && hint_floor > 0.0 &&
+            hint < hint_floor) {
             LOG_INFO("stratum: %s hint %.0f is below the vardiff floor %.0f — "
                      "starting at the floor",
-                     c->worker_name, hint, s->cfg.vardiff_min);
-            hint = s->cfg.vardiff_min;
+                     c->worker_name, hint, hint_floor);
+            hint = hint_floor;
         }
     }
     /* From here to the initial notify we are mutating the same fields the tip
@@ -1567,7 +1598,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * field, attributing a share to a port is guesswork. */
     LOG_INFO("stratum: authorized '%s' from %s (fd=%d, port=%d) at difficulty %.0f",
              c->worker_name, c->peer_ip[0] ? c->peer_ip : "?", c->fd,
-             s->cfg.bind_port, c->difficulty);
+             c->pol_port > 0 ? c->pol_port : s->cfg.bind_port, c->difficulty);
     /* Then push initial set_difficulty + notify (renders this conn's
      * coinbase against the current job using its payout address). */
     send_set_difficulty(buf, len, c->difficulty);
@@ -2530,7 +2561,6 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->initial_diff > 0.0) c->pol_initial_diff = pol->initial_diff;
     if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
-    c->pol_min_diff = pol->min_diff;   /* 0 unless the port promised one */
     c->pol_port = pol->port;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so

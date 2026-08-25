@@ -2289,6 +2289,76 @@ static void test_hint_below_vardiff_min_is_floored(void) {
     printf("ok: a hint below vardiff_min is raised to the floor\n");
 }
 
+/* ⛔ THE REGRESSION THE ARCHITECTURE SWAP INTRODUCED, and the test that would
+ * have caught it.
+ *
+ * Under the old two-server model the rental port had its OWN stratum_cfg_t, so
+ * s->cfg.vardiff_min *was* the rental floor for a rental connection. One server
+ * serving every port means a single cfg, and every bound check that reads it
+ * directly silently drops the per-port policy.
+ *
+ * Driven through the replayed-difficulty hint, which is where a returning
+ * worker's floor is decided and which needs no mining to exercise. The server-
+ * wide floor here is 1 — a home-miner port — and the hint replays 7. If the
+ * per-listener floor is honoured the miner is seeded at 500,000; if the code
+ * reads s->cfg.vardiff_min instead, it is seeded at 7 and a rented fleet
+ * starts three orders of magnitude under what the port advertised.
+ *
+ * ⚠️ The network target is deliberately HIGH (~16.7M). The network clamp wins
+ * over every floor, so an easy target would pull the result back under the
+ * floor and report the clamp's work as the floor's.
+ * → feedback_tests-that-pass-for-the-wrong-reason */
+static void test_listener_floor_beats_the_server_wide_floor(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1.0,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 1.0,        /* the HOME-miner floor */
+                           .vardiff_max = 1e12,
+                           .vardiff_window_sec = 30,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_difficulty_hint = hint_low,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+
+    uint8_t net[32] = {0};
+    net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(c != NULL);
+    if (!c) { stratum_server_free(s); return; }
+
+    /* The miner arrived on the rental port. */
+    stratum_listener_t rental = { .port = 3335, .initial_diff = 500000.0,
+                                  .vardiff_min = 500000.0, .vardiff_max = 1e12 };
+    snprintf(rental.label, sizeof rental.label, "rental");
+    stratum_conn_apply_listener_for_test(c, &rental);
+
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+
+    CHECK(out != NULL);
+    /* The PORT's floor, not the server-wide 1 and not the hint's 7. */
+    CHECK(out && strstr(out, "\"params\":[500000]") != NULL);
+    CHECK(out && strstr(out, "\"params\":[7]") == NULL);
+    CHECK(out && strstr(out, "\"params\":[1]") == NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    if (g_fail == 0) printf("ok: a listener's floor outranks the server-wide floor\n");
+}
+
+
 /* ...but the floor is deliberately NOT applied to initial_diff. A server
  * whose initial_diff sits below its vardiff_min is a valid configuration —
  * it starts easy and lets the first retarget lift it — and that is what
@@ -2960,6 +3030,7 @@ int main(void) {
     test_proportional_falls_back_without_window();
     test_extranonce1_is_one_sequence_per_server();
     test_listener_policy_reaches_the_connection();
+    test_listener_floor_beats_the_server_wide_floor();
     test_hint_below_vardiff_min_is_floored();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();

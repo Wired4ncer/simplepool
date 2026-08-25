@@ -1492,20 +1492,19 @@ int main(int argc, char **argv) {
          * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
          * so this needs no escaping.
          *
-         * promised_min_diff is published alongside min_diff because the two
-         * now behave differently and a consumer has to tell them apart:
-         * min_diff is the rate-loop bound, which the network difficulty still
-         * overrides, while promised_min_diff is kept even when the chain is
-         * easier. A port over the chain on the first is quietly served less
-         * than it asked for; a port over the chain on the second gets what it
-         * asked for and discards blocks paying for it. Opposite findings,
-         * opposite advice. listen_port never promises one. */
+         * ⛔ promised_min_diff is NOT published. Upstream emits it because its
+         * listener floor outranks the network-difficulty clamp; ours does not
+         * (see stratum.c, where pol_min_diff deliberately does not exist), so
+         * publishing the field would describe a promise nothing enforces. A
+         * consumer would tell an operator the rental port holds 500,000 above
+         * the chain when it does not. min_diff — the floor actually served,
+         * network clamp and all — is the honest number and the only one here. */
         char lj[4096];
         size_t lo = 0;
         int dropped = 0;
         lo += (size_t)snprintf(lj + lo, sizeof lj - lo,
-                               "[{\"port\":%d,\"label\":\"\",\"min_diff\":%.10g,"
-                               "\"promised_min_diff\":0,\"initial_diff\":%.10g}",
+                               "[{\"port\":%d,\"label\":\"\","
+                               "\"min_diff\":%.10g,\"initial_diff\":%.10g}",
                                cfg.listen_port, cfg.vardiff_min,
                                cfg.initial_diff);
         for (int i = 0; i < cfg.listener_count; ++i) {
@@ -1513,11 +1512,9 @@ int main(int argc, char **argv) {
             char one[256];
             int n = snprintf(one, sizeof one,
                              ",{\"port\":%d,\"label\":\"%s\","
-                             "\"min_diff\":%.10g,\"promised_min_diff\":%.10g,"
-                             "\"initial_diff\":%.10g}",
+                             "\"min_diff\":%.10g,\"initial_diff\":%.10g}",
                              l->port, l->label,
                              l->vardiff_min > 0 ? l->vardiff_min : cfg.vardiff_min,
-                             l->min_diff,
                              l->initial_diff > 0 ? l->initial_diff : cfg.initial_diff);
             if (n < 0 || lo + (size_t)n >= sizeof lj - 2) { dropped++; continue; }
             memcpy(lj + lo, one, (size_t)n);
