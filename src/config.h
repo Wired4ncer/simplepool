@@ -36,6 +36,17 @@ typedef struct {
      * genuinely over-difficult connection still ratchets down. */
     int    vardiff_min_samples;   /* default 20 */
 
+    /* Ceiling on a miner-requested difficulty (stratum password `d=<n>` or
+     * mining.suggest_difficulty). Default 50000000.
+     *
+     * ⚠️ Size this against idle_timeout_authorized_sec, not against taste.
+     * A request is a floor on the connection's difficulty, so it directly
+     * lengthens that connection's expected share interval — and the reaper
+     * measures inbound silence. At 50M a 25 TH/s connection expects a share
+     * every ~8600s and would be reaped from a 3600s budget. Raise one and
+     * you must consider the other. */
+    double max_suggested_diff;    /* default 5e7 */
+
     /* How far a window may be extended, as a multiple of vardiff_window_sec,
      * while waiting for vardiff_min_samples. Default 8. */
     int    vardiff_max_window_mult;  /* default 8 */

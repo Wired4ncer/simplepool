@@ -189,6 +189,7 @@ typedef struct {
     double vardiff_max;
     int    vardiff_window_sec;
     int    vardiff_min_samples;      /* see config.h; 0 = legacy behaviour */
+    double max_suggested_diff;       /* cap on a miner-requested difficulty */
     int    vardiff_max_window_mult;  /* see config.h */
     double vardiff_idle_step;        /* see config.h */
 

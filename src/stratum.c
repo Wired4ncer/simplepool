@@ -351,6 +351,27 @@ struct stratum_conn {
     uint64_t vd_window_start_ms;
     uint32_t vd_window_shares;
 
+    /* Difficulty this miner asked for, via the stratum password `d=<n>` or
+     * mining.suggest_difficulty. 0 = none requested.
+     *
+     * ⚠️ This is a FLOOR, never a pin. Vardiff may raise the connection
+     * above it and the network-difficulty clamp still wins over it, but
+     * nothing lowers the connection below it.
+     *
+     * A pin would be a denial-of-service hole: `d=1` from a 400 TH/s miner
+     * is ~93,000 shares/sec aimed at the share pipeline. As a floor the
+     * same request is inert — max(1, whatever vardiff chose) is just
+     * vardiff's answer — while a miner asking to go HIGHER, which is the
+     * real request, gets exactly what it asked for.
+     *
+     * The reason a miner needs this at all: vardiff tunes each CONNECTION
+     * toward vardiff_target_spm, but a proxied fleet spreads one rig over
+     * many connections, so the rig sees target_spm x N. At a uniform
+     * difficulty the rig's total share rate is H/(D*2^32) — the connection
+     * count cancels — so letting the miner name D is the one lever that
+     * works regardless of how its hashrate is split. */
+    double   requested_min_diff;
+
     /* The difficulty this connection was on when each recent job was SENT to
      * it — i.e. the difficulty the miner actually mined that job at.
      *
@@ -910,6 +931,14 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         if (new_diff < old_diff / max_step) new_diff = old_diff / max_step;
         if (new_diff < s->cfg.vardiff_min) new_diff = s->cfg.vardiff_min;
         if (new_diff > s->cfg.vardiff_max) new_diff = s->cfg.vardiff_max;
+        /* A miner-requested difficulty is a floor: vardiff may raise this
+         * connection above it, never below. Without this the request lasts
+         * exactly one window — vardiff sees a rate under target (which is
+         * the POINT of a higher difficulty) and drags it straight back
+         * down. */
+        if (c->requested_min_diff > 0.0 && new_diff < c->requested_min_diff) {
+            new_diff = c->requested_min_diff;
+        }
         /* Never raise the share difficulty above the network difficulty:
          * the miner discards hashes above the stratum target locally, so a
          * share target harder than the network target throws away valid
@@ -1114,12 +1143,103 @@ static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     return emit_response(buf, len, id, result, NULL);
 }
 
+/* Pull a difficulty request out of a stratum password field.
+ *
+ * The near-universal convention is `d=<number>`, optionally among other
+ * comma- or semicolon-separated tokens (`x`, `d=4657000`, ...). cgminer,
+ * bosminer, Vnish and LuxOS all let the operator set this field, which is
+ * why it is the request channel with the widest reach.
+ *
+ * Returns 0 and writes *out on success, -1 if the field carries no usable
+ * `d=` token. */
+static int parse_password_diff(const char *pw, double *out) {
+    if (!pw || !out) return -1;
+    for (const char *p = pw; *p; ++p) {
+        /* Match `d=` only at a token boundary, so "id=7" is not a request. */
+        if ((p != pw) && p[-1] != ',' && p[-1] != ';' && p[-1] != ' ') continue;
+        if (p[0] != 'd' || p[1] != '=') continue;
+        char *end = NULL;
+        double v = strtod(p + 2, &end);
+        if (end == p + 2) return -1;              /* `d=` with no number */
+        if (!(v > 0.0) || v != v) return -1;      /* <= 0, or NaN */
+        *out = v;
+        return 0;
+    }
+    return -1;
+}
+
+/* Apply a miner's requested difficulty as a floor on this connection.
+ * Clamped to cfg.max_suggested_diff, then to the network difficulty — a
+ * share target harder than the network target makes the miner discard
+ * valid blocks locally before the pool ever sees them.
+ *
+ * CALLER MUST HOLD c->state_lock. */
+static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
+                                 double req) {
+    if (!(req > 0.0)) return;
+    if (s->cfg.max_suggested_diff > 0.0 && req > s->cfg.max_suggested_diff) {
+        LOG_INFO("stratum: %s requested difficulty %.0f above the cap %.0f — "
+                 "using the cap",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, s->cfg.max_suggested_diff);
+        req = s->cfg.max_suggested_diff;
+    }
+    double net_diff = current_net_diff(s);
+    if (net_diff > 0.0 && req > net_diff) req = net_diff;
+    c->requested_min_diff = req;
+    if (c->difficulty < req) c->difficulty = req;
+}
+
+/* mining.suggest_difficulty: params[0] is the difficulty the miner wants.
+ * The formal stratum way to ask; `d=` in the password is the same request
+ * from firmware that cannot send this. Either may arrive before or after
+ * authorize, so this only records and applies — authorize re-applies it.
+ *
+ * No response is defined for this method, but answering `true` to a request
+ * carrying an id is harmless and keeps strict clients happy. */
+static int handle_suggest_difficulty(stratum_server_t *s, stratum_conn_t *c,
+                                     cJSON *id, cJSON *params,
+                                     char **buf, size_t *len) {
+    double req = 0.0;
+    if (cJSON_IsArray(params) && cJSON_GetArraySize(params) >= 1) {
+        cJSON *d = cJSON_GetArrayItem(params, 0);
+        if (cJSON_IsNumber(d)) req = d->valuedouble;
+    }
+    if (!(req > 0.0)) {
+        cJSON *err = make_error(20, "bad params");
+        return emit_response(buf, len, id, NULL, err);
+    }
+    pthread_mutex_lock(&c->state_lock);
+    double before = c->difficulty;
+    apply_requested_diff(s, c, req);
+    double after = c->difficulty;
+    pthread_mutex_unlock(&c->state_lock);
+    LOG_INFO("stratum: %s suggested difficulty %.0f -> floor %.0f",
+             c->worker_name[0] ? c->worker_name : "(unauthorized)",
+             req, c->requested_min_diff);
+    /* Only tell an ALREADY-authorized miner; before authorize it has no job
+     * yet, and authorize emits the difficulty itself. */
+    if (c->authorized && after != before) send_set_difficulty(buf, len, after);
+    if (id) emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
+    return 0;
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
     const char *worker = NULL;
+    double pw_diff = 0.0;
     if (cJSON_IsArray(params) && cJSON_GetArraySize(params) >= 1) {
         cJSON *w = cJSON_GetArrayItem(params, 0);
         if (cJSON_IsString(w)) worker = w->valuestring;
+        /* params[1] is the password. Historically ignored here; it is the
+         * `d=<n>` difficulty request channel. */
+        if (cJSON_GetArraySize(params) >= 2) {
+            cJSON *p = cJSON_GetArrayItem(params, 1);
+            if (cJSON_IsString(p)) {
+                double v;
+                if (parse_password_diff(p->valuestring, &v) == 0) pw_diff = v;
+            }
+        }
     }
     if (!worker) {
         cJSON *err = make_error(24, "missing worker name");
@@ -1224,6 +1344,19 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                  c->worker_name, hint);
     } else if (c->difficulty <= 0) {
         c->difficulty = s->cfg.initial_diff;
+    }
+    /* A difficulty the miner asked for wins over the replayed hint — the
+     * hint is what it happened to be running at, the request is what it
+     * says it wants. `mining.suggest_difficulty` may already have arrived
+     * before authorize, in which case re-apply it: the hint above has just
+     * overwritten c->difficulty. */
+    {
+        double req = pw_diff > 0.0 ? pw_diff : c->requested_min_diff;
+        if (req > 0.0) {
+            apply_requested_diff(s, c, req);
+            LOG_INFO("stratum: %s requested difficulty %.0f (floor)",
+                     c->worker_name, c->requested_min_diff);
+        }
     }
     /* Same clamp as vardiff, and it deliberately wins over the hint floor
      * above: a starting difficulty above the network difficulty would make the
@@ -1711,6 +1844,8 @@ int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
         rc = handle_subscribe(s, c, id, out_buf, out_len);
     } else if (strcmp(method->valuestring, "mining.authorize") == 0) {
         rc = handle_authorize(s, c, id, params, out_buf, out_len);
+    } else if (strcmp(method->valuestring, "mining.suggest_difficulty") == 0) {
+        rc = handle_suggest_difficulty(s, c, id, params, out_buf, out_len);
     } else if (strcmp(method->valuestring, "mining.submit") == 0) {
         rc = handle_submit(s, c, id, params, out_buf, out_len);
     } else {

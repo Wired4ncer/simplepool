@@ -1,3 +1,4 @@
+#include <math.h>
 #include "../src/stratum.h"
 #include "../src/share.h"
 #include "../src/cjson/cJSON.h"
@@ -729,6 +730,281 @@ static void test_vardiff_waits_for_min_samples(void) {
     CHECK(obs.shares == 5);
     free(out);
     stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Value of the LAST mining.set_difficulty in a response buffer, or -1. */
+static double last_set_difficulty(const char *buf) {
+    const char *hit = NULL, *q = buf;
+    while ((q = strstr(q, "mining.set_difficulty")) != NULL) { hit = q; q += 8; }
+    if (!hit) return -1.0;
+    const char *pr = strstr(hit, "\"params\":[");
+    if (!pr) return -1.0;
+    return strtod(pr + 10, NULL);
+}
+
+/* Authorize helper: subscribe then authorize with `pw` as the password. */
+static double authorize_with_password(stratum_server_t *s, stratum_conn_t *c,
+                                      const char *pw) {
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "{\"id\":2,\"method\":\"mining.authorize\","
+             "\"params\":[\"" TEST_ADDR "\",\"%s\"]}", pw);
+    stratum_handle_message(s, c, msg, &out, &olen);
+    double d = out ? last_set_difficulty(out) : -1.0;
+    free(out);
+    return d;
+}
+
+/* A miner asking for a HIGHER difficulty via the stratum password gets it. */
+static void test_password_diff_raises_difficulty(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                           .initial_diff = 1000,
+                           .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                           .vardiff_min = 1, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 5e7,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};                    /* no network clamp */
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(authorize_with_password(s, c, "d=4657000") == 4657000.0);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* ⛔ The security property. A request is a FLOOR, never a pin, so `d=1`
+ * cannot be used to force a connection below what the pool chose — that
+ * would be ~93,000 shares/sec from a 400 TH/s miner aimed at the share
+ * pipeline. The connection must stay where the pool put it. */
+static void test_password_diff_cannot_lower_difficulty(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                           .initial_diff = 1000,
+                           .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                           .vardiff_min = 1000, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 5e7,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    /* Control: the same connection with no request sits at initial_diff. */
+    CHECK(authorize_with_password(s, c, "d=1") == 1000.0);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* A request above max_suggested_diff is capped, not honoured. */
+static void test_password_diff_capped(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                           .initial_diff = 1000,
+                           .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                           .vardiff_min = 1, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 1e6,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(authorize_with_password(s, c, "d=99999999") == 1e6);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The network-difficulty clamp still wins over a miner's request: a share
+ * target harder than the network target makes the miner discard valid
+ * blocks locally, before the pool ever sees them. */
+static void test_requested_diff_clamped_to_network(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                           .initial_diff = 1e-12,
+                           .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                           .vardiff_min = 1e-12, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 5e7,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};                    /* DIFF1 => network diff 1.0 */
+    net[4] = 0xff; net[5] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(authorize_with_password(s, c, "d=4657000") == 1.0);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* mining.suggest_difficulty is the formal request channel and must behave
+ * exactly like the password form. */
+static void test_suggest_difficulty_method(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                           .initial_diff = 1000,
+                           .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                           .vardiff_min = 1, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 5e7,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    /* Arrives BEFORE authorize, which is where firmware usually sends it. */
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[2500000]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\","
+        "\"params\":[\"" TEST_ADDR "\",\"x\"]}", &out, &olen);
+    CHECK(out != NULL);
+    CHECK(last_set_difficulty(out) == 2500000.0);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* The password field is untrusted input from anyone who can open a socket.
+ * `d=` is matched only at a token boundary, so a password that merely
+ * CONTAINS those characters is not a difficulty request. */
+static void test_password_diff_parsing_edge_cases(void) {
+    struct { const char *pw; double want; } cases[] = {
+        { "x",              1000.0 },    /* the conventional no-op password */
+        { "",               1000.0 },
+        { "d=4657000",   4657000.0 },
+        { "x,d=250000",   250000.0 },    /* among other tokens */
+        { "x;d=250000",   250000.0 },
+        { "id=7",           1000.0 },    /* NOT a request -- mid-token */
+        { "bad=5",          1000.0 },
+        { "d=",             1000.0 },    /* no number */
+        { "d=abc",          1000.0 },
+        { "d=-5",           1000.0 },    /* negative rejected, not clamped */
+        { "d=0",            1000.0 },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+        obs_t obs = {0};
+        stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                               .initial_diff = 1000,
+                               .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                               .vardiff_min = 1, .vardiff_max = 1e15,
+                               .vardiff_window_sec = 30,
+                               .max_suggested_diff = 5e7,
+                               .ctx = &obs, .on_share = on_share,
+                               .on_reject = on_reject, .on_block = on_block };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+        stratum_server_t *s = NULL;
+        stratum_server_start(&cfg, &s);
+        uint8_t net[32] = {0};
+        stratum_server_set_job(s, make_test_job("J1", net), 1);
+        stratum_conn_t *c = stratum_conn_new_for_test(s);
+        double got = authorize_with_password(s, c, cases[i].pw);
+        if (got != cases[i].want) {
+            fprintf(stderr, "  password \"%s\": got %g want %g\n",
+                    cases[i].pw, got, cases[i].want);
+        }
+        CHECK(got == cases[i].want);
+        stratum_conn_free_for_test(c);
+        stratum_server_free(s);
+    }
+}
+
+/* Vardiff must not drag a connection back below what the miner asked for.
+ * Without the floor the request survives exactly one window: a higher
+ * difficulty means a rate under target -- which is the POINT -- and vardiff
+ * reads that as "too hard" and lowers it straight back.
+ *
+ * ⚠️ Two connections on one server, because the assertion for the requesting
+ * one is a NEGATIVE (no set_difficulty). The control proves the retarget path
+ * really is reached under this config; without it the test would pass just as
+ * well if vardiff had never run at all.
+ */
+static void test_vardiff_cannot_lower_below_request(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4,
+                           .initial_diff = 1e-12,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 1e9,   /* always "too slow" */
+                           .vardiff_min = 1e-18, .vardiff_max = 1e15,
+                           .vardiff_window_sec = 1,
+                           .vardiff_min_samples = 0,    /* retarget at once */
+                           .max_suggested_diff = 5e7,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    char *out = NULL; size_t olen = 0;
+
+    /* Control: no request. Vardiff sees a rate far under target and lowers
+     * it by the 4x step cap. Difficulties are tiny so a fixed nonce still
+     * clears the share target -- at a realistic difficulty no canned submit
+     * would be ACCEPTED, and an accepted share is what ticks vardiff. */
+    stratum_conn_t *ctl = stratum_conn_new_for_test(s);
+    CHECK(authorize_with_password(s, ctl, "x") == 1e-12);
+    sleep_ms(1100);
+    stratum_handle_message(s, ctl,
+        "{\"id\":9,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"000000a1\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    {   /* the retarget path IS reached: 1e-12 lowered by the 4x cap */
+        double got = last_set_difficulty(out);
+        CHECK(got > 0.0 && fabs(got - 2.5e-13) < 1e-15);
+    }
+    free(out); out=NULL; olen=0;
+
+    /* Requesting connection: same server, same window, same ratio -- the
+     * only difference is the request. It must not move. */
+    stratum_conn_t *req = stratum_conn_new_for_test(s);
+    CHECK(authorize_with_password(s, req, "d=1e-12") == 1e-12);
+    sleep_ms(1100);
+    stratum_handle_message(s, req,
+        "{\"id\":10,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"000000b2\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    /* Precondition: that submit really was accepted, so it really did tick
+     * vardiff -- otherwise the negative below proves nothing. */
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == 0);
+    CHECK(strstr(out, "mining.set_difficulty") == NULL);
+    free(out);
+
+    stratum_conn_free_for_test(ctl);
+    stratum_conn_free_for_test(req);
     stratum_server_free(s);
 }
 
@@ -1781,6 +2057,13 @@ int main(void) {
     test_vardiff_clamped_to_network_diff();
     test_vardiff_grace_accepts_old_diff_shares();
     test_vardiff_waits_for_min_samples();
+    test_password_diff_raises_difficulty();
+    test_password_diff_cannot_lower_difficulty();
+    test_password_diff_capped();
+    test_requested_diff_clamped_to_network();
+    test_suggest_difficulty_method();
+    test_vardiff_cannot_lower_below_request();
+    test_password_diff_parsing_edge_cases();
     test_socket_setup_applies_rcvtimeo();
     test_socket_setup_disabled();
     test_extranonce1_unique_across_connections();

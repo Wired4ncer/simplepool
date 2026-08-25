@@ -54,6 +54,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_max        = 1e12;
     cfg->vardiff_window_sec = 30;
     cfg->vardiff_min_samples     = 20;
+    cfg->max_suggested_diff      = 5e7;
     cfg->vardiff_max_window_mult = 8;
     cfg->vardiff_idle_step       = 2.0;
     cfg->clean_jobs_on_refresh = 1;
@@ -189,6 +190,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_max")               == 0) cfg->vardiff_max = atof(v);
         else if (strcmp(k, "vardiff_window_sec")        == 0) cfg->vardiff_window_sec = atoi(v);
         else if (strcmp(k, "vardiff_min_samples")       == 0) cfg->vardiff_min_samples = atoi(v);
+        else if (strcmp(k, "max_suggested_diff")        == 0) cfg->max_suggested_diff = atof(v);
         else if (strcmp(k, "vardiff_max_window_mult")   == 0) cfg->vardiff_max_window_mult = atoi(v);
         else if (strcmp(k, "vardiff_idle_step")         == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "clean_jobs_on_refresh")     == 0) cfg->clean_jobs_on_refresh = atoi(v);
