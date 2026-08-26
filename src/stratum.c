@@ -323,8 +323,12 @@ struct stratum_server {
 struct stratum_conn {
     stratum_server_t *server;
     int fd;                  /* -1 in tests */
-    pthread_t thr;
-    int thr_started;
+    /* ⛔ No thread handle here on purpose. The connection's thread is created
+     * ALREADY DETACHED and owns this struct's lifetime — it frees it. A handle
+     * stored here could only be written by the listener AFTER the struct was
+     * published, which is a write into memory the thread may already have
+     * freed (INC-002). Nothing joins a connection thread; only listener
+     * threads are joined, and those keep their handles in stratum_listener_slot. */
 
     /* Peer address, filled at accept(). Recorded so a miner's complaint can
      * be tied to the socket it actually came from: worker names are chosen by
@@ -2736,16 +2740,51 @@ static void *listener_thread(void *arg) {
         /* The port decides the difficulty. */
         conn_apply_listener(c, &ls->pol);
         atomic_fetch_add(&s->conn_count, 1);
-        conn_register(s, c);
-        if (pthread_create(&c->thr, NULL, conn_thread, c) != 0) {
-            conn_unregister(s, c);
+        /* ⛔ After conn_register the connection belongs to other threads, and
+         * conn_thread FREES it when the miner goes away. Do not touch `c`
+         * again here — not even to write a field.
+         *
+         * That is not theoretical. This loop used to do
+         *
+         *     pthread_create(&c->thr, NULL, conn_thread, c);
+         *     pthread_detach(c->thr);      <- read of freed memory
+         *     c->thr_started = 1;          <- WRITE into freed memory
+         *
+         * and pthread_create can return after conn_thread has already run to
+         * completion and freed `c` — overwhelmingly likely when the peer is
+         * already gone, i.e. exactly during a mass disconnect. The 4-byte
+         * store then lands in a free chunk and corrupts glibc's malloc
+         * metadata, which surfaces much later and elsewhere as
+         * `corrupted double-linked list` + SIGABRT. That is how the pool
+         * died on 2026-08-26 at 20:53 UTC (INC-002), ~1,000 connections
+         * being torn down while others were still authorizing.
+         *
+         * The thread is created ALREADY detached, into a local handle, so
+         * there is nothing to clean up and nothing to write back. Neither
+         * `c->thr` nor `c->thr_started` is ever read for a connection — the
+         * shutdown path joins LISTENER threads (`ls->thr`), never these — so
+         * both fields simply go away. */
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) != 0) {
             atomic_fetch_sub(&s->conn_count, 1);
             close(fd);
             stratum_conn_free_for_test(c);
             continue;
         }
-        pthread_detach(c->thr);
-        c->thr_started = 1;
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        conn_register(s, c);
+        pthread_t tid;
+        if (pthread_create(&tid, &attr, conn_thread, c) != 0) {
+            /* Nothing else can have reached `c` yet on this path: the thread
+             * that frees it never started. Unregister and free is safe. */
+            conn_unregister(s, c);
+            atomic_fetch_sub(&s->conn_count, 1);
+            close(fd);
+            stratum_conn_free_for_test(c);
+            pthread_attr_destroy(&attr);
+            continue;
+        }
+        pthread_attr_destroy(&attr);
     }
     return NULL;
 }
