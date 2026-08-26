@@ -263,8 +263,10 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
     for (size_t i = 0; i < t->tx_count; i++) tx_weight += t->txs[i].weight;
 
     /* What the builder splices into the scriptSig: both extranonces, plus the
-     * tag and its length byte. Mirrors coinbase_build_from_template_multi. */
-    size_t ss_growth = 4 + 4;
+     * tag and its length byte. Same constants the probe build passes to
+     * coinbase_build_from_template_multi — a literal here went stale when
+     * extranonce2 grew 4 → 8 and overstated the headroom by 16 WU. */
+    size_t ss_growth = STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE;
     size_t taglen = strlen(cfg->coinbase_tag);
     if (taglen) ss_growth += (taglen > 75 ? 75 : taglen) + 1;
 
