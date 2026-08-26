@@ -2295,6 +2295,106 @@ static void test_hint_below_vardiff_min_is_floored(void) {
     printf("ok: a hint below vardiff_min is raised to the floor\n");
 }
 
+static double hint_huge(void *ctx, const char *worker) {
+    (void)ctx; (void)worker; return 17940000.0;
+}
+
+/* The reconnect lockout, observed live 2026-08-26: a worker's history says
+ * 17.94M (earned when its fleet was bigger), the shrunken fleet reconnects
+ * asking 510k, and floor-only request semantics kept it at 17.94M. The
+ * client treated the work as invalid and looped through authorize every 2
+ * seconds — vardiff never got a share to correct with. At authorize time an
+ * explicit request must win over the replayed hint in BOTH directions. */
+static void test_request_lowers_replayed_hint_at_authorize(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 500000.0,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 500000.0,
+                           .vardiff_max = 1e12,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 1e9,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_difficulty_hint = hint_huge,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    /* High network target so the net-diff clamp cannot be the thing that
+     * lowers the difficulty — the request must do it, or the test passes
+     * for the wrong reason. */
+    uint8_t net[32] = {0};
+    net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[510000]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    /* Told 510000 — the request — not the replayed 17940000. */
+    CHECK(strstr(out, "\"params\":[510000]") != NULL);
+    CHECK(strstr(out, "\"params\":[17940000]") == NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: an explicit request lowers a replayed hint at authorize\n");
+}
+
+/* Same shape, but the request undercuts the listener floor: the lowering
+ * must stop AT the floor — the marketplace was promised that minimum. */
+static void test_request_below_floor_lowers_only_to_floor(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 500000.0,
+                           .vardiff_enabled = 1,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 500000.0,
+                           .vardiff_max = 1e12,
+                           .vardiff_window_sec = 30,
+                           .max_suggested_diff = 1e9,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_difficulty_hint = hint_huge,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+    uint8_t net[32] = {0};
+    net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.suggest_difficulty\",\"params\":[1000]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen);
+    CHECK(out != NULL);
+    /* Lowered from 17.94M, but only to the 500k floor — never to 1000. */
+    CHECK(strstr(out, "\"params\":[500000]") != NULL);
+    CHECK(strstr(out, "\"params\":[17940000]") == NULL);
+    CHECK(strstr(out, "\"params\":[1000]") == NULL);
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: request-lowering stops at the listener floor\n");
+}
+
 /* ⛔ THE REGRESSION THE ARCHITECTURE SWAP INTRODUCED, and the test that would
  * have caught it.
  *
@@ -3038,6 +3138,8 @@ int main(void) {
     test_listener_policy_reaches_the_connection();
     test_listener_floor_beats_the_server_wide_floor();
     test_hint_below_vardiff_min_is_floored();
+    test_request_lowers_replayed_hint_at_authorize();
+    test_request_below_floor_lowers_only_to_floor();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();
     test_submit_below_the_jobs_own_difficulty_is_rejected();

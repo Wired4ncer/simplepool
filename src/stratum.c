@@ -1582,6 +1582,31 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             apply_requested_diff(s, c, req);
             LOG_INFO("stratum: %s requested difficulty %.0f (floor)",
                      c->worker_name, c->requested_min_diff);
+            /* The hint is only what this worker happened to be running at;
+             * the request is what it says it wants NOW. A fleet that has
+             * shrunk since its history was recorded reconnects asking for a
+             * fraction of its replayed difficulty — and a client handed work
+             * far above its request treats it as invalid and drops the line
+             * before vardiff can ever sample it down. Observed live: a
+             * 17.94M replay against a 510k request looped a proxy through
+             * authorize every 2 seconds indefinitely. So at authorize time
+             * only, an explicit request also LOWERS past the hint — never
+             * below the listener's own floor, which is what a marketplace
+             * was promised. Mid-session requests keep floor-only semantics:
+             * there vardiff has live shares to correct with. */
+            if (hint > 0.0 && c->requested_min_diff > 0.0 &&
+                c->difficulty > c->requested_min_diff) {
+                double lf = conn_vardiff_min(s, c);
+                double target = c->requested_min_diff;
+                if (lf > 0.0 && target < lf) target = lf;
+                if (c->difficulty > target) {
+                    LOG_INFO("stratum: %s request %.0f wins over the replayed "
+                             "hint %.0f — lowering to %.0f",
+                             c->worker_name, c->requested_min_diff, hint,
+                             target);
+                    c->difficulty = target;
+                }
+            }
         }
     }
     /* Same clamp as vardiff, and it deliberately wins over the hint floor
