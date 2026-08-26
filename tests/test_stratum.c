@@ -2594,6 +2594,133 @@ static void test_submit_judged_at_the_jobs_own_difficulty(void) {
     printf("ok: a submit is judged at its own job's difficulty\n");
 }
 
+/* ---- submit-rate ceiling (max_submits_per_sec) ------------------------ */
+
+/* Same shape as setup_job_diff_conn, plus a ceiling. Kept separate rather
+ * than adding a parameter, so every existing caller keeps ceiling=0 and this
+ * feature cannot silently change what those tests exercise. */
+static stratum_server_t *setup_ceiling_conn(obs_t *obs, int limit,
+                                            stratum_conn_t **out_c) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-12,
+                           .vardiff_enabled = 0,
+                           .vardiff_target_spm = 12,
+                           .vardiff_min = 0.0,
+                           .vardiff_max = 1e15,
+                           .vardiff_window_sec = 30,
+                           .max_submits_per_sec = limit,
+                           .ctx = obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0 || !s) return NULL;
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out);
+    *out_c = c;
+    return s;
+}
+
+/* Each submit must carry a DISTINCT nonce. Replaying one share hits the
+ * duplicate-share check first, which never reaches the ceiling — the fixture
+ * would then measure dedupe and report it as rate limiting.
+ * → feedback_tests-that-pass-for-the-wrong-reason */
+static void ceil_submit(stratum_server_t *s, stratum_conn_t *c, int n,
+                        char **out, size_t *olen) {
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "{\"id\":9,\"method\":\"mining.submit\","
+             "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"%08x\"]}",
+             (unsigned)n + 1);
+    stratum_handle_message(s, c, msg, out, olen);
+}
+
+/* INC-002: one source pushed ~11k diff-1 submits/sec per worker. Past the
+ * ceiling a submit must be refused BEFORE any hashing, and the refusal must
+ * not write one reject row per refused share — that is what put ~1.95M rows
+ * in the live database in an hour. */
+static void test_submit_ceiling_refuses_past_the_limit(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    stratum_server_t *s = setup_ceiling_conn(&obs, 3, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    int accepted = 0, refused = 0;
+    for (int i = 0; i < 50; i++) {
+        char *out = NULL; size_t olen = 0;
+        ceil_submit(s, c, i, &out, &olen);
+        if (out && strstr(out, "submitting too fast")) refused++;
+        else accepted++;
+        free(out);
+    }
+    /* Exactly the ceiling gets through in the window; the rest are refused. */
+    CHECK(accepted == 3);
+    CHECK(refused == 47);
+    /* The share observer never saw the refused ones — they cost no hashing. */
+    CHECK(obs.shares == 3);
+    /* And 47 refusals produced at most ONE reject row, not 47. */
+    CHECK(obs.rejects <= 1);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: the submit ceiling refuses past the limit, cheaply and quietly\n");
+}
+
+/* The ceiling is per second, not per connection lifetime: once the window
+ * rolls the allowance comes back. Without this a legitimate miner would be
+ * silenced permanently after one burst. */
+static void test_submit_ceiling_window_rolls(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    stratum_server_t *s = setup_ceiling_conn(&obs, 2, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+
+    for (int i = 0; i < 5; i++) {
+        char *out = NULL; size_t olen = 0;
+        ceil_submit(s, c, i, &out, &olen); free(out);
+    }
+    CHECK(obs.shares == 2);
+    /* Roll past the one-second window. */
+    struct timespec ts = { .tv_sec = 1, .tv_nsec = 50000000L };
+    nanosleep(&ts, NULL);
+    char *out = NULL; size_t olen = 0;
+    ceil_submit(s, c, 99, &out, &olen);
+    CHECK(out != NULL && strstr(out, "submitting too fast") == NULL);
+    free(out);
+    CHECK(obs.shares == 3);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: the submit ceiling window rolls each second\n");
+}
+
+/* 0 disables the ceiling — the shipped default, and what every other test in
+ * this file runs with. Asserting it here means the feature cannot start
+ * refusing work for operators who never configured it. */
+static void test_submit_ceiling_zero_disables(void) {
+    obs_t obs = {0};
+    stratum_conn_t *c = NULL;
+    stratum_server_t *s = setup_ceiling_conn(&obs, 0, &c);
+    CHECK(s != NULL);
+    if (!s) return;
+    for (int i = 0; i < 20; i++) {
+        char *out = NULL; size_t olen = 0;
+        ceil_submit(s, c, i, &out, &olen);
+        CHECK(out != NULL && strstr(out, "submitting too fast") == NULL);
+        free(out);
+    }
+    CHECK(obs.shares == 20);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: max_submits_per_sec=0 disables the ceiling\n");
+}
+
 /* The converse, so the rule above cannot be satisfied by simply accepting
  * everything: a share that fails even the difficulty its job was issued at is
  * still rejected. */
@@ -3142,6 +3269,9 @@ int main(void) {
     test_request_below_floor_lowers_only_to_floor();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();
+    test_submit_ceiling_refuses_past_the_limit();
+    test_submit_ceiling_window_rolls();
+    test_submit_ceiling_zero_disables();
     test_submit_below_the_jobs_own_difficulty_is_rejected();
     test_unknown_job_record_falls_back_to_grace();
     test_rerecording_a_job_does_not_consume_ring_slots();

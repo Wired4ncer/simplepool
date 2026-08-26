@@ -439,6 +439,15 @@ struct stratum_conn {
     } job_diff[JOB_DIFF_RING];
     size_t   job_diff_head;
 
+    /* Submit-rate ceiling state (max_submits_per_sec). Touched only by this
+     * connection's own thread, inside handle_submit, so it needs no lock —
+     * unlike the vardiff set above, the tip watcher never reads it. */
+    uint64_t rl_window_start_ms;
+    uint32_t rl_window_count;
+    uint32_t rl_limited;         /* refused since the last report */
+    uint64_t rl_limited_total;   /* refused on this connection, ever */
+    uint64_t rl_reported_ms;
+
     /* The pre-retarget difficulty, honored for a grace period after a
      * set_difficulty. Still the fallback when job_diff has no record for a
      * submit, and when a miner applies a set_difficulty on a LATER job than we
@@ -911,6 +920,74 @@ static double current_net_diff(stratum_server_t *s) {
 static uint64_t diff_grace_ms(const stratum_server_t *s) {
     uint64_t g = (uint64_t)s->cfg.vardiff_window_sec * 2000ULL;
     return g > 60000 ? g : 60000;
+}
+
+/* How often a connection over its submit ceiling says so, rather than once
+ * per refused share — one log line and one reject row per interval whatever
+ * the rate, because the alternative writes the flood into the database that
+ * exists to account for shares. INC-002 put ~1.95M reject rows in the live DB
+ * in one hour and took every frontend query to ~6 s. */
+#define RL_REPORT_INTERVAL_MS 10000
+
+/* Has this connection used up its submits for the current second?
+ *
+ * Called before anything expensive, so a flood costs a JSON parse and a reply
+ * instead of a coinbase render and four SHA256 passes. Returns non-zero when
+ * the submit must be refused, and counts it for the periodic report.
+ *
+ * Ported by hand from upstream `959009d` rather than cherry-picked: our tree
+ * already carried the config key (written, never read — the enforcement half
+ * was lost in a merge, which is why the ceiling was inert during INC-002), and
+ * the commit's other hunks collide with our per-job difficulty ring. */
+static int submit_rate_exceeded(stratum_server_t *s, stratum_conn_t *c,
+                                uint64_t now_mono) {
+    int limit = s->cfg.max_submits_per_sec;
+    if (limit <= 0) return 0;              /* 0 disables the ceiling */
+    if (now_mono - c->rl_window_start_ms >= 1000) {
+        c->rl_window_start_ms = now_mono;
+        c->rl_window_count = 0;
+    }
+    if (c->rl_window_count < (uint32_t)limit) {
+        c->rl_window_count++;
+        return 0;
+    }
+    c->rl_limited++;
+    c->rl_limited_total++;
+    return 1;
+}
+
+/* Say once per RL_REPORT_INTERVAL_MS that this connection is over its ceiling,
+ * carrying the count of everything refused since the last time.
+ *
+ * The message names the difficulty, because that is usually the actual fault:
+ * a legitimate connection only reaches this rate when what it was assigned is
+ * far below what its hashrate warrants and vardiff is still climbing. A flood
+ * reaches it because it is a flood. */
+static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
+                               uint64_t now_mono) {
+    if (c->rl_limited == 0) return;
+    if (c->rl_reported_ms != 0 &&
+        now_mono - c->rl_reported_ms < RL_REPORT_INTERVAL_MS) return;
+
+    LOG_WARN("stratum: %s is over the submit ceiling of %d/s — %u submit(s) "
+             "refused since the last report, %llu on this connection. At "
+             "difficulty %g its hashrate is producing more shares than the "
+             "pool will take; vardiff is raising it",
+             c->worker_name[0] ? c->worker_name : "(unauthorized)",
+             s->cfg.max_submits_per_sec, c->rl_limited,
+             (unsigned long long)c->rl_limited_total, c->difficulty);
+    if (s->cfg.on_reject) {
+        char msg[192];
+        snprintf(msg, sizeof msg,
+                 "submitting too fast: %u refused at over %d/s (%llu total)",
+                 c->rl_limited, s->cfg.max_submits_per_sec,
+                 (unsigned long long)c->rl_limited_total);
+        /* Wall clock here, not the monotonic value the interval is measured
+         * with: this one is a timestamp that gets stored and read back. */
+        s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(), msg);
+    }
+    c->rl_limited = 0;
+    c->rl_reported_ms = now_mono;
 }
 
 /* How many shares a window needs before its minimum achieved difficulty is
@@ -2080,6 +2157,19 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         cJSON *err = make_error(24, "unauthorized");
         return emit_response(buf, len, id, NULL, err);
+    }
+    /* Ceiling check goes here: after authorize (so an unauthorized flood is
+     * still counted as such) but BEFORE parsing params, rendering a coinbase
+     * or hashing — the whole point is that a refused submit stays cheap.
+     * Deliberately NOT one on_reject per refusal: see submit_rate_report. */
+    {
+        uint64_t rl_now = now_ms();
+        if (submit_rate_exceeded(s, c, rl_now)) {
+            submit_rate_report(s, c, rl_now);
+            cJSON *err = make_error(23, "submitting too fast");
+            return emit_response(buf, len, id, NULL, err);
+        }
+        submit_rate_report(s, c, rl_now);
     }
     if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
         if (s->cfg.on_reject) {
