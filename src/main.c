@@ -1469,11 +1469,23 @@ int main(int argc, char **argv) {
      * a `listener` line gets that and the rental keys are ignored — the config
      * validator refuses the two naming the same port.
      *
-     * ⚠️ One behaviour DOES change, deliberately: a listener's min_diff is
-     * kept even when the chain's difficulty is lower, where the old rental
-     * port was clamped down to it. That is the marketplace-facing fix — an
-     * order arriving under the difficulty the port advertised gets cancelled.
-     * Our own rental note recorded the old behaviour as a limitation. */
+     * ⛔ THIS COMMENT USED TO CLAIM A BEHAVIOUR CHANGE THAT DOES NOT EXIST, and
+     * it is corrected rather than deleted because the wrong version was
+     * load-bearing in a migration decision on 2026-08-27. It said a listener's
+     * min_diff is kept even when the chain's difficulty is lower. It is not.
+     * `min_diff` is a RECORD OF INTENT only — it drives the marketplace warning
+     * and the startup log; the floor is delivered through vardiff_min and
+     * initial_diff, and the NETWORK-DIFFICULTY CLAMP in stratum.c overrides
+     * both, unconditionally, after them. There is deliberately no pol_min_diff
+     * on the connection to enforce it with (see stratum.c's "⛔ NO
+     * pol_min_diff"). stratum_listener_t.min_diff carries the full reasoning
+     * and ends "An earlier revision of this comment said the opposite and cited
+     * upstream as the fix. It was wrong. Do not restore it." This was that
+     * revision, surviving in a second file.
+     *
+     * Migrating rental_listen_port to a `listener` line therefore changes NO
+     * difficulty behaviour. What it DOES change is everything below: the legacy
+     * keys are ignored the moment any listener line exists. */
     if (cfg.rental_listen_port > 0 && cfg.listener_count == 0) {
         stratum_listener_t *l = &cfg.listeners[cfg.listener_count++];
         memset(l, 0, sizeof *l);
