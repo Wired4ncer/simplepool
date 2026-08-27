@@ -133,11 +133,17 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
  * CAST(difficulty * rate_used AS INTEGER) and expects credited_sats back
  * bit-for-bit, which is what makes the credit checkable rather than merely
  * recorded. Pass 0.0 whenever credited_sats is 0. */
+/* solo: 1 when the share arrived on a solo listener. Stored on the row and
+ * used to keep it OUT of the PPLNS window -- a solo miner's shares buy them
+ * their own block, so counting them again in the shared window would pay them
+ * twice out of everyone else's work. Recorded per share rather than per worker
+ * so switching ports never rewrites history in either direction. */
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
                             int is_block, const char *share_hash_or_null,
-                            int64_t credited_sats, double rate_used);
+                            int64_t credited_sats, double rate_used,
+                            int solo);
 
 /* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
  * Async (writer thread). delta_sats must be > 0. payout_address (the

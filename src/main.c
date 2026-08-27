@@ -881,7 +881,8 @@ static void refresh_pps_rate(server_ctx_t *s, const bitcoind_template_t *t) {
 static void on_share_cb(void *ctx, const char *worker_name,
                         const char *payout_address, uint64_t ts_ms,
                         double difficulty, int is_block,
-                        const char *block_hash_or_null) {
+                        const char *block_hash_or_null,
+                        int solo) {
     server_ctx_t *s = (server_ctx_t *)ctx;
 
     /* Fold this share into the hashrate window. Difficulty per second is what
@@ -926,7 +927,7 @@ static void on_share_cb(void *ctx, const char *worker_name,
     if (s && s->store) {
         store_record_share_addr(s->store, worker_name, payout_address,
                                 ts_ms, difficulty, is_block,
-                                block_hash_or_null, delta, rate_used);
+                                block_hash_or_null, delta, rate_used, solo);
     }
     if (s && s->bcast) {
         broadcast_share(s->bcast, worker_name, payout_address,

@@ -42,6 +42,11 @@ typedef struct {
     int    found_calls;
     int    last_accepted;
     char   last_submit_error[128];
+    /* Which payout scheme the observed shares arrived under. Asserting on
+     * these is what makes a solo test non-vacuous: "a share arrived" would
+     * pass even if the listener's mode were dropped on the floor. */
+    int    last_solo;
+    int    solo_shares;
 } obs_t;
 
 /* The callbacks are invoked from whichever thread handled the share, and
@@ -52,10 +57,15 @@ static pthread_mutex_t obs_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_share(void *ctx, const char *w, const char *addr,
                      uint64_t ts, double d,
-                     int is_block, const char *blk) {
+                     int is_block, const char *blk, int solo) {
     (void)ts; (void)blk; (void)addr;
     obs_t *o = ctx;
     pthread_mutex_lock(&obs_mu);
+    /* Recorded so a test can assert WHICH scheme a share was submitted under,
+     * not merely that a share arrived. Without this the solo tests below would
+     * pass on a build that ignored the listener's mode entirely. */
+    o->last_solo = solo;
+    if (solo) o->solo_shares++;
     o->shares++;
     o->last_difficulty = d;
     o->sum_share_diff += d;

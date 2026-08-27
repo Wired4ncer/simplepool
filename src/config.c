@@ -149,6 +149,11 @@ static void copy_str(char *dst, size_t cap, const char *src) {
  * order; `port` is the only required one, and anything left unset falls back
  * to the server-wide default at accept time.
  *
+ * mode=solo makes this a SOLO port: connections arriving here pay their own
+ * coinbase (minus the operator fee) instead of the shared PPLNS payout set,
+ * and their shares are recorded solo=1 so they never enter anyone's window.
+ * Absent or mode=proportional keeps the pool-wide behaviour.
+ *
  * min_diff sets the vardiff floor and, unless initial_diff says otherwise,
  * the starting difficulty too. That pairing is the whole point of a rental
  * port: the miner has to arrive already at the floor, because vardiff cannot
@@ -175,6 +180,18 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
         else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
+        else if (strcmp(fk, "mode")         == 0) {
+            /* Only the two that mean something here. "proportional" is spelled
+             * out rather than treated as the absence of mode=solo so an
+             * operator can state the intent explicitly on the public port. */
+            if      (strcmp(fv, "solo")         == 0) out->solo = 1;
+            else if (strcmp(fv, "proportional") == 0) out->solo = 0;
+            else {
+                set_err(errbuf, errlen,
+                        "listener mode must be 'solo' or 'proportional', got '%s'", fv);
+                return -1;
+            }
+        }
         else {
             set_err(errbuf, errlen, "unknown listener field '%s'", fk);
             return -1;

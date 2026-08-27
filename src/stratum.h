@@ -106,6 +106,18 @@ typedef struct {
     /* Free-form, for logs and for the dashboard to tell miners which port to
      * point which machine at. Empty for the default listener. */
     char   label[32];
+    /* SOLO PORT. Set by `listener = port=3336 mode=solo`. A connection that
+     * arrives here has its own coinbase pay ITSELF (minus the operator fee)
+     * instead of the shared PPLNS payout set, and its shares are recorded
+     * solo=1 so they never enter another miner's payout window.
+     *
+     * ⛔ The mode belongs to the LISTENER, not to the worker name. Overloading
+     * the username was considered and rejected: miners already misconfigure it
+     * (one authorized as the literal string "worker" and lost 47k shares to a
+     * base58 error), and a typo there would silently move a miner between
+     * payout schemes. A port is unambiguous, and the miner opts in by pointing
+     * their machine somewhere different. */
+    int    solo;
 } stratum_listener_t;
 
 #define STRATUM_MAX_LISTENERS 8
@@ -155,10 +167,17 @@ int stratum_job_set_payouts(stratum_job_t *j,
                             size_t n_payouts);
 
 /* Observer hooks filled in by main.c (typically routed to the sqlite store). */
+/* `solo` is 1 when the share arrived on a solo listener. It travels with the
+ * share rather than being looked up per worker because a miner may move
+ * between ports: the shares they submitted while on PPLNS must KEEP counting
+ * in the window they earned, and the ones submitted while solo must never
+ * count at all. Classifying by current worker state would retroactively
+ * rewrite both. */
 typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   const char *payout_address,
                                   uint64_t ts_ms, double difficulty,
-                                  int is_block, const char *block_hash_or_null);
+                                  int is_block, const char *block_hash_or_null,
+                                  int solo);
 typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
                                    uint64_t ts_ms, const char *reason);
 /* Submits the assembled block upstream. Returns 0 when the node accepted it,

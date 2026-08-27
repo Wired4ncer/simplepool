@@ -366,6 +366,12 @@ struct stratum_conn {
      * authoritative. See conn_vardiff_min for the floor we DO honour. */
     int      pol_port;
     char     pol_label[32];
+    /* 1 when this connection arrived on a solo listener. Read on the render
+     * path and passed to the share observer. Like the other pol_ fields it is
+     * copied from the listener ONCE at accept time and never re-read, so a
+     * config reload cannot move a live connection between payout schemes
+     * mid-session. */
+    int      pol_solo;
 
     int      subscribed;
     int      authorized;
@@ -776,7 +782,8 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
         }
-    } else if (s->prop_enabled && job->payouts && job->n_payouts > 0 &&
+    } else if (s->prop_enabled && !c->pol_solo &&
+               job->payouts && job->n_payouts > 0 &&
                job->coinbasetxn_hex) {
         /* pool_mode=proportional: one coinbase per template, shared by every
          * connection, paying the PPLNS window's shareholders directly. Sessions
@@ -801,7 +808,14 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
          *
          * In proportional mode this is also the fallback when no PPLNS window
          * exists yet (first block, or an empty shares table): paying the finder
-         * directly is correct and non-custodial, just not yet proportional. */
+         * directly is correct and non-custodial, just not yet proportional.
+         *
+         * It is ALSO the deliberate path for a SOLO connection (pol_solo),
+         * which is why the proportional branch above excludes them: solo means
+         * exactly "this miner's coinbase pays this miner", which is what this
+         * branch already did. The operator fee still applies -- fee_bps is
+         * passed here just as it is everywhere else -- so a solo block is
+         * split miner + fee, and verify-split.py needs no new coinbase shape. */
         rc = coinbase_build_from_template(job->coinbasetxn_hex,
                                           c->payout_address,
                                           s->cfg.operator_address, s->cfg.fee_bps,
@@ -2090,7 +2104,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
          * to gauge how lucky each share was). When is_block, this string
          * also IS the block hash; otherwise it's a 'just-a-share' hash. */
         s->cfg.on_share(s->cfg.ctx, c->worker_name, c->payout_address,
-                        ts_now, share_diff, is_block, sent_hash_hex);
+                        ts_now, share_diff, is_block, sent_hash_hex,
+                        c->pol_solo);
     }
     /* Tick vardiff: count this accepted share toward the window, and track
      * the difficulty it actually achieved. Reading the hash as a target
@@ -2691,6 +2706,7 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->vardiff_min  > 0.0) c->pol_vardiff_min  = pol->vardiff_min;
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
     c->pol_port = pol->port;
+    c->pol_solo = pol->solo;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so
      * seeding it here keeps a subscribe-only conn reporting its port's value

@@ -67,7 +67,8 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  is_block      INTEGER NOT NULL DEFAULT 0,"
     "  block_hash    TEXT,"
     "  credited_sats INTEGER NOT NULL DEFAULT 0,"
-    "  rate_used     REAL NOT NULL DEFAULT 0"
+    "  rate_used     REAL NOT NULL DEFAULT 0,"
+    "  solo          INTEGER NOT NULL DEFAULT 0"
     ");"
     "CREATE INDEX IF NOT EXISTS shares_ts_idx ON shares(ts);"
     "CREATE INDEX IF NOT EXISTS shares_worker_ts_idx ON shares(worker_id, ts);"
@@ -341,6 +342,24 @@ static const char *MIGRATIONS_SQL[] = {
      * and `last_seen`/`polls` record how many polls collapsed into it. Rows
      * predating the columns are each a single observation, so backfilling
      * last_seen from ts is exact, not a guess. */
+    /* Which payout scheme the share was submitted UNDER, fixed at the moment
+     * it was accepted. Rows predating the column keep 0 = proportional, which
+     * is exactly right: no solo listener existed before it, so every historical
+     * share genuinely was a PPLNS share.
+     *
+     * ⛔ It lives on the SHARE, not on the worker. A miner may move between the
+     * public and solo ports, and the two must not contaminate each other: the
+     * shares earned while on PPLNS have to keep counting in the window they
+     * were earned in, and the ones earned while solo must never count at all.
+     * Deriving it from the worker's current port would retroactively rewrite
+     * both directions every time somebody switched.
+     *
+     * ⚠️ NO NEW INDEX. shares_ts_idx already orders the window scan and the
+     * filter is a cheap per-row test on a column the row already carries.
+     * Building an index on this table cost a LOST SHARE on 2026-08-26 -- the
+     * build held the write lock past the store's retry budget. If the filter
+     * ever measures slow, measure it first; do not reflexively add one. */
+    "ALTER TABLE shares       ADD COLUMN solo           INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE templates    ADD COLUMN last_seen      INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE templates    ADD COLUMN polls          INTEGER NOT NULL DEFAULT 1",
     "UPDATE templates SET last_seen = ts WHERE last_seen = 0",
@@ -419,6 +438,7 @@ typedef struct {
     uint8_t  block_status;      /* EV_BLOCK only: STORE_BLOCK_* */
     int64_t  delta_sats;        /* EV_CREDIT only */
     double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
+    int      solo;              /* EV_SHARE only: 1 = arrived on a solo listener */
     char     worker_name[WORKER_NAME_MAX];
     char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
     char     hash[HASH_STR_MAX];
@@ -613,6 +633,9 @@ static void process_event(store_t *s, const event_t *ev) {
          * consistent — see the shares schema comment. */
         sqlite3_bind_int64 (s->st_insert_share, 6, ev->delta_sats);
         sqlite3_bind_double(s->st_insert_share, 7, ev->rate_used);
+        /* Which payout scheme this share was submitted under. Fixed here, at
+         * accept time, and never recomputed -- see the shares.solo migration. */
+        sqlite3_bind_int   (s->st_insert_share, 8, ev->solo);
         if (sqlite3_step(s->st_insert_share) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
         } else {
@@ -894,8 +917,8 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "RETURNING id";
     static const char *Q_INS_SHARE =
         "INSERT INTO shares "
-        "  (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)";
+        "  (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used, solo) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     static const char *Q_INS_REJECT =
         "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
     /* OR IGNORE so a re-found hash cannot fail the step. The dedupe guard
@@ -994,14 +1017,15 @@ int store_record_share(store_t *s, const char *worker_name,
                        int is_block, const char *share_hash_or_null)
 {
     return store_record_share_addr(s, worker_name, NULL, ts_ms, difficulty,
-                                   is_block, share_hash_or_null, 0, 0.0);
+                                   is_block, share_hash_or_null, 0, 0.0, 0);
 }
 
 int store_record_share_addr(store_t *s, const char *worker_name,
                             const char *payout_address,
                             uint64_t ts_ms, double difficulty,
                             int is_block, const char *share_hash_or_null,
-                            int64_t credited_sats, double rate_used)
+                            int64_t credited_sats, double rate_used,
+                            int solo)
 {
     if (!s || !worker_name) return -1;
     event_t ev;
@@ -1012,6 +1036,7 @@ int store_record_share_addr(store_t *s, const char *worker_name,
     ev.is_block = is_block;
     ev.delta_sats = credited_sats;
     ev.rate_used = rate_used;
+    ev.solo = solo ? 1 : 0;
     strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     if (payout_address)
         strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
@@ -1822,6 +1847,18 @@ static int prop_window_agg(store_t *s, sqlite3_int64 from_s, sqlite3_int64 befor
         "SELECT COALESCE(SUM(s.difficulty),0), COALESCE(MIN(s.ts),0), COUNT(*)"
         "  FROM shares s JOIN workers w ON s.worker_id = w.id"
         "  WHERE s.ts >= ? AND s.ts <= ?"
+        /* ⛔ THE THIRD PLACE solo has to be excluded, and the easiest to miss.
+         * This aggregate SIZES the window; store_prop_payouts decides who is
+         * paid out of it. If this one counted solo difficulty and the payout
+         * query did not, the window would be sized against work that nobody in
+         * the payout set performed, sum(payouts) would fall short of the
+         * coinbase total, and coinbase_build_from_template_multi would refuse
+         * the coinbase -- so the pool would stop producing proportional blocks
+         * entirely. All three share queries in the PPLNS path carry the same
+         * filter; the per-worker vardiff query at prop_recent_diff deliberately
+         * does NOT, because a solo miner's own shares are still their own
+         * hashrate. */
+        "    AND s.solo = 0"
         "    AND w.payout_address IS NOT NULL AND w.payout_address != ''";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
@@ -1895,10 +1932,14 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
      * a SHORTER window than asked for, which looks like a working pool paying
      * on the wrong window. */
     static const char *Q =
+        /* solo = 0: a solo miner's shares buy them their own block, so
+         * counting them here would pay them a second time out of everyone
+         * else's. See the shares.solo migration for why this is per-share. */
         "SELECT s.ts, s.id, s.difficulty FROM shares s"
         "  JOIN workers w ON s.worker_id = w.id"
         /* No is_block filter -- see prop_window_agg. */
         "  WHERE (s.ts < ? OR (s.ts = ? AND s.id < ?))"
+        "    AND s.solo = 0"
         "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
         "  ORDER BY s.ts DESC, s.id DESC"
         "  LIMIT ?";
@@ -1975,7 +2016,15 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
         "  FROM shares s"
         "  JOIN workers w ON s.worker_id = w.id"
         /* No is_block filter -- see prop_window_agg. */
+        /* ⛔ This filter MUST match store_prop_compute_window's exactly. The
+         * window decides how far back to reach; this decides who gets paid out
+         * of it. If one excludes solo shares and the other does not, the sum of
+         * payouts stops equalling the window difficulty the coinbase was sized
+         * against -- and coinbase_build_from_template_multi refuses to emit a
+         * coinbase that pays the wrong total, so the pool would simply stop
+         * producing proportional blocks. */
         "  WHERE s.ts >= ? AND s.ts <= ?"
+        "    AND s.solo = 0"
         "    AND w.payout_address IS NOT NULL AND w.payout_address != ''"
         "  GROUP BY w.payout_address"
         "  ORDER BY total_diff DESC";

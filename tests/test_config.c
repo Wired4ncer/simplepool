@@ -193,6 +193,57 @@ static void test_listener_line_parses(void) {
     CHECK(cfg.initial_diff == 1.0);
 }
 
+/* mode=solo marks the listener, and — the part that actually matters — a
+ * listener WITHOUT it stays proportional. Asserting only the solo port would
+ * pass on a build that set solo=1 unconditionally. */
+static void test_listener_mode_solo(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[640];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3335 min_diff=500000 label=braiins\n"
+             "listener = port=3336 mode=solo label=solo\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listener_count == 2);
+    /* The rental port did NOT become solo just because a solo port exists. */
+    CHECK(cfg.listeners[0].port == 3335);
+    CHECK(cfg.listeners[0].solo == 0);
+    CHECK(cfg.listeners[1].port == 3336);
+    CHECK(cfg.listeners[1].solo == 1);
+    /* mode does not disturb the difficulty policy it shares a line with. */
+    CHECK(cfg.listeners[1].vardiff_min == 0.0);
+    CHECK(strcmp(cfg.listeners[1].label, "solo") == 0);
+}
+
+/* mode=proportional is accepted and means what it says, so an operator can
+ * state the intent on the public port rather than relying on the absence of
+ * mode=solo. */
+static void test_listener_mode_proportional_explicit(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listener = port=3337 mode=proportional\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.listeners[0].solo == 0);
+}
+
+/* An unknown mode is refused AT STARTUP rather than silently defaulting.
+ * Silently treating "Solo" or "sole" as proportional would put a miner who
+ * asked for solo into the shared payout window without anyone noticing. */
+static void test_listener_mode_typo_is_refused(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listener = port=3336 mode=sollo\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc != 0);
+    CHECK(strstr(err, "mode") != NULL);
+}
+
 /* A config that names no listener has none — which is what makes installing
  * this binary a no-op for an operator still on the rental_* keys. */
 static void test_listeners_default_to_none(void) {
@@ -274,6 +325,9 @@ int main(void) {
     test_listen_backlog_defaults_to_sentinel();
     test_listen_backlog_parses();
     test_listener_line_parses();
+    test_listener_mode_solo();
+    test_listener_mode_proportional_explicit();
+    test_listener_mode_typo_is_refused();
     test_listeners_default_to_none();
     test_listener_colliding_with_listen_port_is_refused();
     test_listener_colliding_with_rental_port_is_refused();

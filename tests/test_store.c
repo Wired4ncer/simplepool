@@ -298,7 +298,7 @@ static void test_credited_sats(void) {
         expected += credited;
         assert(store_record_share_addr(s, "payer", "addr1",
                                        1000ULL + (uint64_t)i, (double)i,
-                                       0, NULL, credited, 7.0) == 0);
+                                       0, NULL, credited, 7.0, 0) == 0);
     }
     /* solo-style: no accrual, so the column must record 0 — not be left
      * to a later recompute that would invent a credit. rate_used stays 0
@@ -306,7 +306,7 @@ static void test_credited_sats(void) {
     for (int i = 0; i < 25; ++i) {
         assert(store_record_share_addr(s, "solo", "addr2",
                                        9000ULL + (uint64_t)i, 3.0,
-                                       0, NULL, 0, 0.0) == 0);
+                                       0, NULL, 0, 0.0, 0) == 0);
     }
     /* The legacy 6-arg helper must still work and store 0. */
     assert(store_record_share(s, "legacy", 9500, 2.0, 0, NULL) == 0);
@@ -498,7 +498,7 @@ static void test_rate_history(void) {
     /* And a share credited at one of those rates must be traceable to it —
      * exact equality, because it is the same double on both sides. */
     assert(store_record_share_addr(s, "w", "addr", 1700000400000ULL, 2.0,
-                                   0, NULL, (int64_t)(2.0 * rate2), rate2) == 0);
+                                   0, NULL, (int64_t)(2.0 * rate2), rate2, 0) == 0);
     assert(store_flush(s) == 0);
     assert(scalar_i64(db,
         "SELECT count(*) FROM shares s WHERE s.rate_used > 0 AND NOT EXISTS ("
@@ -724,7 +724,7 @@ static void test_proportional_window_floor(void) {
     for (int i = 0; i < 10; i++) {
         uint64_t ts = now_ms_ - (uint64_t)i * 60000ULL;
         assert(store_record_share_addr(s, "w1", "bcrt1qaaa", ts, 1.0,
-                                       0, NULL, 0, 0.0) == 0);
+                                       0, NULL, 0, 0.0, 0) == 0);
     }
     assert(store_flush(s) == 0);
 
@@ -785,11 +785,11 @@ static void test_proportional_window_when_every_share_is_a_block(void) {
     for (int i = 0; i < 60; i++)
         assert(store_record_share_addr(s, "w.a", "bcrt1qaaa",
                                        now_ms_ - (uint64_t)i * 1000ULL, 1.0,
-                                       1 /* is_block */, "deadbeef", 0, 0.0) == 0);
+                                       1 /* is_block */, "deadbeef", 0, 0.0, 0) == 0);
     for (int i = 0; i < 40; i++)
         assert(store_record_share_addr(s, "w.b", "bcrt1qbbb",
                                        now_ms_ - (uint64_t)i * 1000ULL, 1.0,
-                                       1 /* is_block */, "deadbeef", 0, 0.0) == 0);
+                                       1 /* is_block */, "deadbeef", 0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
 
     /* Precondition, asserted rather than assumed: no ordinary share exists, so
@@ -849,7 +849,7 @@ static void test_proportional_window_when_every_share_is_a_block(void) {
         assert(store_record_share_addr(s, "w.now", "bcrt1qccc",
                                        (now_s - 100 + (uint64_t)i) * 1000ULL,
                                        512.0, 1 /* is_block */, "deadbeef",
-                                       0, 0.0) == 0);
+                                       0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
     double d = store_worker_recent_difficulty(s, "w.now", 3600);
     if (d <= 0.0) {
@@ -883,11 +883,11 @@ static void test_worker_recent_difficulty(void) {
     for (int i = 0; i < 5; i++)
         assert(store_record_share_addr(s, "w.ramp", "bcrt1qaaa",
                                        (now_s - 300 + (uint64_t)i) * 1000ULL,
-                                       ramp[i], 0, NULL, 0, 0.0) == 0);
+                                       ramp[i], 0, NULL, 0, 0.0, 0) == 0);
     for (int i = 0; i < 20; i++)
         assert(store_record_share_addr(s, "w.ramp", "bcrt1qaaa",
                                        (now_s - 200 + (uint64_t)i) * 1000ULL,
-                                       4096.0, 0, NULL, 0, 0.0) == 0);
+                                       4096.0, 0, NULL, 0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
 
     double d = store_worker_recent_difficulty(s, "w.ramp", 3600);
@@ -899,11 +899,11 @@ static void test_worker_recent_difficulty(void) {
     for (int i = 0; i < 200; i++)
         assert(store_record_share_addr(s, "w.churn", "bcrt1qccc",
                                        (now_s - 3000 + (uint64_t)i) * 1000ULL,
-                                       (i % 4) + 1.0, 0, NULL, 0, 0.0) == 0);
+                                       (i % 4) + 1.0, 0, NULL, 0, 0.0, 0) == 0);
     for (int i = 0; i < 24; i++)
         assert(store_record_share_addr(s, "w.churn", "bcrt1qccc",
                                        (now_s - 120 + (uint64_t)i) * 1000ULL,
-                                       13680.0, 0, NULL, 0, 0.0) == 0);
+                                       13680.0, 0, NULL, 0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
     double churn = store_worker_recent_difficulty(s, "w.churn", 3600);
     if (churn != 13680.0) {
@@ -915,7 +915,7 @@ static void test_worker_recent_difficulty(void) {
     for (int i = 0; i < 3; i++)
         assert(store_record_share_addr(s, "w.new", "bcrt1qbbb",
                                        (now_s - 10 + (uint64_t)i) * 1000ULL,
-                                       999.0, 0, NULL, 0, 0.0) == 0);
+                                       999.0, 0, NULL, 0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
     assert(store_worker_recent_difficulty(s, "w.new", 3600) == 0.0);
 
@@ -948,7 +948,7 @@ static void test_proportional_window_pages(void) {
     for (int i = 0; i < 600; i++)
         assert(store_record_share_addr(s, "w.page", "bcrt1qaaa",
                                        (now_s - 600 + (uint64_t)i) * 1000ULL,
-                                       1.0, 0, NULL, 0, 0.0) == 0);
+                                       1.0, 0, NULL, 0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
     uint64_t before_ms = now_s * 1000ULL;
 
@@ -1017,13 +1017,13 @@ static void test_proportional_window_boundary_spans_a_page(void) {
     const char *addr = "bcrt1qbound";
     for (int i = 0; i < 3; i++)
         assert(store_record_share_addr(s, "w.b", addr,
-                                       (now_s - 1) * 1000ULL, 1.0, 0, NULL, 0, 0.0) == 0);
+                                       (now_s - 1) * 1000ULL, 1.0, 0, NULL, 0, 0.0, 0) == 0);
     for (int i = 0; i < 10; i++)
         assert(store_record_share_addr(s, "w.b", addr,
-                                       (now_s - 2) * 1000ULL, 1.0, 0, NULL, 0, 0.0) == 0);
+                                       (now_s - 2) * 1000ULL, 1.0, 0, NULL, 0, 0.0, 0) == 0);
     for (int i = 0; i < 10; i++)
         assert(store_record_share_addr(s, "w.b", addr,
-                                       (now_s - 3) * 1000ULL, 1.0, 0, NULL, 0, 0.0) == 0);
+                                       (now_s - 3) * 1000ULL, 1.0, 0, NULL, 0, 0.0, 0) == 0);
     assert(store_flush(s) == 0);
     uint64_t before_ms = now_s * 1000ULL;
 
@@ -1305,6 +1305,95 @@ static void test_proportional_settles_compose(void) {
     printf("  ok test_proportional_settles_compose\n");
 }
 
+/* SOLO SHARES MUST NOT ENTER THE PPLNS WINDOW.
+ *
+ * A solo miner's shares buy them their own block. Counting them again in the
+ * shared window would pay them a second time out of everybody else's work --
+ * and, worse, would size the window against difficulty that nobody in the
+ * payout set performed, so sum(payouts) would fall short of the coinbase total
+ * and coinbase_build_from_template_multi would refuse the coinbase outright.
+ *
+ * ⚠️ THE POSITIVE CONTROL IS THE POINT. The solo shares here are recorded with
+ * the SAME worker/address/timestamps/difficulty as a proportional run, so the
+ * only difference between the two halves of this test is the solo flag. An
+ * assertion that "the window has 1 address" would pass on a build where the
+ * solo shares never reached the database at all; asserting that the identical
+ * shares DO appear when solo=0 is what proves they were written, reached the
+ * window query, and were excluded on purpose. */
+static void test_solo_shares_excluded_from_pplns_window(void) {
+    uint64_t base_ts = 1700000000000ULL;
+
+    /* --- control: both miners proportional -> both in the window --------- */
+    {
+        const char *path = fresh_db_path();
+        store_cfg_t cfg = {0};
+        snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+        cfg.commit_window_ms = 20; cfg.commit_max_shares = 100;
+        store_t *s = NULL;
+        assert(store_open(&cfg, &s) == 0);
+        for (int i = 0; i < 5; i++) {
+            assert(store_record_share_addr(s, "pplns", "bcrt1qaaa",
+                base_ts + (uint64_t)i, 2.0, 0, NULL, 0, 0.0, 0) == 0);
+            assert(store_record_share_addr(s, "other", "bcrt1qbbb",
+                base_ts + 10 + (uint64_t)i, 2.0, 0, NULL, 0, 0.0, 0) == 0);
+        }
+        assert(store_flush(s) == 0);
+
+        uint64_t start_ms = 0; double actual = 0.0;
+        assert(store_prop_compute_window(s, 20.0, base_ts + 100, 0,
+                                         &start_ms, &actual, NULL) == 0);
+        pplns_addr_t *addrs = NULL; size_t n = 0;
+        assert(store_prop_window_addrs(s, start_ms, base_ts + 100, &addrs, &n) == 0);
+        assert(n == 2);                 /* both miners present */
+        assert(actual >= 20.0);         /* all 20 difficulty counted */
+        free(addrs);
+        store_close(s);
+    }
+
+    /* --- the real case: identical shares, one miner marked solo ---------- */
+    {
+        const char *path = fresh_db_path();
+        store_cfg_t cfg = {0};
+        snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+        cfg.commit_window_ms = 20; cfg.commit_max_shares = 100;
+        store_t *s = NULL;
+        assert(store_open(&cfg, &s) == 0);
+        for (int i = 0; i < 5; i++) {
+            assert(store_record_share_addr(s, "pplns", "bcrt1qaaa",
+                base_ts + (uint64_t)i, 2.0, 0, NULL, 0, 0.0, 0) == 0);
+            /* Same address, same difficulty, same window -- only solo differs. */
+            assert(store_record_share_addr(s, "solo", "bcrt1qbbb",
+                base_ts + 10 + (uint64_t)i, 2.0, 0, NULL, 0, 0.0, 1) == 0);
+        }
+        assert(store_flush(s) == 0);
+
+        /* The solo shares ARE in the table -- so a pass below is exclusion,
+         * not absence. Without this the test would pass on a build that
+         * dropped solo shares on the floor, which is a different bug. */
+        sqlite3 *db = NULL;
+        assert(sqlite3_open(path, &db) == SQLITE_OK);
+        assert(scalar_i64(db, "SELECT COUNT(*) FROM shares WHERE solo = 1") == 5);
+        assert(scalar_i64(db, "SELECT COUNT(*) FROM shares WHERE solo = 0") == 5);
+        sqlite3_close(db);
+
+        uint64_t start_ms = 0; double actual = 0.0;
+        /* Ask for the same 20.0 the control satisfied. Only 10 difficulty is
+         * now eligible, so the window must report the truncated amount rather
+         * than quietly counting solo work toward the target. */
+        (void)store_prop_compute_window(s, 20.0, base_ts + 100, 0,
+                                        &start_ms, &actual, NULL);
+        assert(actual <= 10.0 + 0.001);   /* solo difficulty NOT counted */
+
+        pplns_addr_t *addrs = NULL; size_t n = 0;
+        assert(store_prop_window_addrs(s, start_ms, base_ts + 100, &addrs, &n) == 0);
+        assert(n == 1);                                   /* solo miner absent */
+        assert(strcmp(addrs[0].address, "bcrt1qaaa") == 0);
+        free(addrs);
+        store_close(s);
+    }
+    printf("  ok test_solo_shares_excluded_from_pplns_window\n");
+}
+
 static void test_proportional(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -1325,7 +1414,7 @@ static void test_proportional(void) {
     for (size_t m = 0; m < 3; m++) {
         for (int i = 0; i < miners[m].count; i++) {
             int rc = store_record_share_addr(s, miners[m].worker, miners[m].addr,
-                base_ts + (uint64_t)(m * 10 + i), miners[m].diff, 0, NULL, 0, 0.0);
+                base_ts + (uint64_t)(m * 10 + i), miners[m].diff, 0, NULL, 0, 0.0, 0);
             assert(rc == 0);
         }
     }
@@ -1702,6 +1791,7 @@ int main(void) {
     test_worker_recent_difficulty();
     test_proportional_window_pages();
     test_proportional_window_boundary_spans_a_page();
+    test_solo_shares_excluded_from_pplns_window();
     test_proportional();
     test_store_opens_a_pre_status_database();
     test_prop_ledger_read_is_not_torn();
