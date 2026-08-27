@@ -2156,7 +2156,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                               c->payout_address, ts_now, job->height,
                               job->job_id, block_hash_hex,
                               reward_sats, fee_sats,
-                              block_accepted, submit_err);
+                              block_accepted, submit_err, c->pol_solo);
     }
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }

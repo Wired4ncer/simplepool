@@ -211,6 +211,11 @@ typedef double (*difficulty_hint_fn)(void *ctx, const char *worker_name);
  * moves money — pool_mode=proportional settles its payout plan from `job_id`
  * here — MUST gate on `accepted`. Recording a candidate is not the same act
  * as paying for one. */
+/* `solo` is 1 when the connection that solved this block arrived on a solo
+ * listener. It is here for the SETTLE path, not for accounting: the PPLNS plan
+ * is per-TEMPLATE and shared by every connection, so a solo miner solving that
+ * template would otherwise consume the plan built for the PPLNS set — marking
+ * shareholders as paid out of a coinbase that paid only the solo finder. */
 typedef void (*block_found_fn)(void *ctx,
                                const char *worker_name,
                                const char *finder_address,
@@ -218,7 +223,8 @@ typedef void (*block_found_fn)(void *ctx,
                                const char *job_id,
                                const char *block_hash,
                                int64_t reward_sats, int64_t fee_sats,
-                               int accepted, const char *submit_error);
+                               int accepted, const char *submit_error,
+                               int solo);
 
 typedef struct {
     char   bind_addr[64];

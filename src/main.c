@@ -984,7 +984,8 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
                               const char *job_id,
                               const char *block_hash,
                               int64_t reward_sats, int64_t fee_sats,
-                              int accepted, const char *submit_error) {
+                              int accepted, const char *submit_error,
+                              int solo) {
     server_ctx_t *s = (server_ctx_t *)ctx;
     /* Accepted only makes it a candidate the chain has not rejected — it is
      * still 'pending' until something verifies the block is in the chain.
@@ -1014,7 +1015,26 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
      * reconcile_blocks() resolves chain membership for the blocks_found row;
      * it does NOT unwind a settled plan. See ecash-pool-proportional-plan.md
      * §3.6. */
-    if (s && s->store && s->cfg && accepted &&
+    /* ⛔ !solo IS LOad-BEARING. The PPLNS plan is per-TEMPLATE and shared by
+     * every connection, so a solo miner can solve the very template a plan was
+     * built for. Settling it then marks the shareholders as PAID out of a
+     * coinbase that paid only the solo finder — measured on regtest 2026-08-27:
+     * the ledger swung 0.7 per claimant, turning one shareholder's +0.30 claim
+     * into a -0.40 debt for a block it received nothing from. No funds move; it
+     * is the fairness memory that decides who is paid first out of the NEXT
+     * real block, and production carries 139 non-zero prop_ledger rows.
+     *
+     * This is a defect solo INTRODUCES: before it, every block in proportional
+     * mode was a PPLNS block, so settling was unconditionally right.
+     *
+     * ⚠️ SKIP, do NOT consume or clear the plan. On a low-difficulty chain two
+     * miners can solve the same job; if a solo connection solves job X and a
+     * PPLNS connection also does, the second one SHOULD still settle. Clearing
+     * here would silently destroy that. Left alone the plan ages out of the
+     * ring, which is also the right semantics — from the PPLNS book's view a
+     * solo block is simply a block that did not pay them, like one another
+     * pool found. */
+    if (s && s->store && s->cfg && accepted && !solo &&
         strcmp(s->cfg->pool_mode, "proportional") == 0 && job_id) {
         prop_plan_t settled;
         memset(&settled, 0, sizeof settled);

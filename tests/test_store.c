@@ -1187,6 +1187,77 @@ static void test_store_opens_a_pre_status_database(void) {
     printf("  ok test_store_opens_a_pre_status_database\n");
 }
 
+/* WHY SKIPPING THE SETTLE ON A SOLO BLOCK IS LOAD-BEARING.
+ *
+ * The PPLNS plan is per-TEMPLATE and shared by every connection, so a solo
+ * miner can solve the very template a plan was built for. Settling it then
+ * records the shareholders as PAID out of a coinbase that paid only the solo
+ * finder. Measured on regtest 2026-08-27: the ledger swung 0.7 per claimant,
+ * turning one shareholder's +0.30 claim into a -0.40 debt for a block it
+ * received nothing from. Production carries 139 non-zero prop_ledger rows, so
+ * this is live, not theoretical.
+ *
+ * ⛔ WHAT THIS TEST DOES *NOT* COVER, stated plainly so nobody reads it as more
+ * than it is: the GATE ITSELF. `on_block_found_cb` is static in main.c and is
+ * not reachable from this suite, so no assertion here can prove that a solo
+ * block skips the settle. What this proves is that settling a NON-EMPTY ledger
+ * MUTATES it — i.e. that the skip is load-bearing and its absence would be
+ * destructive. The gate is covered by the regtest harness
+ * (~/solo-proof-0827, ~2 min to stand up), which is where the defect was
+ * actually caught. A unit suite missed it once already; do not let this test's
+ * green tick suggest otherwise.
+ *
+ * ⚠️ THE NON-EMPTY ASSERTION IS THE POINT (claude-eb, 2026-08-27). Their first
+ * regtest run had prop_max_outputs=8, both addresses cleared in full, and the
+ * ledger was empty before AND after — so "the solo block did not move the
+ * ledger" was true and proved nothing. An "unchanged" assertion against an
+ * empty table passes for exactly the wrong reason. */
+static void test_settle_mutates_a_nonempty_ledger(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20; cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Seed a ledger that is deliberately NOT zero-sum-empty: A overpaid, B owed. */
+    pplns_claim_t seed[2] = {
+        { .address = "bcrt1qaaa", .claim_fraction = -0.30 },
+        { .address = "bcrt1qbbb", .claim_fraction =  0.30 },
+    };
+    assert(store_prop_settle_block(s, 1000, NULL, 0, seed, 2) == 0);
+
+    pplns_claim_t *before = NULL; size_t n_before = 0;
+    assert(store_prop_get_ledger(s, &before, &n_before) == 0);
+    /* THE GUARD: if this is 0, everything below is vacuous. */
+    assert(n_before == 2 && "ledger must be NON-EMPTY or the test proves nothing");
+
+    /* Settling again with a different outcome must MOVE it. This is what a
+     * solo block would wrongly trigger, and what the !solo gate prevents. */
+    pplns_claim_t next[2] = {
+        { .address = "bcrt1qaaa", .claim_fraction =  0.40 },
+        { .address = "bcrt1qbbb", .claim_fraction = -0.40 },
+    };
+    assert(store_prop_settle_block(s, 2000, seed, 2, next, 2) == 0);
+
+    pplns_claim_t *after = NULL; size_t n_after = 0;
+    assert(store_prop_get_ledger(s, &after, &n_after) == 0);
+    assert(n_after == 2);
+
+    int moved = 0;
+    for (size_t i = 0; i < n_after; i++) {
+        for (size_t j = 0; j < n_before; j++) {
+            if (strcmp(after[i].address, before[j].address) == 0 &&
+                after[i].claim_fraction != before[j].claim_fraction) moved = 1;
+        }
+    }
+    assert(moved && "settle must mutate a non-empty ledger -- otherwise the "
+                    "!solo gate guards nothing and this test is vacuous");
+    free(before); free(after);
+    store_close(s);
+    printf("  ok test_settle_mutates_a_nonempty_ledger\n");
+}
+
 static void test_prop_ledger_read_is_not_torn(void) {
     const char *path = fresh_db_path();
     store_cfg_t cfg = {0};
@@ -1794,6 +1865,7 @@ int main(void) {
     test_solo_shares_excluded_from_pplns_window();
     test_proportional();
     test_store_opens_a_pre_status_database();
+    test_settle_mutates_a_nonempty_ledger();
     test_prop_ledger_read_is_not_torn();
     test_proportional_settles_compose();
     test_proportional_window_floor();

@@ -47,6 +47,7 @@ typedef struct {
      * pass even if the listener's mode were dropped on the floor. */
     int    last_solo;
     int    solo_shares;
+    int    last_block_solo;
 } obs_t;
 
 /* The callbacks are invoked from whichever thread handled the share, and
@@ -98,10 +99,13 @@ static int on_block(void *ctx, const char *hex, char *errbuf, size_t errlen) {
 static void on_block_found(void *ctx, const char *w, const char *addr,
                            uint64_t ts, uint32_t height, const char *job_id,
                            const char *hash, int64_t reward, int64_t fee,
-                           int accepted, const char *submit_error) {
+                           int accepted, const char *submit_error, int solo) {
     (void)w; (void)addr; (void)ts; (void)height; (void)job_id; (void)hash;
     (void)reward; (void)fee;
     obs_t *o = ctx;
+    /* Recorded so a test can assert which SCHEME solved the block, not merely
+     * that one was found. The settle gate in main.c reads exactly this flag. */
+    o->last_block_solo = solo;
     o->found_calls++;
     o->last_accepted = accepted;
     snprintf(o->last_submit_error, sizeof(o->last_submit_error), "%s",
