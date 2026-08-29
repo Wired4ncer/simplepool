@@ -1186,6 +1186,13 @@ static void test_vardiff_still_lowers_for_a_matched_miner(void) {
     if (!mined) { stratum_conn_free_for_test(c); stratum_server_free(s); return; }
     rearm_vardiff_window(s, c);
 
+    /* The window was armed at authorize, and the mining above ran inside it —
+     * 163 ms on a quiet machine, over 8 s under a sanitizer. Crossing the
+     * 1 s boundary here spends a retarget this test never asked for, and
+     * everything below then measures the wrong window. Re-arm so the test
+     * turns on behaviour rather than on how fast the box mines. */
+    stratum_conn_rearm_vardiff_for_test(c);
+
     char *out = NULL; size_t olen = 0;
     for (int i = 0; i < N - 1; ++i) {
         submit_nonce(s, c, TEST_EN2, nonce[i], &out, &olen);

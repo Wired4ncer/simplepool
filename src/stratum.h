@@ -460,6 +460,16 @@ int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
 void stratum_conn_force_difficulty_for_test(stratum_conn_t *c,
                                             double cur, double prev);
 int         stratum_conn_subscribed_for_test(const stratum_conn_t *c);
+/* Restart this connection's vardiff window, as handle_authorize does.
+ *
+ * handle_authorize arms the window, so any work a test does between the
+ * handshake and its first submit is spending window time. Brute-force mining
+ * in a test takes anywhere from a fraction of a second to several seconds
+ * under a sanitizer, so a test that mines before submitting can cross the
+ * window boundary on a loaded machine and spend a retarget it never intended
+ * -- which makes it pass or fail on timing rather than on behaviour. Call
+ * this after the setup work and before the submits that matter. */
+void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
 
 /* Live connection threads. Zero after stratum_server_stop() returns is the
  * observable form of "no connection thread can touch this server again",

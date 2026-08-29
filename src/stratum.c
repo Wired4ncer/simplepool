@@ -1205,7 +1205,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         c->vd_window_start_ms = now;
         c->vd_window_shares = 0;
         c->vd_window_min_achieved = HUGE_VAL;
-    c->vd_window_max_assigned = 0.0;
+        c->vd_window_max_assigned = 0.0;
         return;
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
@@ -2510,6 +2510,14 @@ int stratum_server_last_peer_ip_for_test(stratum_server_t *s, char *out, size_t 
     /* `found`, not `c`: once the lock is dropped another thread may have freed
      * the connection, and even comparing a dangling pointer is UB by the letter. */
     return found ? 0 : -1;
+}
+
+void stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c) {
+    if (!c) return;
+    c->vd_window_start_ms = now_ms();
+    c->vd_window_shares = 0;
+    c->vd_window_min_achieved = HUGE_VAL;
+    c->vd_window_max_assigned = 0.0;
 }
 
 /* ---- real connection thread ------------------------------------------ */
