@@ -449,6 +449,15 @@ struct stratum_conn {
     uint32_t vd_window_shares;
     double   vd_window_min_achieved;
 
+    /* The highest difficulty any job in this window was NOTIFIED under, which
+     * is not the same as the difficulty in force now: a retarget sends
+     * set_difficulty without re-notifying, so shares for jobs the miner
+     * already holds keep arriving mined against the older, higher number.
+     * The floor detector has to judge them against what they were mined
+     * under, or a legitimate downward retarget looks like a miner filtering
+     * at a floor above its assignment. 0 until the first share lands. */
+    double   vd_window_max_assigned;
+
     /* Difficulty this miner asked for, via the stratum password `d=<n>` or
      * mining.suggest_difficulty. 0 = none requested.
      *
@@ -1196,6 +1205,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
         c->vd_window_start_ms = now;
         c->vd_window_shares = 0;
         c->vd_window_min_achieved = HUGE_VAL;
+    c->vd_window_max_assigned = 0.0;
         return;
     }
     uint64_t elapsed_ms = now - c->vd_window_start_ms;
@@ -1258,13 +1268,28 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
      * that cap damps an extrapolation from a share rate, whereas this is a
      * value we watched every share in the window exceed.
      *
-     * The comparison is against old_diff, the difficulty actually in force
-     * while these shares were mined, not against the rate loop's proposal.
-     * An accepted share always achieves at least the difficulty it was
-     * accepted under, so the window minimum is always >= old_diff; testing
-     * it against a proposal the rate loop has just cut by 4x would fire on
-     * every such cut and pin the difficulty of every miner that legitimately
-     * slowed down. */
+     * The comparison is never against the rate loop's proposal: an accepted
+     * share always achieves at least the difficulty it was accepted under, so
+     * testing the window minimum against a proposal just cut by 4x would fire
+     * on every such cut and pin the difficulty of every miner that legitimately
+     * slowed down.
+     *
+     * ⛔ old_diff alone is not enough either, and the difference is not
+     * hypothetical. A retarget sends set_difficulty WITHOUT re-notifying, by
+     * design — every job already carries the difficulty it went out under — so
+     * after a cut, shares for jobs the miner still holds keep arriving mined
+     * against the OLD, higher number. Judge those against old_diff and the
+     * window minimum clears it by construction. The collision is exact: the
+     * rate loop's cut is capped at 4x and VD_FLOOR_TRIGGER is 4.0, so a full
+     * cut leaves the previous difficulty sitting precisely on the trigger, and
+     * the floor then undoes the cut the rate loop just made. Compare against
+     * the highest difficulty the window's shares were actually mined under.
+     *
+     * floor_basis >= old_diff always, so this can only make the check fire
+     * less — it cannot introduce a floor trigger where there was none. */
+    double floor_basis = c->vd_window_max_assigned > old_diff
+                       ? c->vd_window_max_assigned : old_diff;
+
     /* The floor detector needs the SAME sample floor the rate loop needs,
      * for the same reason. VD_FLOOR_MIN_SAMPLES alone reads vd_window_shares
      * directly, so it is unaffected by vardiff_min_samples — and a window
@@ -1288,7 +1313,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     int from_floor = 0;
     if (c->vd_window_shares >= floor_min_samples &&
         isfinite(c->vd_window_min_achieved) &&
-        c->vd_window_min_achieved > old_diff * VD_FLOOR_TRIGGER) {
+        c->vd_window_min_achieved > floor_basis * VD_FLOOR_TRIGGER) {
         double floor_diff = c->vd_window_min_achieved * VD_FLOOR_BACKOFF;
         if (floor_diff > new_diff) {
             new_diff = floor_diff;
@@ -1325,6 +1350,7 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     c->vd_window_start_ms = now;
     c->vd_window_shares = 0;
     c->vd_window_min_achieved = HUGE_VAL;
+    c->vd_window_max_assigned = 0.0;
 
     if (new_diff != old_diff) {
         c->difficulty = new_diff;
@@ -1809,6 +1835,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;
     c->vd_window_min_achieved = HUGE_VAL;
+    c->vd_window_max_assigned = 0.0;
 
     /* respond true */
     emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
@@ -2214,6 +2241,12 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (achieved < c->vd_window_min_achieved) {
         c->vd_window_min_achieved = achieved;
     }
+    /* assigned_diff, not c->difficulty: this share was mined against the
+     * difficulty ITS job went out under, which a retarget earlier in this
+     * window may already have moved on from. */
+    if (assigned_diff > c->vd_window_max_assigned) {
+        c->vd_window_max_assigned = assigned_diff;
+    }
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
     pthread_mutex_unlock(&c->state_lock);
     /* ⛔ This fires for EVERY candidate, accepted or not, and `accepted` is
@@ -2382,6 +2415,7 @@ stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     c->difficulty = s ? s->cfg.initial_diff : 1.0;
     c->vd_window_min_achieved = HUGE_VAL;
     pthread_mutex_init(&c->state_lock, NULL);
+    c->vd_window_max_assigned = 0.0;
     pthread_mutex_init(&c->write_lock, NULL);
     return c;
 }
