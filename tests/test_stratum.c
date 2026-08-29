@@ -48,6 +48,12 @@ typedef struct {
     int    last_solo;
     int    solo_shares;
     int    last_block_solo;
+    /* Reject instrumentation. Asserting on these is what keeps the
+     * classification honest: "a stale reject arrived" would pass on a build
+     * that labelled every one of them the same way. */
+    char    last_peer_ip[64];
+    char    last_kind[32];
+    int64_t last_job_age_ms;
 } obs_t;
 
 /* The callbacks are invoked from whichever thread handled the share, and
@@ -75,12 +81,18 @@ static void on_share(void *ctx, const char *w, const char *addr,
     snprintf(o->last_worker, sizeof(o->last_worker), "%s", w ? w : "");
     pthread_mutex_unlock(&obs_mu);
 }
-static void on_reject(void *ctx, const char *w, uint64_t ts, const char *r) {
+static void on_reject(void *ctx, const char *w, const char *peer_ip,
+                      uint64_t ts, const char *r, const char *kind,
+                      int64_t job_age_ms) {
     (void)ts; (void)w;
     obs_t *o = ctx;
     pthread_mutex_lock(&obs_mu);
     o->rejects++;
     snprintf(o->last_reason, sizeof(o->last_reason), "%s", r ? r : "");
+    snprintf(o->last_peer_ip, sizeof(o->last_peer_ip), "%s",
+             peer_ip ? peer_ip : "");
+    snprintf(o->last_kind, sizeof(o->last_kind), "%s", kind ? kind : "");
+    o->last_job_age_ms = job_age_ms;
     pthread_mutex_unlock(&obs_mu);
 }
 /* Returns 0 = the node accepted it, so the existing tests keep exercising
@@ -268,6 +280,12 @@ static void test_submit_unknown_job(void) {
     CHECK(rc == 0);
     CHECK(obs.rejects == 1);
     CHECK(strstr(obs.last_reason, "stale") != NULL);
+    /* "NOPE" is not a job id we could ever have minted, so it must be
+     * reported as such and carry no age. Before the three-way split this
+     * counted identically to a job the pool really did retire, which is the
+     * confusion the retention argument kept running aground on. */
+    CHECK(strcmp(obs.last_kind, STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    CHECK(obs.last_job_age_ms == STRATUM_JOB_AGE_NONE);
     /* response should carry an error array */
     CHECK(strstr(out, "\"error\"") != NULL);
     free(out);
@@ -685,10 +703,16 @@ static int dial(int family, int port) {
  * reason that has nothing to do with the code under test. A deploy gate that
  * fails one run in twenty teaches people to re-run it, which is worse than
  * having no gate. Writes the port actually bound back through *port. */
-static stratum_server_t *start_on(const char *addr, int *port) {
+static stratum_server_t *start_on_obs(const char *addr, int *port, obs_t *obs) {
     for (int p = *port; p < *port + 20; p++) {
         stratum_cfg_t cfg = { .bind_port = p, .max_conns = 8,
                               .initial_diff = 1.0, .vardiff_enabled = 0 };
+        if (obs) {
+            cfg.ctx = obs;
+            cfg.on_share = on_share;
+            cfg.on_reject = on_reject;
+            cfg.on_block = on_block;
+        }
         snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "%s", addr);
         stratum_server_t *s = NULL;
         if (stratum_server_start(&cfg, &s) != 0) continue;
@@ -698,6 +722,10 @@ static stratum_server_t *start_on(const char *addr, int *port) {
         return s;
     }
     return NULL;
+}
+
+static stratum_server_t *start_on(const char *addr, int *port) {
+    return start_on_obs(addr, port, NULL);
 }
 
 /* 🔴 GATE: on a dual-stack listener an IPv4 client MUST still record a dotted
@@ -2958,6 +2986,169 @@ static void test_unauthorized_submit_is_recorded_as_a_reject(void) {
     stratum_server_free(s);
 }
 
+/* "stale or unknown job" was one counter over three unrelated events, which
+ * is why the acceptance window could never be argued about from the reject
+ * table: a job the pool retired at 60 s and a garbage id from a miner that
+ * had never been issued anything looked identical. The classifier is pure, so
+ * it is tested directly rather than through a server. */
+static void test_job_id_classification_is_three_way(void) {
+    const uint64_t start = 1000000000000ull;   /* server start, wall-clock ms */
+    const uint64_t now   = start + 500000ull;
+    int64_t age = 0;
+    char id[64];
+
+    /* Nothing that could have come out of our own snprintf. */
+    CHECK(strcmp(stratum_classify_job_id(start, now, NULL, &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    CHECK(age == STRATUM_JOB_AGE_NONE);
+    CHECK(strcmp(stratum_classify_job_id(start, now, "", &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    CHECK(strcmp(stratum_classify_job_id(start, now, "NOPE", &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    CHECK(strcmp(stratum_classify_job_id(start, now, "-5", &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    CHECK(strcmp(stratum_classify_job_id(start, now, "abc-", &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    /* The sequence half must be hex too, or "1a-hello" would be read as a
+     * timestamp and reported with an age it never had. */
+    CHECK(strcmp(stratum_classify_job_id(start, now, "1a-hello", &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+    /* Long enough to overflow the accumulator: refused, not wrapped into a
+     * plausible timestamp. */
+    CHECK(strcmp(stratum_classify_job_id(start, now,
+                                         "ffffffffffffffffff-1", &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+
+    /* A job this run issued and then retired — the case the retention window
+     * is actually about, and the only one that carries a real age. */
+    snprintf(id, sizeof id, "%llx-%lx", (unsigned long long)(start + 1000ull), 7ul);
+    CHECK(strcmp(stratum_classify_job_id(start, now, id, &age),
+                 STRATUM_REJECT_KIND_EVICTED) == 0);
+    CHECK(age == (int64_t)(now - start - 1000ull));
+
+    /* Well-formed, but minted before this process existed: a previous
+     * instance issued it, so "we evicted it" would be a false statement about
+     * our own retention. */
+    snprintf(id, sizeof id, "%llx-%lx", (unsigned long long)(start - 1ull), 1ul);
+    CHECK(strcmp(stratum_classify_job_id(start, now, id, &age),
+                 STRATUM_REJECT_KIND_PRE_RESTART) == 0);
+    CHECK(age == STRATUM_JOB_AGE_NONE);
+
+    /* Beyond any plausible clock skew ahead of us: not ours. */
+    snprintf(id, sizeof id, "%llx-%lx", (unsigned long long)(now + 600000ull), 1ul);
+    CHECK(strcmp(stratum_classify_job_id(start, now, id, &age),
+                 STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
+
+    /* Slightly ahead — a wall-clock step between issue and submit. The
+     * negative age is passed through DELIBERATELY: clamping it to zero would
+     * file a clock artefact as a fresh job and quietly bias the very
+     * distribution this column exists to measure. */
+    snprintf(id, sizeof id, "%llx-%lx", (unsigned long long)(now + 1000ull), 1ul);
+    CHECK(strcmp(stratum_classify_job_id(start, now, id, &age),
+                 STRATUM_REJECT_KIND_EVICTED) == 0);
+    CHECK(age == -1000);
+    CHECK(age != STRATUM_JOB_AGE_NONE);   /* a real measurement, not "absent" */
+    printf("ok: job id classification splits evicted / pre-restart / never issued\n");
+}
+
+/* End to end through the submit path: a well-formed id for a job the server
+ * does not hold comes back with an age, not merely a reason string. */
+static void test_stale_reject_carries_a_job_age(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    /* Shaped exactly like main.c mints them, stamped now: this run issued it
+     * as far as the classifier can tell, and the server no longer has it. */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t now_ms_wall = (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+    char line[256];
+    snprintf(line, sizeof line,
+             "{\"id\":3,\"method\":\"mining.submit\","
+             "\"params\":[\"w\",\"%llx-%lx\",\"" TEST_EN2 "\","
+             "\"60000000\",\"00000000\"]}",
+             (unsigned long long)now_ms_wall, 3ul);
+    stratum_handle_message(s, c, line, &out, &olen); free(out); out=NULL;
+
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "stale") != NULL);
+    CHECK(strcmp(obs.last_kind, STRATUM_REJECT_KIND_EVICTED) == 0);
+    /* An age, and a sane one — the point of the column is that this number
+     * exists at all, since without it "would a longer window have saved this
+     * share?" cannot be answered from the data. */
+    CHECK(obs.last_job_age_ms >= 0);
+    CHECK(obs.last_job_age_ms < 60000);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a stale reject carries the age of the job it named\n");
+}
+
+/* The reject record has to carry the CONNECTION, not just the worker name: a
+ * submit refused before authorize has no worker at all, which is how a
+ * 10,776-share burst over 08-28/29 stayed unattributable to anything. Driven
+ * over a real socket on purpose — a hand-made test connection has no peer to
+ * report, so an in-process test would pass on a build that never populated
+ * the field. */
+static void test_reject_records_the_peer_ip(void) {
+    obs_t obs = {0};
+    /* Walks a port range for the reason start_on documents: a fixed port makes
+     * the suite flaky, and 39341 sat inside the dual-stack tests' own walk
+     * ranges — a collision needing no other process at all. */
+    int port = 39400;
+    stratum_server_t *s = start_on_obs("127.0.0.1", &port, &obs);
+    if (!s) { printf("skip: reject records peer ip (no free port)\n"); return; }
+
+    int cfd = dial(AF_INET, port);
+    CHECK(cfd >= 0);
+    if (cfd < 0) { stratum_server_stop(s); stratum_server_free(s); return; }
+
+    /* Submit without authorizing — the unattributable case itself. */
+    const char *msg =
+        "{\"id\":1,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}\n";
+    CHECK(write(cfd, msg, strlen(msg)) == (ssize_t)strlen(msg));
+
+    for (int i = 0; i < 500; ++i) {
+        pthread_mutex_lock(&obs_mu);
+        int done = obs.rejects > 0;
+        pthread_mutex_unlock(&obs_mu);
+        if (done) break;
+        sleep_ms(2);
+    }
+    pthread_mutex_lock(&obs_mu);
+    CHECK(obs.rejects == 1);
+    CHECK(strstr(obs.last_reason, "unauthorized") != NULL);
+    CHECK(strcmp(obs.last_peer_ip, "127.0.0.1") == 0);
+    /* Not a job lookup, so no kind and no age — and they must read as absent
+     * rather than as zero. */
+    CHECK(obs.last_kind[0] == '\0');
+    CHECK(obs.last_job_age_ms == STRATUM_JOB_AGE_NONE);
+    pthread_mutex_unlock(&obs_mu);
+
+    close(cfd);
+    stratum_server_stop(s);
+    stratum_server_free(s);
+    printf("ok: a reject records the peer ip it arrived from\n");
+}
+
 /* A candidate the node refuses is reported as not accepted, with the node's
  * reason. Before this the submitblock result was discarded and the candidate
  * was recorded as a found block regardless — on a low-difficulty chain that
@@ -3291,6 +3482,9 @@ int main(void) {
     test_rerecording_a_job_does_not_consume_ring_slots();
     test_clean_jobs_only_on_a_new_block();
     test_unauthorized_submit_is_recorded_as_a_reject();
+    test_job_id_classification_is_three_way();
+    test_stale_reject_carries_a_job_age();
+    test_reject_records_the_peer_ip();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -178,8 +178,60 @@ typedef void (*share_observer_fn)(void *ctx, const char *worker_name,
                                   uint64_t ts_ms, double difficulty,
                                   int is_block, const char *block_hash_or_null,
                                   int solo);
+/* `peer_ip` is the connection the reject arrived on, and it is the whole
+ * reason this callback carries more than a worker name: a submit refused
+ * before authorize has no worker to blame, so a burst of them (10,776 of them
+ * over 08-28/29) was unattributable to anything at all. It is never NULL —
+ * every connection has one from accept.
+ *
+ * `reject_kind` and `job_age_ms` are populated ONLY for "stale or unknown
+ * job", which is three distinct events sharing one counter: see
+ * stratum_classify_job_id. Every other reject passes (NULL, -1). */
 typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
-                                   uint64_t ts_ms, const char *reason);
+                                   const char *peer_ip, uint64_t ts_ms,
+                                   const char *reason,
+                                   const char *reject_kind,
+                                   int64_t job_age_ms);
+
+/* "no age", and deliberately NOT -1: a job id stamped slightly ahead of the
+ * clock yields a genuinely negative age, and -1 ms is one of the values it can
+ * take. A sentinel a real measurement can collide with turns a clock step into
+ * a silently absent row — the exact disappearance this column exists to make
+ * visible. INT64_MIN is not a reachable age. */
+#define STRATUM_JOB_AGE_NONE INT64_MIN
+
+/* The three ways a submit can name a job we cannot find. */
+#define STRATUM_REJECT_KIND_EVICTED      "evicted"
+#define STRATUM_REJECT_KIND_PRE_RESTART  "unknown_pre_restart"
+#define STRATUM_REJECT_KIND_NEVER_ISSUED "never_issued"
+
+/* Classify the job id from a submit that find_job() could not match, and
+ * recover the job's age from the id itself.
+ *
+ * Every job id is "<hex wall-clock ms>-<hex seq>" (main.c), so the creation
+ * time travels in the string the miner hands back — it needs no eviction
+ * index and survives the job struct being freed. Returns one of the three
+ * STRATUM_REJECT_KIND_* strings (never NULL) and writes the age in ms to
+ * *age_ms_out, or STRATUM_JOB_AGE_NONE where no age exists:
+ *
+ *   evicted             we issued it this run and retired it. Age is real,
+ *                       and it is the number the retention window has to be
+ *                       argued from.
+ *   unknown_pre_restart well-formed, but stamped before this process started:
+ *                       issued by a previous instance, which is why we have
+ *                       no record of it. Age would be meaningless.
+ *   never_issued        does not parse, or is stamped in the future beyond
+ *                       any plausible clock skew. Not ours.
+ *
+ * ⚠️ The age is measured on CLOCK_REALTIME (the id's own clock), while the
+ * TTL sweep in retire_job() runs on CLOCK_MONOTONIC. They normally track, but
+ * a wall-clock step between issue and submit skews the age REPORTED here
+ * without skewing the eviction that actually happened. A negative age is
+ * exactly that case, and is passed through rather than clamped so it stays
+ * visible in the data instead of reading as a fresh job. */
+const char *stratum_classify_job_id(uint64_t server_start_ms,
+                                    uint64_t now_wall_ms,
+                                    const char *job_id, int64_t *age_ms_out);
 /* Submits the assembled block upstream. Returns 0 when the node accepted it,
  * non-zero when it refused, filling errbuf with the node's reason.
  *

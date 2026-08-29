@@ -171,7 +171,8 @@ static void test_rejects(void) {
     for (int i = 0; i < 50; ++i) {
         char wname[32];
         snprintf(wname, sizeof(wname), "rw%d", i);
-        rc = store_record_reject(s, wname, 1000 + (uint64_t)i, "low-difficulty");
+        rc = store_record_reject(s, wname, "203.0.113.7", 1000 + (uint64_t)i,
+                                 "low-difficulty", NULL, STORE_JOB_AGE_NONE);
         assert(rc == 0);
     }
     rc = store_flush(s);
@@ -185,6 +186,86 @@ static void test_rejects(void) {
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_rejects\n");
+}
+
+/* The columns must arrive on a database that already exists — which is the
+ * only case that runs in production. A fresh-schema test proves nothing about
+ * the ALTER path, and the ALTER path is the one that has to work on the live
+ * pool's own file. Also asserts that "no age" is stored as NULL rather than 0:
+ * a stale reject whose job id predates this process has no age, and averaging
+ * it in as zero would drag the distribution the column exists to measure. */
+static void test_reject_columns_migrate_on_an_existing_db(void) {
+    const char *path = fresh_db_path();
+
+    /* The pre-instrumentation schema, verbatim. */
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db,
+        "CREATE TABLE rejects ("
+        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  worker_name TEXT,"
+        "  ts          INTEGER NOT NULL,"
+        "  reason      TEXT NOT NULL);"
+        "INSERT INTO rejects (worker_name, ts, reason)"
+        "  VALUES ('old.rig', 900, 'stale or unknown job');",
+        NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    sqlite3_close(db);
+
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    rc = store_open(&cfg, &s);
+    assert(rc == 0);
+
+    rc = store_record_reject(s, "new.rig", "203.0.113.9", 1000,
+                             "stale or unknown job", "evicted", 1234);
+    assert(rc == 0);
+    rc = store_record_reject(s, "new.rig", "203.0.113.9", 2000,
+                             "stale or unknown job", "unknown_pre_restart",
+                             STORE_JOB_AGE_NONE);
+    assert(rc == 0);
+    rc = store_flush(s);
+    assert(rc == 0);
+
+    rc = sqlite3_open(path, &db);
+    assert(rc == SQLITE_OK);
+    /* The pre-existing row keeps NULL — it is not retroactively attributable,
+     * and pretending otherwise would put one anonymous miner in the data. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM rejects WHERE worker_name = 'old.rig'"
+        "  AND peer_ip IS NULL AND reject_kind IS NULL"
+        "  AND job_age_ms IS NULL") == 1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM rejects WHERE peer_ip = '203.0.113.9'") == 2);
+    assert(scalar_i64(db,
+        "SELECT job_age_ms FROM rejects WHERE reject_kind = 'evicted'") == 1234);
+    /* Absent, not zero. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM rejects"
+        "  WHERE reject_kind = 'unknown_pre_restart' AND job_age_ms IS NULL") == 1);
+    sqlite3_close(db);
+
+    /* A clock step between minting a job and the share arriving yields a
+     * genuinely negative age. It must survive as a NUMBER: -1 as a sentinel
+     * would have swallowed it, and a NULL here is indistinguishable from a
+     * kind that has no age at all. */
+    rc = store_record_reject(s, "skew.rig", "203.0.113.9", 3000,
+                             "stale or unknown job", "evicted", -1);
+    assert(rc == 0);
+    assert(store_flush(s) == 0);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db,
+        "SELECT job_age_ms FROM rejects WHERE worker_name = 'skew.rig'") == -1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM rejects"
+        "  WHERE worker_name = 'skew.rig' AND job_age_ms IS NULL") == 0);
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_reject_columns_migrate_on_an_existing_db\n");
 }
 
 typedef struct {
@@ -1848,6 +1929,7 @@ int main(void) {
     printf("running test_store...\n");
     test_basic();
     test_rejects();
+    test_reject_columns_migrate_on_an_existing_db();
     test_concurrent();
     test_drop();
     test_credited_sats();

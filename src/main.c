@@ -1081,13 +1081,27 @@ static void on_share_cb(void *ctx, const char *worker_name,
     }
 }
 
-static void on_reject_cb(void *ctx, const char *worker_name, uint64_t ts_ms,
-                         const char *reason) {
+/* The stratum layer and the store each name their own "no age" sentinel and
+ * neither includes the other's header. This is the seam where they meet, so
+ * this is where a divergence has to fail — at compile time, not as ages
+ * silently written NULL. */
+_Static_assert(STRATUM_JOB_AGE_NONE == STORE_JOB_AGE_NONE,
+               "stratum and store disagree about the no-age sentinel");
+
+static void on_reject_cb(void *ctx, const char *worker_name,
+                         const char *peer_ip, uint64_t ts_ms,
+                         const char *reason, const char *reject_kind,
+                         int64_t job_age_ms) {
     server_ctx_t *s = (server_ctx_t *)ctx;
     if (s && s->store) {
-        store_record_reject(s->store, worker_name, ts_ms, reason);
+        store_record_reject(s->store, worker_name, peer_ip, ts_ms, reason,
+                            reject_kind, job_age_ms);
     }
     if (s && s->bcast) {
+        /* ⛔ peer_ip deliberately NOT broadcast. The broadcast feed is what
+         * the public dashboard consumes; the address of every miner that
+         * mistypes a submit does not belong on it. It is recorded in the
+         * local database for operator diagnosis and stops there. */
         broadcast_reject(s->bcast, worker_name, ts_ms, reason);
     }
 }

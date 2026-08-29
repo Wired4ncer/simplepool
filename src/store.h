@@ -37,9 +37,23 @@ int store_record_share(store_t *s, const char *worker_name,
                        uint64_t ts_ms, double difficulty,
                        int is_block, const char *share_hash_or_null);
 
-/* Record a rejected share. */
+/* "No age recorded", stored as NULL. Deliberately not -1 or 0: both are values
+ * a real age can take once a clock step is possible. Must equal
+ * STRATUM_JOB_AGE_NONE; main.c static-asserts it. */
+#define STORE_JOB_AGE_NONE INT64_MIN
+
+/* Record a rejected share.
+ *
+ * peer_ip may be NULL (stored NULL); it is what makes a reject on a
+ * connection that never authorized attributable to anything at all.
+ * reject_kind is NULL except for "stale or unknown job", and job_age_ms is
+ * negative wherever no age exists — both are stored NULL in that case, so a
+ * query can tell "no age" from "age zero" instead of averaging the two
+ * together. */
 int store_record_reject(store_t *s, const char *worker_name,
-                        uint64_t ts_ms, const char *reason);
+                        const char *peer_ip, uint64_t ts_ms,
+                        const char *reason, const char *reject_kind,
+                        int64_t job_age_ms);
 
 /* Record a block found. Thread-safe.
  * finder_address may be NULL (legacy callers); reward_sats/fee_sats may be
