@@ -359,7 +359,12 @@ int coinbase_address_to_script(const char *addr,
                 return -1;
             }
             /* OP_0 <push prog_len> <program>. */
-            if (cap < prog_len + 2) return -1;
+            if (cap < prog_len + 2) {
+                set_err(errbuf, errlen,
+                        "output buffer holds %zu bytes, need %zu for a v0 "
+                        "witness program", cap, prog_len + 2);
+                return -1;
+            }
             out[0] = 0x00;
             out[1] = (uint8_t)prog_len;
             memcpy(out + 2, prog, prog_len);
@@ -398,7 +403,11 @@ int coinbase_address_to_script(const char *addr,
         }
         /* P2TR: OP_1 <32-byte push>. Verified against the ECX node itself —
          * validateaddress returns scriptPubKey 5120<program> for a bc1p address. */
-        if (cap < 34) return -1;
+        if (cap < 34) {
+            set_err(errbuf, errlen,
+                    "output buffer holds %zu bytes, need 34 for P2TR", cap);
+            return -1;
+        }
         out[0] = 0x51; /* OP_1 */
         out[1] = 0x20; /* push 32 */
         memcpy(out + 2, prog, 32);
@@ -428,7 +437,11 @@ int coinbase_address_to_script(const char *addr,
     uint8_t ver = dec[0];
     /* P2PKH: 0x00 (mainnet), 0x6f (testnet/regtest). */
     if (ver == 0x00 || ver == 0x6f) {
-        if (cap < 25) return -1;
+        if (cap < 25) {
+            set_err(errbuf, errlen,
+                    "output buffer holds %zu bytes, need 25 for P2PKH", cap);
+            return -1;
+        }
         out[0] = 0x76; /* OP_DUP */
         out[1] = 0xa9; /* OP_HASH160 */
         out[2] = 0x14; /* push 20 */
@@ -440,7 +453,11 @@ int coinbase_address_to_script(const char *addr,
     }
     /* P2SH: 0x05 (mainnet), 0xc4 (testnet/regtest). */
     if (ver == 0x05 || ver == 0xc4) {
-        if (cap < 23) return -1;
+        if (cap < 23) {
+            set_err(errbuf, errlen,
+                    "output buffer holds %zu bytes, need 23 for P2SH", cap);
+            return -1;
+        }
         out[0] = 0xa9; /* OP_HASH160 */
         out[1] = 0x14; /* push 20 */
         memcpy(out + 2, dec + 1, 20);
@@ -1182,7 +1199,15 @@ size_t coinbase_max_payout_outputs(int64_t weight_limit,
     if (headroom < 0) return 1;
 
     /* The template already budgeted one spendable output, so the first payout
-     * costs nothing extra; the operator fee output takes one of the slots. */
+     * is credited against it; the operator fee output takes one of the slots.
+     *
+     * ⚠️ That credit is EXACT ONLY IF our payout is the same size as the output
+     * the template put there. It was, when payouts were P2WPKH and so was the
+     * template's output. With taproot payouts budgeted at 172 WU against a
+     * 124 WU P2WPKH template output (136 if the node pays P2PKH) the credit is
+     * up to 48 WU optimistic — one output's worth of slack, absorbed by
+     * COINBASE_WEIGHT_SAFETY_WU's 400 and therefore not a block-loss risk, but
+     * no longer the "costs nothing extra" this comment used to claim. */
     int64_t allowed = 1 + headroom / COINBASE_PAYOUT_TXOUT_WU - (fee_output ? 1 : 0);
     if (allowed < 1) allowed = 1;
     return ((uint64_t)allowed < (uint64_t)ceiling) ? (size_t)allowed : ceiling;

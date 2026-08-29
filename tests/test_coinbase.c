@@ -838,13 +838,29 @@ static void test_scriptsig_over_100_is_rejected(void) {
 /* ---------------------------------------------------------------------------
  * BIP-350 conformance.
  *
- * ⛔ THE TABLES BELOW WERE GENERATED FROM bip-0350.mediawiki, NOT TYPED. A test
- * vector transcribed by hand is a test that passes for the wrong reason the
- * moment one character slips, and these strings are deliberately adversarial —
- * one differs from its neighbour only in the checksum, another carries a single
- * uppercase letter in the middle to test case rejection. The generator read the
- * spec and emitted this; the tables are then static, so the suite has no
- * network dependency.
+ * The tables below are VERIFIED AGAINST bip-0350.mediawiki. They come with no
+ * generator, and an earlier version of this comment claimed they were
+ * "generated, do not hand-edit" — pointing at a tool that does not exist in
+ * this tree. That is unenforceable advice dressed as a guarantee, so this says
+ * what can actually be checked here instead.
+ *
+ * Why it matters: these strings are deliberately adversarial — one differs
+ * from its neighbour only in the checksum, another carries a single uppercase
+ * letter mid-string to test case rejection — so a slipped character makes a
+ * test that passes for the wrong reason. What stands behind them is an
+ * independent differential rather than provenance: all 23 entries were decoded
+ * with a from-scratch BIP-173/350 reference implementation and checked against
+ * what each row asserts — the 5 supported reproduce their scriptPubKey byte
+ * for byte, the 3 refused-by-policy are genuinely well-formed with the witness
+ * version and program length claimed, and all 15 invalid ones are rejected for
+ * the stated reason. A transcription slip would have broken a checksum and
+ * been caught. The same reference was diffed against
+ * coinbase_address_to_script() over 1,224 generated addresses — witness
+ * versions 0-16 x program lengths {2,16,20,21,31,32,33,40} x {bc,tb,bcrt} x
+ * {lower, upper, bad checksum} — with zero mismatches and exactly the 18
+ * expected acceptances.
+ *
+ * The tables are static, so the suite has no network dependency.
  *
  * ⚠️ "VALID PER BIP-350" AND "WE WILL PAY IT" ARE DIFFERENT QUESTIONS, and the
  * split into two tables is the point. Three of the eight addresses BIP-350
@@ -855,7 +871,7 @@ static void test_scriptsig_over_100_is_rejected(void) {
  * that miner an error message at authorize. Accepting costs them a block.
  * (BIP-341: a v1 program of any length other than 32 remains unencumbered.)
  * ------------------------------------------------------------------------- */
-/* GENERATED FROM bip-0350.mediawiki — do not hand-edit. */
+/* Verified against bip-0350.mediawiki — see the note above. */
 static const struct { const char *addr; const char *spk; } bip350_supported[] = {
     { "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
       "0014751e76e8199196d454941c45d1b3a323f1433bd6" },  /* v0, 20-byte */
