@@ -1178,6 +1178,62 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
  *
  * Parses only far enough to walk the output list. Returns 0 on success,
  * negative on malformed input; counts are untouched on failure. */
+size_t coinbase_payout_txout_bytes(const char *address) {
+    /* The largest payout script this pool emits is 34 bytes (P2TR / P2WSH), so
+     * 8 + 1 + 34 = 43 is the maximum and the fallback. */
+    const size_t max_bytes = 8 + 1 + 34;
+    uint8_t spk[64];
+    size_t spk_len = 0;
+    if (!address || !*address ||
+        coinbase_address_to_script(address, spk, sizeof spk, &spk_len,
+                                   NULL, 0) < 0 ||
+        spk_len == 0 || spk_len > 75) {
+        /* Undecodable, or long enough to need a multi-byte length varint --
+         * neither is something we emit. Charge the maximum. */
+        return max_bytes;
+    }
+    size_t n = 8 + 1 + spk_len;
+    return n > max_bytes ? max_bytes : n;
+}
+
+size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
+                                         size_t template_slot_bytes,
+                                         size_t scriptsig_growth_bytes,
+                                         size_t payout_txout_bytes,
+                                         int fee_output,
+                                         size_t budget_bytes,
+                                         size_t ceiling) {
+    if (ceiling < 1) ceiling = 1;
+    if (budget_bytes == 0) return ceiling;          /* cap disabled */
+
+    /* A caller passing 0, or less than the smallest output we emit (P2WPKH,
+     * 31 B), has a bug. Fall back to the largest, which is the direction that
+     * keeps us inside the budget. */
+    if (payout_txout_bytes < 31 || payout_txout_bytes > 8 + 1 + 34)
+        payout_txout_bytes = 8 + 1 + 34;
+
+    /* The model, verified against real blocks from this pool (996560, 996563,
+     * 996566), exact to the byte in every case:
+     *
+     *   built = template_coinbase_bytes - template_slot_bytes
+     *           + scriptsig_growth_bytes + n_total_outputs * payout_txout_bytes
+     *
+     * The subtraction is why template_slot_bytes is a parameter rather than an
+     * assumption: our first payout REPLACES the template's own spendable
+     * output, and that output is not necessarily the same size as ours. Taking
+     * it as measured keeps the estimate exact whether the node pays P2WPKH,
+     * P2PKH or anything else, instead of exact only while they happen to
+     * match. 0 means "unknown", which credits nothing and errs small. */
+    size_t fixed = template_coinbase_bytes + scriptsig_growth_bytes;
+    fixed = (template_slot_bytes < fixed) ? fixed - template_slot_bytes : 0;
+    if (fixed >= budget_bytes) return 1;            /* nothing fits; pay one */
+
+    size_t n_total = (budget_bytes - fixed) / payout_txout_bytes;
+    size_t slots = (fee_output && n_total > 0) ? n_total - 1 : n_total;
+    if (slots < 1) slots = 1;                       /* a block must pay someone */
+    return slots < ceiling ? slots : ceiling;
+}
+
 size_t coinbase_max_payout_outputs(int64_t weight_limit,
                                    int64_t tx_weight_total,
                                    size_t template_coinbase_bytes,
@@ -1213,13 +1269,18 @@ size_t coinbase_max_payout_outputs(int64_t weight_limit,
     return ((uint64_t)allowed < (uint64_t)ceiling) ? (size_t)allowed : ceiling;
 }
 
-int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
-                             char *errbuf, size_t errlen) {
+/* One walk over a template coinbase, reporting the reward and the serialized
+ * size of the single spendable output that carries it. Both public entry
+ * points below use this: the size is needed because our first payout REPLACES
+ * that output, so its bytes are the credit against a coinbase size budget. */
+static int cb_walk_template(const char *coinbase_tx_hex, int64_t *out_reward,
+                            size_t *out_slot_bytes, char *errbuf, size_t errlen) {
     if (!coinbase_tx_hex || !out_reward) {
         set_err(errbuf, errlen, "null arg");
         return -1;
     }
     *out_reward = 0;
+    if (out_slot_bytes) *out_slot_bytes = 0;
 
     size_t hexlen = strlen(coinbase_tx_hex);
     if (hexlen % 2 != 0) { set_err(errbuf, errlen, "odd coinbasetxn hex"); return -1; }
@@ -1256,14 +1317,18 @@ int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
 
     int spendable = 0;
     uint64_t reward = 0;
+    size_t slot_bytes = 0;
     for (uint64_t i = 0; i < vout; i++) {
         uint64_t val = 0, spk_len = 0;
+        size_t off_before = off;
         if (rd_u64(tx, txlen, &off, &val) < 0) { set_err(errbuf, errlen, "truncated output value"); goto done; }
         if (rd_varint(tx, txlen, &off, &spk_len) < 0) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
         if (spk_len > (uint64_t)(txlen - off)) { set_err(errbuf, errlen, "truncated scriptPubKey"); goto done; }
         int op_return = (spk_len >= 1 && tx[off] == 0x6a);
         off += spk_len;
-        if (!op_return) { spendable++; reward = val; }
+        /* Measured from the serialization, not recomputed from spk_len, so a
+         * multi-byte length varint is counted as it actually appears. */
+        if (!op_return) { spendable++; reward = val; slot_bytes = off - off_before; }
     }
     if (spendable != 1) {
         set_err(errbuf, errlen, "coinbasetxn has %d spendable outputs (expected 1)", spendable);
@@ -1272,10 +1337,24 @@ int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
     if (reward > (uint64_t)INT64_MAX) { set_err(errbuf, errlen, "reward overflows int64"); goto done; }
 
     *out_reward = (int64_t)reward;
+    if (out_slot_bytes) *out_slot_bytes = slot_bytes;
     ret = 0;
 done:
     free(tx);
     return ret;
+}
+
+int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
+                             char *errbuf, size_t errlen) {
+    return cb_walk_template(coinbase_tx_hex, out_reward, NULL, errbuf, errlen);
+}
+
+int coinbase_template_payout_slot_bytes(const char *coinbase_tx_hex,
+                                        size_t *out_bytes,
+                                        char *errbuf, size_t errlen) {
+    if (!out_bytes) { set_err(errbuf, errlen, "null arg"); return -1; }
+    int64_t reward = 0;
+    return cb_walk_template(coinbase_tx_hex, &reward, out_bytes, errbuf, errlen);
 }
 
 int coinbase_count_outputs(const char *tx_hex, int *spendable_out,

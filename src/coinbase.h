@@ -128,6 +128,15 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
 int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
                              char *errbuf, size_t errlen);
 
+/* Serialized size of the template coinbase's single spendable output, i.e. the
+ * bytes our first payout output replaces. Needed to size a coinbase byte
+ * budget exactly rather than assuming the template pays the same address type
+ * we do. Same parse and same refusals as coinbase_template_reward().
+ * Returns 0 ok, negative on error. */
+int coinbase_template_payout_slot_bytes(const char *coinbase_tx_hex,
+                                        size_t *out_bytes,
+                                        char *errbuf, size_t errlen);
+
 /* Weight of one extra coinbase payout output, sized for the LARGEST kind this
  * pool will emit: 8-byte value + 1-byte script length + 34-byte P2TR
  * scriptPubKey = 43 bytes, non-witness, so x4.
@@ -179,6 +188,50 @@ int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
  * Returns at least 1 — one payout output is already inside the server's own
  * budget, and a block must pay someone. *out_headroom_wu (optional) receives
  * the computed spare weight, or -1 when it could not be computed. */
+/* Serialized size of the payout output this address produces: 8-byte value +
+ * 1-byte script-length varint + its scriptPubKey. 31 bytes for P2WPKH, 43 for
+ * P2TR and P2WSH, 34 for P2PKH, 32 for P2SH.
+ *
+ * An address this pool cannot decode is charged the LARGEST it emits (43)
+ * rather than skipped. Such an address should never reach a payout set --
+ * stratum validates through this same decoder at authorize -- but if one does,
+ * over-charging costs a payout slot while under-charging breaks the budget the
+ * caller asked for. */
+size_t coinbase_payout_txout_bytes(const char *address);
+
+/* How many payout outputs fit inside a serialized-coinbase BYTE budget.
+ *
+ * This is a marketplace-compatibility limit, NOT a consensus one. See
+ * prop_max_coinbase_bytes in config.h for why it exists: a hashrate
+ * marketplace validates our coinbase before placing an order, and the same
+ * payout COUNT is a different SIZE depending on address type, so a pool that
+ * only caps the count can drift across a size threshold it cannot see.
+ *
+ * ⛔ payout_txout_bytes must be the LARGEST output in the candidate set, not an
+ * average and not the first one. The payouts actually emitted are a subset of
+ * the candidates chosen by claim size, so any smaller figure lets the real
+ * coinbase exceed the budget.
+ *
+ * budget_bytes 0 disables the cap and returns `ceiling` unchanged.
+ *
+ * ⚠️ Deliberately conservative: template_coinbase_bytes is counted in full,
+ * including the spendable output that our first payout REPLACES (~31 B).
+ * Parsing the template to reclaim those bytes would make the estimate exact
+ * and the failure direction worse -- a wrong parse would overstate the budget
+ * and put us back across the threshold silently, which is the failure this
+ * exists to prevent. Erring ~31 B small costs at most one payout slot.
+ *
+ * Returns at least 1: a block must pay someone, and a budget too small for
+ * even one payout is a misconfiguration to be reported, not a block to be
+ * suppressed. */
+size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
+                                         size_t template_slot_bytes,
+                                         size_t scriptsig_growth_bytes,
+                                         size_t payout_txout_bytes,
+                                         int fee_output,
+                                         size_t budget_bytes,
+                                         size_t ceiling);
+
 size_t coinbase_max_payout_outputs(int64_t weight_limit,
                                    int64_t tx_weight_total,
                                    size_t template_coinbase_bytes,

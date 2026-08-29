@@ -550,6 +550,143 @@ static void test_max_payout_outputs(void) {
     printf("ok: coinbase_max_payout_outputs adapts to template weight\n");
 }
 
+/* The coinbase BYTE budget — a marketplace-compatibility limit, not consensus.
+ *
+ * These numbers are not invented. They are the pool's own blocks, read back
+ * from the node on 2026-08-29:
+ *
+ *   height 996560 / 996563: 719 B, 19 outputs (17 P2WPKH payouts, 2 nulldata)
+ *   height 996566:          767 B, 20 outputs (17 P2WPKH payouts, 3 nulldata)
+ *
+ * and the model reproduces both EXACTLY:
+ *
+ *   built = template_bytes - template_slot_bytes + ss_growth
+ *           + n_total_outputs * payout_bytes
+ *
+ * with ss_growth 29 (extranonce 4+8, tag "/ecashpool.tech/" 16, +1 length) and
+ * a 31-byte P2WPKH payout. A model that merely looked plausible would have
+ * been wrong by one output here, which is a payout a miner does not get. */
+static void test_max_payout_outputs_bytes(void) {
+    const size_t SS = 29, P2WPKH = 31, P2TR = 43;
+    /* Template with 2 nulldata commitments + its own 31 B P2WPKH output. */
+    const size_t TMPL = 194, SLOT = 31;
+
+    /* Reproduce block 996563: 16 payouts + 1 fee = 17 outputs = 719 B. */
+    const size_t built_719 = TMPL - SLOT + SS + 17 * P2WPKH;
+    assert(built_719 == 719);
+
+    /* A budget of exactly the size we already produce must not cost a slot. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 719, 16)
+           == 16);
+    /* One byte more room changes nothing; one byte less costs exactly one. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 720, 16)
+           == 16);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 718, 16)
+           == 15);
+
+    /* THE POINT OF THE WHOLE THING: the same 16 miners on taproot addresses.
+     * 17 outputs x 43 B would be 923 B, past the 919 B that NiceHash's
+     * verificator rejected. Under a 750 B budget the cap must bite. */
+    assert(TMPL - SLOT + SS + 17 * P2TR == 923);
+    size_t tr = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2TR, 1, 750, 16);
+    assert(tr < 16);
+    /* And whatever it returns must actually FIT the budget. */
+    assert(TMPL - SLOT + SS + (tr + 1) * P2TR <= 750);
+    /* Exactly: (750 - 192) / 43 = 12 outputs, minus the fee = 11 payouts. */
+    assert(tr == 11);
+
+    /* An all-P2WPKH window under the same 750 B budget is untouched — the cap
+     * must cost nothing until address types actually grow the coinbase. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 750, 16)
+           == 16);
+
+    /* 0 disables it entirely: an upgrade must not silently reprice payouts. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2TR, 1, 0, 16) == 16);
+
+    /* The ceiling still binds over the byte cap. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 4000, 12)
+           == 12);
+
+    /* A budget too small for even one payout returns 1, not 0: a block must
+     * pay someone, and the misconfiguration is the operator's to see. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 400, 16) >= 1);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 100, 16) == 1);
+
+    /* An unknown template slot size credits nothing rather than guessing —
+     * one slot smaller, never larger. */
+    size_t known   = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 719, 64);
+    size_t unknown = coinbase_max_payout_outputs_bytes(TMPL, 0,    SS, P2WPKH, 1, 719, 64);
+    assert(unknown <= known);
+
+    /* ⛔ A nonsense per-output size must never buy slots: below the smallest
+     * output we emit, or above the largest, falls back to the largest. */
+    size_t as_tr = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2TR, 1, 750, 16);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, 0,  1, 750, 16) == as_tr);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, 30, 1, 750, 16) == as_tr);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, 99, 1, 750, 16) == as_tr);
+
+    /* The fee output really does consume one. */
+    size_t with_fee = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 719, 64);
+    size_t no_fee   = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 0, 719, 64);
+    assert(no_fee == with_fee + 1);
+
+    printf("ok: coinbase_max_payout_outputs_bytes holds the byte budget\n");
+}
+
+/* Per-address output sizes, the input the byte budget divides by. */
+static void test_payout_txout_bytes(void) {
+    assert(coinbase_payout_txout_bytes(
+               "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4") == 31);  /* P2WPKH */
+    assert(coinbase_payout_txout_bytes(
+               "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3")
+           == 43);                                                    /* P2WSH */
+    assert(coinbase_payout_txout_bytes(
+               "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0")
+           == 43);                                                    /* P2TR */
+    assert(coinbase_payout_txout_bytes("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2") == 34);
+    assert(coinbase_payout_txout_bytes("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy") == 32);
+
+    /* Undecodable is charged the LARGEST, never skipped and never the
+     * smallest: over-charging costs a payout slot, under-charging breaks the
+     * budget the operator asked for. */
+    assert(coinbase_payout_txout_bytes("not-an-address") == 43);
+    assert(coinbase_payout_txout_bytes("") == 43);
+    assert(coinbase_payout_txout_bytes(NULL) == 43);
+    /* Well-formed but refused by policy (witness v2) — unknown to us. */
+    assert(coinbase_payout_txout_bytes("bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs") == 43);
+
+    /* The weight constant and the byte figure must never disagree. */
+    assert(coinbase_payout_txout_bytes(
+               "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0") * 4
+           == COINBASE_PAYOUT_TXOUT_WU);
+
+    printf("ok: coinbase_payout_txout_bytes measures the real output\n");
+}
+
+/* The template's own spendable output, parsed rather than assumed. */
+static void test_template_payout_slot_bytes(void) {
+    char err[256] = {0};
+    size_t slot = 0;
+    assert(coinbase_template_payout_slot_bytes(ENF_COINBASE_HEX, &slot,
+                                               err, sizeof err) == 0);
+    /* Whatever the enforcer pays, it must be a plausible single output and
+     * must match what the reward walk saw. */
+    assert(slot >= 31 && slot <= 43);
+
+    int64_t reward = 0;
+    assert(coinbase_template_reward(ENF_COINBASE_HEX, &reward, err, sizeof err) == 0);
+    assert(reward > 0);
+
+    /* Same refusals as the reward walk — it is literally the same parse. */
+    assert(coinbase_template_payout_slot_bytes("nothex", &slot, err, sizeof err) < 0);
+    assert(err[0] != 0);
+    assert(coinbase_template_payout_slot_bytes(NULL, &slot, err, sizeof err) < 0);
+    assert(coinbase_template_payout_slot_bytes(ENF_COINBASE_HEX, NULL,
+                                               err, sizeof err) < 0);
+
+    printf("ok: coinbase_template_payout_slot_bytes\n");
+}
+
 /* Multi-output builder: split the 50 BTC reward three ways. */
 static void test_build_from_template_multi(void) {
     coinbase_parts_t parts = {0};
@@ -1024,6 +1161,9 @@ int main(void) {
     test_build_from_template_fee_split();
     test_template_reward();
     test_max_payout_outputs();
+    test_payout_txout_bytes();
+    test_template_payout_slot_bytes();
+    test_max_payout_outputs_bytes();
     test_build_from_template_multi();
     test_build_from_template_multi_fee();
     test_build_from_template_multi_sum_check();

@@ -252,6 +252,7 @@ static double template_net_diff(const bitcoind_template_t *t) {
 static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
                                             const proxy_config_t *cfg,
                                             int fee_output,
+                                            size_t payout_txout_bytes,
                                             int64_t *out_headroom_wu) {
     size_t ceiling = (size_t)cfg->prop_max_outputs;
     if (ceiling > PROP_PLAN_MAX_PAY) ceiling = PROP_PLAN_MAX_PAY;
@@ -270,10 +271,77 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
     size_t taglen = strlen(cfg->coinbase_tag);
     if (taglen) ss_growth += (taglen > 75 ? 75 : taglen) + 1;
 
-    return coinbase_max_payout_outputs(t->weight_limit, tx_weight,
-                                       strlen(t->coinbasetxn_hex) / 2,
-                                       ss_growth, fee_output, ceiling,
-                                       out_headroom_wu);
+    size_t n = coinbase_max_payout_outputs(t->weight_limit, tx_weight,
+                                           strlen(t->coinbasetxn_hex) / 2,
+                                           ss_growth, fee_output, ceiling,
+                                           out_headroom_wu);
+
+    /* Second, independent limit: keep the SERIALIZED COINBASE inside the
+     * operator's byte budget. The weight limit above is consensus and is very
+     * loose here (measured floor ~7,000 WU spare); this one is marketplace
+     * compatibility, and it is the tight one. See prop_max_coinbase_bytes. */
+    if (cfg->prop_max_coinbase_bytes > 0) {
+        /* Our first payout replaces the template's own spendable output, so
+         * its size is a credit. An unreadable template leaves this 0, which
+         * credits nothing and costs at most one slot -- the safe direction. */
+        size_t slot_bytes = 0;
+        (void)coinbase_template_payout_slot_bytes(t->coinbasetxn_hex,
+                                                  &slot_bytes, NULL, 0);
+        size_t by_bytes = coinbase_max_payout_outputs_bytes(
+                              strlen(t->coinbasetxn_hex) / 2, slot_bytes,
+                              ss_growth, payout_txout_bytes, fee_output,
+                              (size_t)cfg->prop_max_coinbase_bytes, ceiling);
+        if (by_bytes < n) {
+            LOG_INFO("coinbase byte budget binds: %zu payouts (was %zu) — "
+                     "template %zu B, largest payout output %zu B, budget %d B",
+                     by_bytes, n, strlen(t->coinbasetxn_hex) / 2,
+                     payout_txout_bytes, cfg->prop_max_coinbase_bytes);
+            n = by_bytes;
+        }
+    }
+    return n;
+}
+
+/* The LARGEST payout output any address that could be paid from this template
+ * would produce.
+ *
+ * ⛔ THE SET MUST BE COMPLETE. pplns_compute_payouts builds its working set
+ * from exactly two places -- the window addresses and the stored claim ledger,
+ * because a miner who has gone away is still owed and still gets paid -- and
+ * emits a SUBSET of that union. Sizing over the same union is therefore an
+ * upper bound on what is emitted. Sizing over `addrs` alone would NOT be: the
+ * first carried-forward claimant holding a bc1p address while the window is
+ * all-P2WPKH would push the coinbase past the budget unmeasured.
+ *
+ * The operator fee output is an output but not a payout, so it does not pass
+ * through that path and is added here by hand.
+ *
+ * ⚠️ If a future change can introduce a payout address from anywhere but these
+ * two arrays, it MUST be added here in the same commit. */
+static size_t prop_candidate_txout_bytes(const pplns_addr_t *addrs,
+                                         size_t n_addrs,
+                                         const pplns_claim_t *ledger_in,
+                                         size_t n_ledger_in,
+                                         const proxy_config_t *cfg,
+                                         int fee_output) {
+    size_t max_b = 0;
+    for (size_t i = 0; i < n_addrs; i++) {
+        if (!addrs[i].address[0]) continue;
+        size_t b = coinbase_payout_txout_bytes(addrs[i].address);
+        if (b > max_b) max_b = b;
+    }
+    for (size_t i = 0; i < n_ledger_in; i++) {
+        if (!ledger_in[i].address[0]) continue;
+        size_t b = coinbase_payout_txout_bytes(ledger_in[i].address);
+        if (b > max_b) max_b = b;
+    }
+    if (fee_output && cfg->operator_address[0]) {
+        size_t b = coinbase_payout_txout_bytes(cfg->operator_address);
+        if (b > max_b) max_b = b;
+    }
+    /* An empty set cannot happen here -- the caller already refused a window
+     * with no addresses -- but budgeting nothing is the unsafe direction. */
+    return max_b ? max_b : (size_t)(8 + 1 + 34);
 }
 
 /* Compute the PPLNS payout set for a template.
@@ -404,8 +472,13 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
      * from, and settlement needs it to compute its delta. */
 
     int64_t headroom_wu = -1;
+    /* Measured over the addresses this block could actually pay -- the window
+     * AND the carried-forward claim ledger, since both can be emitted. */
+    size_t payout_bytes = prop_candidate_txout_bytes(addrs, n_addrs,
+                                                     ledger_in, n_ledger_in,
+                                                     s->cfg, fee_sats > 0);
     size_t max_out = prop_max_outputs_for_template(t, s->cfg, fee_sats > 0,
-                                                   &headroom_wu);
+                                                   payout_bytes, &headroom_wu);
 
     /* The split is denominated in the difficulty these rows actually carry;
      * `actual_diff` is the walk's own measure of the same window and is used

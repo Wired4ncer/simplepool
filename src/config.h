@@ -190,6 +190,29 @@ typedef struct {
     double prop_window_k;
     int64_t prop_min_payout_sats;
     int prop_max_outputs;
+    /* prop_max_coinbase_bytes caps the SERIALIZED SIZE of the coinbase, in
+     * bytes, as a second limit alongside prop_max_outputs. 0 disables it.
+     *
+     * Why a byte cap when there is already a count cap: prop_max_outputs is a
+     * COUNT, and the same count is a different size depending on the address
+     * types being paid. A P2WPKH payout is 31 bytes on the wire and a taproot
+     * one is 43. So 16 payouts is ~702 B today and would be ~906 B if the same
+     * 16 miners moved to bc1p addresses -- a 29% growth that no configuration
+     * change caused and nothing would report.
+     *
+     * That matters because a hashrate marketplace validates our coinbase
+     * before it will place an order. NiceHash's verificator rejected this pool
+     * at 919 B and accepted it at 702 B; where in between it breaks cannot be
+     * measured, because the endpoint needs an account we do not have. So the
+     * risk is not that a block becomes invalid -- the weight budget is a
+     * separate and much looser limit -- it is that orders silently stop being
+     * placeable, weeks after the change that caused it, with no error anywhere.
+     *
+     * With this set, a taproot-heavy payout set simply gets FEWER SLOTS and the
+     * smallest payouts carry forward, exactly as they do when the count cap
+     * binds. That turns an unbounded external dependency into a bounded
+     * internal one we control. */
+    int prop_max_coinbase_bytes;
     /* Floor on how far back the window reaches, in seconds. The window is
      * whichever is LARGER: prop_window_k blocks of work, or this many seconds
      * of shares.
