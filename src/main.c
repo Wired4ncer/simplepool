@@ -291,13 +291,7 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
                               strlen(t->coinbasetxn_hex) / 2, slot_bytes,
                               ss_growth, payout_txout_bytes, fee_output,
                               (size_t)cfg->prop_max_coinbase_bytes, ceiling);
-        if (by_bytes < n) {
-            LOG_INFO("coinbase byte budget binds: %zu payouts (was %zu) — "
-                     "template %zu B, largest payout output %zu B, budget %d B",
-                     by_bytes, n, strlen(t->coinbasetxn_hex) / 2,
-                     payout_txout_bytes, cfg->prop_max_coinbase_bytes);
-            n = by_bytes;
-        }
+        if (by_bytes < n) n = by_bytes;
     }
     return n;
 }
@@ -479,6 +473,22 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                                                      s->cfg, fee_sats > 0);
     size_t max_out = prop_max_outputs_for_template(t, s->cfg, fee_sats > 0,
                                                    payout_bytes, &headroom_wu);
+
+    /* Report the byte budget only when it can actually COST someone a payout,
+     * i.e. when it caps below the number of addresses in play. Lowering a
+     * ceiling of 16 to 12 while four miners are eligible changes nothing, and
+     * logging that as "binds" trains the reader to ignore the line that
+     * matters. Measured in regtest: the first version of this said "binds" on
+     * five consecutive blocks, none of which lost a payout. */
+    if (s->cfg->prop_max_coinbase_bytes > 0) {
+        size_t candidates = n_addrs + n_ledger_in;
+        if (max_out < candidates)
+            LOG_INFO("coinbase byte budget is costing payouts: %zu of %zu "
+                     "candidates paid — largest payout output %zu B, budget "
+                     "%d B. The rest carry forward.",
+                     max_out, candidates, payout_bytes,
+                     s->cfg->prop_max_coinbase_bytes);
+    }
 
     /* The split is denominated in the difficulty these rows actually carry;
      * `actual_diff` is the walk's own measure of the same window and is used
