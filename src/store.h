@@ -37,6 +37,11 @@ int store_record_share(store_t *s, const char *worker_name,
                        uint64_t ts_ms, double difficulty,
                        int is_block, const char *share_hash_or_null);
 
+/* "No age recorded", stored as NULL. Deliberately not -1 or 0: both are values
+ * a real age can take once a clock step is possible. Must equal
+ * STRATUM_JOB_AGE_NONE; main.c static-asserts it. */
+#define STORE_JOB_AGE_NONE INT64_MIN
+
 /* Record a rejected share.
  *
  * peer_ip may be NULL (stored NULL); it is what makes a reject on a

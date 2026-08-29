@@ -285,7 +285,7 @@ static void test_submit_unknown_job(void) {
      * counted identically to a job the pool really did retire, which is the
      * confusion the retention argument kept running aground on. */
     CHECK(strcmp(obs.last_kind, STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
-    CHECK(obs.last_job_age_ms < 0);
+    CHECK(obs.last_job_age_ms == STRATUM_JOB_AGE_NONE);
     /* response should carry an error array */
     CHECK(strstr(out, "\"error\"") != NULL);
     free(out);
@@ -703,10 +703,16 @@ static int dial(int family, int port) {
  * reason that has nothing to do with the code under test. A deploy gate that
  * fails one run in twenty teaches people to re-run it, which is worse than
  * having no gate. Writes the port actually bound back through *port. */
-static stratum_server_t *start_on(const char *addr, int *port) {
+static stratum_server_t *start_on_obs(const char *addr, int *port, obs_t *obs) {
     for (int p = *port; p < *port + 20; p++) {
         stratum_cfg_t cfg = { .bind_port = p, .max_conns = 8,
                               .initial_diff = 1.0, .vardiff_enabled = 0 };
+        if (obs) {
+            cfg.ctx = obs;
+            cfg.on_share = on_share;
+            cfg.on_reject = on_reject;
+            cfg.on_block = on_block;
+        }
         snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "%s", addr);
         stratum_server_t *s = NULL;
         if (stratum_server_start(&cfg, &s) != 0) continue;
@@ -716,6 +722,10 @@ static stratum_server_t *start_on(const char *addr, int *port) {
         return s;
     }
     return NULL;
+}
+
+static stratum_server_t *start_on(const char *addr, int *port) {
+    return start_on_obs(addr, port, NULL);
 }
 
 /* 🔴 GATE: on a dual-stack listener an IPv4 client MUST still record a dotted
@@ -2990,7 +3000,7 @@ static void test_job_id_classification_is_three_way(void) {
     /* Nothing that could have come out of our own snprintf. */
     CHECK(strcmp(stratum_classify_job_id(start, now, NULL, &age),
                  STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
-    CHECK(age == -1);
+    CHECK(age == STRATUM_JOB_AGE_NONE);
     CHECK(strcmp(stratum_classify_job_id(start, now, "", &age),
                  STRATUM_REJECT_KIND_NEVER_ISSUED) == 0);
     CHECK(strcmp(stratum_classify_job_id(start, now, "NOPE", &age),
@@ -3022,7 +3032,7 @@ static void test_job_id_classification_is_three_way(void) {
     snprintf(id, sizeof id, "%llx-%lx", (unsigned long long)(start - 1ull), 1ul);
     CHECK(strcmp(stratum_classify_job_id(start, now, id, &age),
                  STRATUM_REJECT_KIND_PRE_RESTART) == 0);
-    CHECK(age == -1);
+    CHECK(age == STRATUM_JOB_AGE_NONE);
 
     /* Beyond any plausible clock skew ahead of us: not ours. */
     snprintf(id, sizeof id, "%llx-%lx", (unsigned long long)(now + 600000ull), 1ul);
@@ -3037,6 +3047,7 @@ static void test_job_id_classification_is_three_way(void) {
     CHECK(strcmp(stratum_classify_job_id(start, now, id, &age),
                  STRATUM_REJECT_KIND_EVICTED) == 0);
     CHECK(age == -1000);
+    CHECK(age != STRATUM_JOB_AGE_NONE);   /* a real measurement, not "absent" */
     printf("ok: job id classification splits evicted / pre-restart / never issued\n");
 }
 
@@ -3097,27 +3108,17 @@ static void test_stale_reject_carries_a_job_age(void) {
  * report, so an in-process test would pass on a build that never populated
  * the field. */
 static void test_reject_records_the_peer_ip(void) {
-    enum { PORT = 39341 };
     obs_t obs = {0};
-    stratum_cfg_t cfg = { .bind_port = PORT, .max_conns = 4,
-                          .initial_diff = 1.0, .idle_timeout_sec = 30,
-                          .ctx = &obs, .on_share = on_share,
-                          .on_reject = on_reject, .on_block = on_block };
-    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
-    stratum_server_t *s = NULL;
-    if (stratum_server_start(&cfg, &s) != 0 || !s) {
-        printf("skip: reject records peer ip (port %d unavailable)\n", PORT);
-        return;
-    }
+    /* Walks a port range for the reason start_on documents: a fixed port makes
+     * the suite flaky, and 39341 sat inside the dual-stack tests' own walk
+     * ranges — a collision needing no other process at all. */
+    int port = 39400;
+    stratum_server_t *s = start_on_obs("127.0.0.1", &port, &obs);
+    if (!s) { printf("skip: reject records peer ip (no free port)\n"); return; }
 
-    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    int cfd = dial(AF_INET, port);
     CHECK(cfd >= 0);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(PORT);
-    CHECK(inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) == 1);
-    CHECK(connect(cfd, (struct sockaddr *)&a, sizeof a) == 0);
+    if (cfd < 0) { stratum_server_stop(s); stratum_server_free(s); return; }
 
     /* Submit without authorizing — the unattributable case itself. */
     const char *msg =
@@ -3139,7 +3140,7 @@ static void test_reject_records_the_peer_ip(void) {
     /* Not a job lookup, so no kind and no age — and they must read as absent
      * rather than as zero. */
     CHECK(obs.last_kind[0] == '\0');
-    CHECK(obs.last_job_age_ms == -1);
+    CHECK(obs.last_job_age_ms == STRATUM_JOB_AGE_NONE);
     pthread_mutex_unlock(&obs_mu);
 
     close(cfd);

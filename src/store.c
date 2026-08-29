@@ -682,7 +682,11 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_text(s->st_insert_reject, 5, ev->reject_kind, -1, SQLITE_TRANSIENT);
         else
             sqlite3_bind_null(s->st_insert_reject, 5);
-        if (ev->job_age_ms >= 0)
+        /* NULL means "there is no age", which is ONLY the sentinel. A negative
+         * age is a real measurement — the clock stepped between the job being
+         * minted and the share arriving — and storing it as NULL would hide
+         * exactly the case worth seeing. */
+        if (ev->job_age_ms != STORE_JOB_AGE_NONE)
             sqlite3_bind_int64(s->st_insert_reject, 6, (sqlite3_int64)ev->job_age_ms);
         else
             sqlite3_bind_null(s->st_insert_reject, 6);

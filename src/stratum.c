@@ -535,7 +535,7 @@ const char *stratum_classify_job_id(uint64_t server_start_ms,
                                     uint64_t now_wall_ms,
                                     const char *job_id, int64_t *age_ms_out)
 {
-    if (age_ms_out) *age_ms_out = -1;
+    if (age_ms_out) *age_ms_out = STRATUM_JOB_AGE_NONE;
     if (!job_id || !*job_id) return STRATUM_REJECT_KIND_NEVER_ISSUED;
 
     const char *dash = strchr(job_id, '-');
@@ -1046,7 +1046,7 @@ static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
         /* Wall clock here, not the monotonic value the interval is measured
          * with: this one is a timestamp that gets stored and read back. */
         s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                         msg, NULL, -1);
+                         msg, NULL, STRATUM_JOB_AGE_NONE);
     }
     c->rl_limited = 0;
     c->rl_reported_ms = now_mono;
@@ -1609,7 +1609,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
                              "stratum username must start with a bitcoin address",
-                             NULL, -1);
+                             NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(24,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
@@ -1621,7 +1621,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
                              "pps accrual suspended (difficulty below floor)",
-                             NULL, -1);
+                             NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(24, PPS_GATED_MSG);
         return emit_response(buf, len, id, NULL, err);
@@ -1643,7 +1643,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                 char rmsg[192];
                 snprintf(rmsg, sizeof rmsg, "invalid thunder address: %s", derr);
                 s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
-                                 rmsg, NULL, -1);
+                                 rmsg, NULL, STRATUM_JOB_AGE_NONE);
             }
             c->payout_address[0] = '\0';
             char emsg[192];
@@ -1661,7 +1661,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                 char rmsg[192];
                 snprintf(rmsg, sizeof rmsg, "invalid payout address: %s", derr);
                 s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
-                                 rmsg, NULL, -1);
+                                 rmsg, NULL, STRATUM_JOB_AGE_NONE);
             }
             c->payout_address[0] = '\0';
             char emsg[192];
@@ -1908,7 +1908,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              (uint32_t)submit_version)) {
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                             "duplicate share", NULL, -1);
+                             "duplicate share", NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
@@ -1941,7 +1941,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                  job->en2_size);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                             "bad extranonce2 size", NULL, -1);
+                             "bad extranonce2 size", NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(20, "bad extranonce2 size");
         return emit_response(buf, len, id, NULL, err);
@@ -1965,7 +1965,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         free(en2_bytes);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                             "coinbase render failed", NULL, -1);
+                             "coinbase render failed", NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(25, "coinbase render failed");
         return emit_response(buf, len, id, NULL, err);
@@ -2077,7 +2077,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 	LOG_INFO("stratum: reject from worker '%s' - Reason: low difficulty (Sent Hash > Worker Target)", c->worker_name);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                             "low difficulty", NULL, -1);
+                             "low difficulty", NULL, STRATUM_JOB_AGE_NONE);
         }
         free(cb);
         cJSON *err = make_error(23, "low difficulty");
@@ -2100,7 +2100,7 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                  "(hash already credited)", c->worker_name);
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                             "duplicate share", NULL, -1);
+                             "duplicate share", NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
@@ -2221,7 +2221,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx,
                              c->worker_name[0] ? c->worker_name
                                                : "(unauthorized)",
-                             c->peer_ip, now_ms(), "unauthorized", NULL, -1);
+                             c->peer_ip, now_ms(), "unauthorized", NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(24, "unauthorized");
         return emit_response(buf, len, id, NULL, err);
@@ -2242,7 +2242,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
-                             "bad params", NULL, -1);
+                             "bad params", NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(20, "bad params");
         return emit_response(buf, len, id, NULL, err);
@@ -2261,7 +2261,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         if (s->cfg.on_reject) {
             s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
                              "pps accrual suspended (difficulty below floor)",
-                             NULL, -1);
+                             NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(24, PPS_GATED_MSG);
         return emit_response(buf, len, id, NULL, err);
@@ -2278,7 +2278,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
          * argued about from data. One clock reading serves both the record and
          * the age so they cannot disagree. */
         uint64_t    ts_now     = now_ms();
-        int64_t     job_age_ms = -1;
+        int64_t     job_age_ms = STRATUM_JOB_AGE_NONE;
         const char *kind =
             stratum_classify_job_id(s->start_ms, ts_now, jid, &job_age_ms);
         if (s->cfg.on_reject) {

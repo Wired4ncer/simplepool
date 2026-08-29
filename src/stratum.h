@@ -193,6 +193,13 @@ typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
                                    const char *reject_kind,
                                    int64_t job_age_ms);
 
+/* "no age", and deliberately NOT -1: a job id stamped slightly ahead of the
+ * clock yields a genuinely negative age, and -1 ms is one of the values it can
+ * take. A sentinel a real measurement can collide with turns a clock step into
+ * a silently absent row — the exact disappearance this column exists to make
+ * visible. INT64_MIN is not a reachable age. */
+#define STRATUM_JOB_AGE_NONE INT64_MIN
+
 /* The three ways a submit can name a job we cannot find. */
 #define STRATUM_REJECT_KIND_EVICTED      "evicted"
 #define STRATUM_REJECT_KIND_PRE_RESTART  "unknown_pre_restart"
@@ -205,7 +212,7 @@ typedef void (*reject_observer_fn)(void *ctx, const char *worker_name,
  * time travels in the string the miner hands back — it needs no eviction
  * index and survives the job struct being freed. Returns one of the three
  * STRATUM_REJECT_KIND_* strings (never NULL) and writes the age in ms to
- * *age_ms_out, or -1 where no age exists:
+ * *age_ms_out, or STRATUM_JOB_AGE_NONE where no age exists:
  *
  *   evicted             we issued it this run and retired it. Age is real,
  *                       and it is the number the retention window has to be

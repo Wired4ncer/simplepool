@@ -172,7 +172,7 @@ static void test_rejects(void) {
         char wname[32];
         snprintf(wname, sizeof(wname), "rw%d", i);
         rc = store_record_reject(s, wname, "203.0.113.7", 1000 + (uint64_t)i,
-                                 "low-difficulty", NULL, -1);
+                                 "low-difficulty", NULL, STORE_JOB_AGE_NONE);
         assert(rc == 0);
     }
     rc = store_flush(s);
@@ -225,7 +225,8 @@ static void test_reject_columns_migrate_on_an_existing_db(void) {
                              "stale or unknown job", "evicted", 1234);
     assert(rc == 0);
     rc = store_record_reject(s, "new.rig", "203.0.113.9", 2000,
-                             "stale or unknown job", "unknown_pre_restart", -1);
+                             "stale or unknown job", "unknown_pre_restart",
+                             STORE_JOB_AGE_NONE);
     assert(rc == 0);
     rc = store_flush(s);
     assert(rc == 0);
@@ -246,6 +247,22 @@ static void test_reject_columns_migrate_on_an_existing_db(void) {
     assert(scalar_i64(db,
         "SELECT count(*) FROM rejects"
         "  WHERE reject_kind = 'unknown_pre_restart' AND job_age_ms IS NULL") == 1);
+    sqlite3_close(db);
+
+    /* A clock step between minting a job and the share arriving yields a
+     * genuinely negative age. It must survive as a NUMBER: -1 as a sentinel
+     * would have swallowed it, and a NULL here is indistinguishable from a
+     * kind that has no age at all. */
+    rc = store_record_reject(s, "skew.rig", "203.0.113.9", 3000,
+                             "stale or unknown job", "evicted", -1);
+    assert(rc == 0);
+    assert(store_flush(s) == 0);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_i64(db,
+        "SELECT job_age_ms FROM rejects WHERE worker_name = 'skew.rig'") == -1);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM rejects"
+        "  WHERE worker_name = 'skew.rig' AND job_age_ms IS NULL") == 0);
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_reject_columns_migrate_on_an_existing_db\n");

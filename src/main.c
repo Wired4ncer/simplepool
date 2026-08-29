@@ -1031,6 +1031,13 @@ static void on_share_cb(void *ctx, const char *worker_name,
     }
 }
 
+/* The stratum layer and the store each name their own "no age" sentinel and
+ * neither includes the other's header. This is the seam where they meet, so
+ * this is where a divergence has to fail — at compile time, not as ages
+ * silently written NULL. */
+_Static_assert(STRATUM_JOB_AGE_NONE == STORE_JOB_AGE_NONE,
+               "stratum and store disagree about the no-age sentinel");
+
 static void on_reject_cb(void *ctx, const char *worker_name,
                          const char *peer_ip, uint64_t ts_ms,
                          const char *reason, const char *reject_kind,
