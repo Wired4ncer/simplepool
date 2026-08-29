@@ -1273,7 +1273,15 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
  * retargets, and stays stuck there forever. That is reachable now that
  * authorize can seed a difficulty from history: hardware gets swapped behind
  * the same worker name. Called on every job broadcast, so an idle connection
- * ratchets down 4x per vardiff window until it can produce shares again. */
+ * ratchets down until it can produce shares again.
+ *
+ * ⚠️ The rate is `vardiff_idle_step` (default 2.0) per EXTENDED window --
+ * vardiff_window_sec x vardiff_max_window_mult -- not 4x per vardiff window,
+ * which this comment claimed until 2026-08-29. On the live config (30 s x 8,
+ * step 2.0) that is one halving per 240 s: a solo connection started at
+ * 65,536 reaches a 1,024 floor in six halvings, about 24 MINUTES. The old
+ * wording overstated recovery by roughly 8x in wall-clock terms, and it is
+ * the comment anyone sizing a starting difficulty would reason from. */
 static void vardiff_check_idle(stratum_server_t *s, stratum_conn_t *c,
                                char **buf, size_t *len) {
     if (!s->cfg.vardiff_enabled || !c->authorized) return;
