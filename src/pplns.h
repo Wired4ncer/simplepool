@@ -44,6 +44,30 @@ typedef struct {
     int64_t sats;
 } pplns_payout_t;
 
+/* Histogram length: one bucket per possible payout-output size in bytes. The
+ * largest output this pool emits is 8 + 1 + 34 = 43 B (P2TR / P2WSH), so 44
+ * buckets cover every size including zero. */
+#define PPLNS_TXOUT_HIST_LEN 44
+
+/* Count the DISTINCT addresses this block could pay, by the size in bytes of
+ * the coinbase output each would need, into hist[0..hist_len-1].
+ *
+ * ⛔ The dedupe is not an optimisation, it is the correctness condition. The
+ * working set pplns_compute_payouts builds is one entry PER DISTINCT ADDRESS
+ * across the window and the claim ledger (see find_work), and an address in
+ * both is the ordinary case: an in-window miner also carrying a claim too
+ * small to have been paid last time. Counting it twice inflates the multiset
+ * and re-creates the over-charge the caller is sizing to avoid.
+ *
+ * Returns the number of distinct addresses counted. Zero means the caller must
+ * fall back to charging the maximum per output — that is also what happens if
+ * the internal allocation fails, which is why the count is returned rather
+ * than inferred from the histogram. */
+size_t pplns_candidate_txout_hist(const pplns_addr_t *addrs, size_t n_addrs,
+                                  const pplns_claim_t *ledger_in,
+                                  size_t n_ledger_in,
+                                  size_t *hist, size_t hist_len);
+
 /* Compute the coinbase payout list and the updated deferred-claim ledger.
  *
  * reward_after_fee: sats available to miners (block reward minus operator fee).

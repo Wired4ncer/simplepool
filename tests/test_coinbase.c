@@ -1,4 +1,5 @@
 #include "coinbase.h"
+#include "pplns.h"
 #include "stratum.h"
 
 #include <assert.h>
@@ -566,69 +567,158 @@ static void test_max_payout_outputs(void) {
  * with ss_growth 29 (extranonce 4+8, tag "/ecashpool.tech/" 16, +1 length) and
  * a 31-byte P2WPKH payout. A model that merely looked plausible would have
  * been wrong by one output here, which is a payout a miner does not get. */
+/* Fill a candidate-size histogram: `n_small` P2WPKH payees and `n_large`
+ * taproot ones. The sizes are the real ones coinbase_payout_txout_bytes
+ * returns for those address types. */
+static void mk_hist(size_t *h, size_t n_small, size_t n_large) {
+    memset(h, 0, PPLNS_TXOUT_HIST_LEN * sizeof(*h));
+    h[31] = n_small;
+    h[43] = n_large;
+}
+
 static void test_max_payout_outputs_bytes(void) {
     const size_t SS = 29, P2WPKH = 31, P2TR = 43;
     /* Template with 2 nulldata commitments + its own 31 B P2WPKH output. */
     const size_t TMPL = 194, SLOT = 31;
+    size_t h[PPLNS_TXOUT_HIST_LEN];
 
     /* Reproduce block 996563: 16 payouts + 1 fee = 17 outputs = 719 B. */
     const size_t built_719 = TMPL - SLOT + SS + 17 * P2WPKH;
     assert(built_719 == 719);
 
     /* A budget of exactly the size we already produce must not cost a slot. */
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 719, 16)
-           == 16);
+    mk_hist(h, 16, 0);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             719, 16, NULL) == 16);
     /* One byte more room changes nothing; one byte less costs exactly one. */
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 720, 16)
-           == 16);
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 718, 16)
-           == 15);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             720, 16, NULL) == 16);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             718, 16, NULL) == 15);
 
-    /* THE POINT OF THE WHOLE THING: the same 16 miners on taproot addresses.
-     * 17 outputs x 43 B would be 923 B, past the 919 B that NiceHash's
-     * verificator rejected. Under a 750 B budget the cap must bite. */
-    assert(TMPL - SLOT + SS + 17 * P2TR == 923);
-    size_t tr = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2TR, 1, 750, 16);
+    /* The predicted size is the ceiling the built coinbase must come in under,
+     * and for a homogeneous set it is exact to the byte. */
+    size_t predicted = 0;
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             719, 16, &predicted) == 16);
+    assert(predicted == 719);
+
+    /* 🔴 THE BUG THIS FUNCTION WAS CHANGED FOR: fifteen P2WPKH payees and ONE
+     * taproot payee. Charging every output the largest candidate's 43 B priced
+     * this batch at 235 + 16*43 and refused five payouts nobody was going to
+     * spend those bytes on. The real worst case is 731 B — inside the 750 B
+     * budget — so all sixteen still fit.
+     *
+     * There was no test for the mixed case before: the old "point of the whole
+     * thing" assertion passed a single scalar standing in for sixteen taproot
+     * addresses, which is the uniform case, where charging the max and summing
+     * the k largest agree by definition. */
+    mk_hist(h, 15, 1);
+    assert(TMPL - SLOT + SS + P2WPKH /* fee */ + 15 * P2WPKH + P2TR == 731);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             750, 16, NULL) == 16);
+
+    /* The same sixteen miners ALL on taproot addresses: now the budget really
+     * does bite, because the bytes really are needed. */
+    mk_hist(h, 0, 16);
+    assert(TMPL - SLOT + SS + 17 * P2TR == 923);   /* past NiceHash's 919 B */
+    size_t tr = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                  PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                                  750, 16, &predicted);
     assert(tr < 16);
-    /* And whatever it returns must actually FIT the budget. */
-    assert(TMPL - SLOT + SS + (tr + 1) * P2TR <= 750);
-    /* Exactly: (750 - 192) / 43 = 12 outputs, minus the fee = 11 payouts. */
-    assert(tr == 11);
+    /* Whatever it returns must actually FIT, counting the fee output. */
+    assert(TMPL - SLOT + SS + P2WPKH + tr * P2TR <= 750);
+    assert(TMPL - SLOT + SS + P2WPKH + (tr + 1) * P2TR > 750);
+    /* 192 + 31 fee = 223 fixed; (750 - 223) / 43 = 12 payouts. It was 11 while
+     * the fee output was charged 43 B for a 31 B P2WPKH output — a second
+     * over-charge sitting on top of the first. */
+    assert(tr == 12);
+    assert(predicted == 223 + 12 * P2TR);
 
     /* An all-P2WPKH window under the same 750 B budget is untouched — the cap
      * must cost nothing until address types actually grow the coinbase. */
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 750, 16)
-           == 16);
+    mk_hist(h, 16, 0);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             750, 16, NULL) == 16);
 
     /* 0 disables it entirely: an upgrade must not silently reprice payouts. */
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2TR, 1, 0, 16) == 16);
+    mk_hist(h, 0, 16);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             0, 16, NULL) == 16);
 
     /* The ceiling still binds over the byte cap. */
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 4000, 12)
-           == 12);
+    mk_hist(h, 16, 0);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             4000, 12, NULL) == 12);
 
     /* A budget too small for even one payout returns 1, not 0: a block must
      * pay someone, and the misconfiguration is the operator's to see. */
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 400, 16) >= 1);
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 100, 16) == 1);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             400, 16, NULL) >= 1);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             100, 16, NULL) == 1);
 
     /* An unknown template slot size credits nothing rather than guessing —
      * one slot smaller, never larger. */
-    size_t known   = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 719, 64);
-    size_t unknown = coinbase_max_payout_outputs_bytes(TMPL, 0,    SS, P2WPKH, 1, 719, 64);
+    size_t known   = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                       PPLNS_TXOUT_HIST_LEN,
+                                                       P2WPKH, 719, 64, NULL);
+    size_t unknown = coinbase_max_payout_outputs_bytes(TMPL, 0, SS, h,
+                                                       PPLNS_TXOUT_HIST_LEN,
+                                                       P2WPKH, 719, 64, NULL);
     assert(unknown <= known);
 
-    /* ⛔ A nonsense per-output size must never buy slots: below the smallest
-     * output we emit, or above the largest, falls back to the largest. */
-    size_t as_tr = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2TR, 1, 750, 16);
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, 0,  1, 750, 16) == as_tr);
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, 30, 1, 750, 16) == as_tr);
-    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, 99, 1, 750, 16) == as_tr);
+    /* ⛔ A size we cannot emit is a caller bug, and must never buy slots: it is
+     * charged the largest output instead. The old scalar clamp is gone with the
+     * scalar, so the same gate lives here, on the histogram. Sizes are sourced
+     * through coinbase_payout_txout_bytes, which cannot produce these — this
+     * catches a future caller that fills the histogram some other way. */
+    size_t bogus[PPLNS_TXOUT_HIST_LEN];
+    memset(bogus, 0, sizeof bogus);
+    bogus[10] = 16;                              /* smaller than any real output */
+    mk_hist(h, 0, 16);
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, bogus,
+                                             PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                             750, 16, NULL)
+           == coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                                750, 16, NULL));
+    /* No histogram at all is the same conservative answer. */
+    assert(coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, NULL, 0, P2WPKH,
+                                             750, 16, NULL)
+           == coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                PPLNS_TXOUT_HIST_LEN, P2WPKH,
+                                                750, 16, NULL));
 
-    /* The fee output really does consume one. */
-    size_t with_fee = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 1, 719, 64);
-    size_t no_fee   = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, P2WPKH, 0, 719, 64);
+    /* The fee output really does consume one — with more candidates than the
+     * budget can hold, so the count is budget-bound rather than candidate-bound
+     * and the fee's cost is visible. */
+    mk_hist(h, 30, 0);
+    size_t with_fee = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                        PPLNS_TXOUT_HIST_LEN,
+                                                        P2WPKH, 719, 64, NULL);
+    size_t no_fee   = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                        PPLNS_TXOUT_HIST_LEN,
+                                                        0, 719, 64, NULL);
     assert(no_fee == with_fee + 1);
+    /* And a LARGER fee output can only cost more, never buy payouts. The exact
+     * difference is no longer fixed at one: the fee is charged its own real
+     * size now, not the same number every payout slot is charged. */
+    size_t tr_fee = coinbase_max_payout_outputs_bytes(TMPL, SLOT, SS, h,
+                                                      PPLNS_TXOUT_HIST_LEN,
+                                                      P2TR, 719, 64, NULL);
+    assert(tr_fee <= with_fee);
+    assert(no_fee >= with_fee);
 
     printf("ok: coinbase_max_payout_outputs_bytes holds the byte budget\n");
 }

@@ -223,14 +223,36 @@ size_t coinbase_payout_txout_bytes(const char *address);
  *
  * Returns at least 1: a block must pay someone, and a budget too small for
  * even one payout is a misconfiguration to be reported, not a block to be
- * suppressed. */
+ * suppressed.
+ *
+ * size_hist[b] is the number of DISTINCT candidate addresses whose payout
+ * output would be b bytes (see pplns_candidate_txout_hist, which is what
+ * makes "distinct" mean the same thing here as in the payout set). The budget
+ * is spent on the k LARGEST of them, not on k copies of the largest — the
+ * difference is a whole payout slot per taproot address in the window.
+ * NULL, or a histogram with fewer entries than the ceiling, charges the
+ * maximum for whatever is not described, which is the conservative direction.
+ *
+ * fee_txout_bytes is the operator fee output's exact size, or 0 when no fee
+ * output is emitted. It is a fixed cost, not a payout slot.
+ *
+ * out_predicted_bytes (optional) receives the serialized coinbase size this
+ * function budgeted for at the returned count — the ceiling the built coinbase
+ * must come in under. It exists so the caller can check the estimate against
+ * the bytes the builder actually produces: charging every slot the largest
+ * candidate left so much slack that an under-estimate was structurally
+ * impossible, and summing the k largest deliberately removes that slack. 0
+ * means "not computed" (the cap is disabled, or the budget is too small for
+ * even one payout). */
 size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
                                          size_t template_slot_bytes,
                                          size_t scriptsig_growth_bytes,
-                                         size_t payout_txout_bytes,
-                                         int fee_output,
+                                         const size_t *size_hist,
+                                         size_t hist_len,
+                                         size_t fee_txout_bytes,
                                          size_t budget_bytes,
-                                         size_t ceiling);
+                                         size_t ceiling,
+                                         size_t *out_predicted_bytes);
 
 size_t coinbase_max_payout_outputs(int64_t weight_limit,
                                    int64_t tx_weight_total,

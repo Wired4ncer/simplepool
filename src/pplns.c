@@ -45,6 +45,45 @@ static int cmp_claim_desc(const void *a, const void *b) {
     return 0;
 }
 
+/* Documented in pplns.h. Mirrors find_work's dedupe deliberately: same rule,
+ * same two arrays, same order, so the set sized here is the set that gets
+ * paid. It is O(n^2) in the number of addresses, exactly like find_work — a
+ * pool with hundreds of addresses in the window measures in microseconds, and
+ * matching the existing rule is worth more here than a faster one that could
+ * drift away from it. */
+size_t pplns_candidate_txout_hist(const pplns_addr_t *addrs, size_t n_addrs,
+                                  const pplns_claim_t *ledger_in,
+                                  size_t n_ledger_in,
+                                  size_t *hist, size_t hist_len)
+{
+    if (!hist || hist_len == 0) return 0;
+    for (size_t i = 0; i < hist_len; i++) hist[i] = 0;
+
+    size_t cap = n_addrs + n_ledger_in;
+    if (cap == 0) return 0;
+    const char **seen = (const char **)calloc(cap, sizeof(*seen));
+    if (!seen) return 0;   /* caller charges the maximum: the safe direction */
+    size_t nseen = 0;
+
+    for (size_t pass = 0; pass < 2; pass++) {
+        size_t n = pass == 0 ? n_addrs : n_ledger_in;
+        for (size_t i = 0; i < n; i++) {
+            const char *a = pass == 0 ? addrs[i].address : ledger_in[i].address;
+            if (!a || !a[0]) continue;
+            int dup = 0;
+            for (size_t k = 0; k < nseen; k++)
+                if (strcmp(seen[k], a) == 0) { dup = 1; break; }
+            if (dup) continue;
+            seen[nseen++] = a;
+            size_t b = coinbase_payout_txout_bytes(a);
+            if (b >= hist_len) b = hist_len - 1;
+            hist[b]++;
+        }
+    }
+    free(seen);
+    return nseen;
+}
+
 int pplns_compute_payouts(int64_t reward_after_fee,
                           const pplns_addr_t *addrs, size_t n_addrs,
                           pplns_claim_t *ledger, size_t ledger_cap,

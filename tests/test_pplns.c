@@ -411,7 +411,67 @@ static void test_rejects_bad_input(void) {
     printf("ok: invalid input refused\n");
 }
 
+/* ⚠️ A working dedupe and a missing one are indistinguishable when the two
+ * arrays do not overlap — so this fixture overlaps ON PURPOSE, and asserts the
+ * raw count differs from the deduped one. Without that, the test would pass on
+ * a build that never deduped at all.
+ *
+ * The address sizes are asserted inside the fixture too: every one of these
+ * must actually decode, because an address the sizer cannot read is charged the
+ * maximum, and a fixture made entirely of undecodable addresses would produce a
+ * uniform histogram that looks exactly like a correct one. */
+static void test_candidate_hist_dedupes_like_the_payout_set(void) {
+    const char *W = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";   /* P2WPKH */
+    const char *T = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"; /* P2TR */
+    const char *S = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"; /* P2WSH */
+    assert(coinbase_payout_txout_bytes(W) == 31);
+    assert(coinbase_payout_txout_bytes(T) == 43);
+    assert(coinbase_payout_txout_bytes(S) == 43);
+
+    pplns_addr_t  addrs[2]  = {0};
+    pplns_claim_t ledger[2] = {0};
+    snprintf(addrs[0].address, sizeof addrs[0].address, "%s", W);
+    snprintf(addrs[1].address, sizeof addrs[1].address, "%s", T);
+    /* T is in the window AND carrying a claim — the ordinary case for a miner
+     * whose last payout fell under min_payout_sats, and the case that makes a
+     * sum over both arrays double-charge it. */
+    snprintf(ledger[0].address, sizeof ledger[0].address, "%s", T);
+    snprintf(ledger[1].address, sizeof ledger[1].address, "%s", S);
+
+    size_t hist[PPLNS_TXOUT_HIST_LEN];
+    size_t n = pplns_candidate_txout_hist(addrs, 2, ledger, 2, hist,
+                                          PPLNS_TXOUT_HIST_LEN);
+    /* Three distinct addresses out of four rows: the dedupe DID something. */
+    assert(n == 3);
+    assert(n != 2 + 2);
+    assert(hist[31] == 1);
+    assert(hist[43] == 2);      /* T once, not twice, plus S */
+
+    /* Empty addresses are skipped exactly as the payout path skips them. */
+    pplns_addr_t blanks[2] = {0};
+    snprintf(blanks[0].address, sizeof blanks[0].address, "%s", W);
+    assert(pplns_candidate_txout_hist(blanks, 2, NULL, 0, hist,
+                                      PPLNS_TXOUT_HIST_LEN) == 1);
+    assert(hist[31] == 1);
+
+    /* An address the sizer cannot read is charged the largest output we emit,
+     * never skipped and never assumed small. */
+    pplns_addr_t junk[1] = {0};
+    snprintf(junk[0].address, sizeof junk[0].address, "not-an-address");
+    assert(pplns_candidate_txout_hist(junk, 1, NULL, 0, hist,
+                                      PPLNS_TXOUT_HIST_LEN) == 1);
+    assert(hist[43] == 1);
+
+    /* Nothing to size at all: the count is zero, which is the caller's signal
+     * to charge the maximum per output rather than to budget nothing. */
+    assert(pplns_candidate_txout_hist(NULL, 0, NULL, 0, hist,
+                                      PPLNS_TXOUT_HIST_LEN) == 0);
+
+    printf("ok: candidate histogram dedupes by address, like the payout set\n");
+}
+
 int main(void) {
+    test_candidate_hist_dedupes_like_the_payout_set();
     test_simple_split();
     test_paid_in_full_leaves_no_ledger();
     test_remainder_to_largest();

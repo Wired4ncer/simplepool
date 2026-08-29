@@ -1199,24 +1199,23 @@ size_t coinbase_payout_txout_bytes(const char *address) {
 size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
                                          size_t template_slot_bytes,
                                          size_t scriptsig_growth_bytes,
-                                         size_t payout_txout_bytes,
-                                         int fee_output,
+                                         const size_t *size_hist,
+                                         size_t hist_len,
+                                         size_t fee_txout_bytes,
                                          size_t budget_bytes,
-                                         size_t ceiling) {
+                                         size_t ceiling,
+                                         size_t *out_predicted_bytes) {
+    if (out_predicted_bytes) *out_predicted_bytes = 0;
+    const size_t max_b = 8 + 1 + 34;   /* P2TR / P2WSH, the largest we emit */
+    const size_t min_b = 8 + 1 + 22;   /* P2WPKH, the smallest we emit */
     if (ceiling < 1) ceiling = 1;
     if (budget_bytes == 0) return ceiling;          /* cap disabled */
-
-    /* A caller passing 0, or less than the smallest output we emit (P2WPKH,
-     * 31 B), has a bug. Fall back to the largest, which is the direction that
-     * keeps us inside the budget. */
-    if (payout_txout_bytes < 31 || payout_txout_bytes > 8 + 1 + 34)
-        payout_txout_bytes = 8 + 1 + 34;
 
     /* The model, verified against real blocks from this pool (996560, 996563,
      * 996566), exact to the byte in every case:
      *
      *   built = template_coinbase_bytes - template_slot_bytes
-     *           + scriptsig_growth_bytes + n_total_outputs * payout_txout_bytes
+     *           + scriptsig_growth_bytes + sum(sizes of the outputs emitted)
      *
      * The subtraction is why template_slot_bytes is a parameter rather than an
      * assumption: our first payout REPLACES the template's own spendable
@@ -1226,12 +1225,61 @@ size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
      * match. 0 means "unknown", which credits nothing and errs small. */
     size_t fixed = template_coinbase_bytes + scriptsig_growth_bytes;
     fixed = (template_slot_bytes < fixed) ? fixed - template_slot_bytes : 0;
-    if (fixed >= budget_bytes) return 1;            /* nothing fits; pay one */
 
-    size_t n_total = (budget_bytes - fixed) / payout_txout_bytes;
-    size_t slots = (fee_output && n_total > 0) ? n_total - 1 : n_total;
-    if (slots < 1) slots = 1;                       /* a block must pay someone */
-    return slots < ceiling ? slots : ceiling;
+    /* The operator fee output is always emitted and its address is known, so
+     * it is an EXACT term here rather than one more max-sized payout slot.
+     * Charging it 43 B for a 31 B P2WPKH output was a second over-charge on
+     * top of the one this function exists to remove. A size outside the range
+     * we emit is a caller bug; charge the maximum, which is the direction that
+     * keeps us inside the budget. */
+    if (fee_txout_bytes) {
+        if (fee_txout_bytes < min_b || fee_txout_bytes > max_b)
+            fee_txout_bytes = max_b;
+        fixed += fee_txout_bytes;
+    }
+    if (fixed >= budget_bytes) return 1;            /* nothing fits; pay one */
+    size_t left = budget_bytes - fixed;
+    const size_t left0 = left;
+
+    /* Sizes we cannot emit are a caller bug rather than a small output: fold
+     * them into the largest bucket instead of trusting the number. */
+    size_t bogus = 0;
+    if (size_hist)
+        for (size_t b = 0; b < hist_len; b++)
+            if (b < min_b || b > max_b) bogus += size_hist[b];
+
+    /* Largest candidate first. Payout selection is by claim size, not by byte
+     * size, so ANY k addresses that get emitted are together no larger than
+     * the k largest candidates — which makes this prefix sum an upper bound
+     * whichever k are chosen, and an exact one when the sizes are uniform.
+     * Charging every slot the single largest candidate's size (what this used
+     * to do) is also an upper bound, but a far looser one: one taproot payee
+     * in the window priced all sixteen outputs at 43 B and cost real payouts
+     * for bytes nobody was going to spend. */
+    size_t n = 0;
+    for (size_t b = max_b + 1; b-- > min_b; ) {
+        size_t count = (size_hist && b < hist_len) ? size_hist[b] : 0;
+        if (b == max_b) count += bogus;
+        while (count-- > 0 && n < ceiling) {
+            if (left < b) {
+                if (out_predicted_bytes) *out_predicted_bytes = fixed + (left0 - left);
+                return n ? n : 1;                   /* a block must pay someone */
+            }
+            left -= b;
+            n++;
+        }
+        if (n >= ceiling) break;
+    }
+
+    /* Slots left over with no candidate to put in them — an empty or absent
+     * histogram, or simply fewer addresses than the ceiling. Charge the
+     * maximum for the remainder, the same rule an undecodable address gets:
+     * the extra slots can never be emitted (there is nobody to pay in them),
+     * so this only ever holds the answer DOWN, which is the safe direction. */
+    while (n < ceiling && left >= max_b) { left -= max_b; n++; }
+
+    if (out_predicted_bytes) *out_predicted_bytes = fixed + (left0 - left);
+    return n ? n : 1;
 }
 
 size_t coinbase_max_payout_outputs(int64_t weight_limit,
