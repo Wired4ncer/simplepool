@@ -76,7 +76,13 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  worker_name TEXT,"
     "  ts          INTEGER NOT NULL,"
-    "  reason      TEXT NOT NULL"
+    "  reason      TEXT NOT NULL,"
+    /* peer_ip: the connection, not the worker — a submit refused before
+     * authorize has no worker name to carry. reject_kind/job_age_ms are set
+     * only for "stale or unknown job"; NULL everywhere else. */
+    "  peer_ip     TEXT,"
+    "  reject_kind TEXT,"
+    "  job_age_ms  INTEGER"
     ");"
     "CREATE INDEX IF NOT EXISTS rejects_ts_idx ON rejects(ts);"
     "CREATE TABLE IF NOT EXISTS blocks_found ("
@@ -381,6 +387,14 @@ static const char *MIGRATIONS_SQL[] = {
      * and writes them, which is why the dashboard renders "unknown" rather
      * than guessing — a banner that asserts the wrong network is worse than
      * one that admits it doesn't know yet. */
+    /* Reject instrumentation, added 2026-08-29. Rows written before it keep
+     * NULL in all three, which is honest: the peer and the job age were never
+     * recorded, not zero. ⛔ Any rate computed across the upgrade must scope
+     * itself to `peer_ip IS NOT NULL`, or the old rows read as one anonymous
+     * miner. */
+    "ALTER TABLE rejects      ADD COLUMN peer_ip     TEXT",
+    "ALTER TABLE rejects      ADD COLUMN reject_kind TEXT",
+    "ALTER TABLE rejects      ADD COLUMN job_age_ms  INTEGER",
     "ALTER TABLE pool_meta    ADD COLUMN network          TEXT",
     "ALTER TABLE pool_meta    ADD COLUMN network_source   TEXT",
     "ALTER TABLE pool_meta    ADD COLUMN coinbase_tag     TEXT",
@@ -424,6 +438,9 @@ static const char *MIGRATIONS_SQL[] = {
 #define HASH_STR_MAX    96
 #define REASON_MAX      128
 #define ADDR_MAX        128
+/* INET6_ADDRSTRLEN (46) rounded up; stratum hands us a text address. */
+#define PEER_IP_MAX     64
+#define REJECT_KIND_MAX 32
 
 #define WORKER_CACHE_SLOTS 16384
 
@@ -443,6 +460,9 @@ typedef struct {
     char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
     char     hash[HASH_STR_MAX];
     char     reason[REASON_MAX];
+    char     peer_ip[PEER_IP_MAX];          /* EV_REJECT only: may be empty */
+    char     reject_kind[REJECT_KIND_MAX];  /* EV_REJECT only: may be empty */
+    int64_t  job_age_ms;                    /* EV_REJECT only: <0 = no age */
 } event_t;
 
 typedef struct {
@@ -651,6 +671,21 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_null(s->st_insert_reject, 1);
         sqlite3_bind_int64(s->st_insert_reject, 2, (sqlite3_int64)(ev->ts_ms / 1000));
         sqlite3_bind_text(s->st_insert_reject, 3, ev->reason, -1, SQLITE_TRANSIENT);
+        /* NULL rather than "" or 0 for anything absent: a stale reject with no
+         * age (an id from before this process started) and one aged zero are
+         * different facts, and a bare column cannot say which it is. */
+        if (ev->peer_ip[0])
+            sqlite3_bind_text(s->st_insert_reject, 4, ev->peer_ip, -1, SQLITE_TRANSIENT);
+        else
+            sqlite3_bind_null(s->st_insert_reject, 4);
+        if (ev->reject_kind[0])
+            sqlite3_bind_text(s->st_insert_reject, 5, ev->reject_kind, -1, SQLITE_TRANSIENT);
+        else
+            sqlite3_bind_null(s->st_insert_reject, 5);
+        if (ev->job_age_ms >= 0)
+            sqlite3_bind_int64(s->st_insert_reject, 6, (sqlite3_int64)ev->job_age_ms);
+        else
+            sqlite3_bind_null(s->st_insert_reject, 6);
         if (sqlite3_step(s->st_insert_reject) != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
         } else {
@@ -920,7 +955,9 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "  (worker_id, ts, difficulty, is_block, block_hash, credited_sats, rate_used, solo) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     static const char *Q_INS_REJECT =
-        "INSERT INTO rejects (worker_name, ts, reason) VALUES (?, ?, ?)";
+        "INSERT INTO rejects (worker_name, ts, reason, peer_ip, reject_kind, "
+        "                     job_age_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?)";
     /* OR IGNORE so a re-found hash cannot fail the step. The dedupe guard
      * in stratum is an in-memory ring that empties on restart, so the same
      * solution can legitimately arrive twice; once the unique index exists
@@ -1052,7 +1089,9 @@ int store_record_share_addr(store_t *s, const char *worker_name,
 }
 
 int store_record_reject(store_t *s, const char *worker_name,
-                        uint64_t ts_ms, const char *reason)
+                        const char *peer_ip, uint64_t ts_ms,
+                        const char *reason, const char *reject_kind,
+                        int64_t job_age_ms)
 {
     if (!s || !reason) return -1;
     event_t ev;
@@ -1061,6 +1100,10 @@ int store_record_reject(store_t *s, const char *worker_name,
     ev.ts_ms = ts_ms;
     if (worker_name) strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
     strncpy(ev.reason, reason, REASON_MAX - 1);
+    if (peer_ip)     strncpy(ev.peer_ip, peer_ip, PEER_IP_MAX - 1);
+    if (reject_kind) strncpy(ev.reject_kind, reject_kind, REJECT_KIND_MAX - 1);
+    /* memset above zeroes this, and zero is a VALID age. Set it explicitly. */
+    ev.job_age_ms = job_age_ms;
     if (enqueue(s, &ev) != 0) {
         atomic_fetch_add(&s->shares_dropped, 1);
         return -1;

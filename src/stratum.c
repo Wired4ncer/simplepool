@@ -271,6 +271,12 @@ int stratum_job_set_payouts(stratum_job_t *j,
 struct stratum_server {
     stratum_cfg_t cfg;
 
+    /* Wall clock at startup. Job ids carry the wall-clock ms they were minted
+     * at, and this is what separates "an id we issued this run and retired"
+     * from "an id issued by the process that ran before this one" — the second
+     * is not a retention problem and must not be counted as one. */
+    uint64_t start_ms;
+
     /* Derived once from cfg.pool_mode so the render path does not string-compare
      * per share. Mirrors cfg.pps_enabled, which main.c derives the same way. */
     int prop_enabled;
@@ -517,6 +523,43 @@ static int hex_nib(char c) {
     if (c >= 'a' && c <= 'f') return 10 + c - 'a';
     if (c >= 'A' && c <= 'F') return 10 + c - 'A';
     return -1;
+}
+
+/* A job id stamped further ahead than this is not one of ours whatever it
+ * parses as. Generous on purpose: the point is to exclude a foreign id, not
+ * to police our own clock. */
+#define JOB_ID_FUTURE_SLACK_MS 300000u
+
+/* Documented in stratum.h. Pure, and public only so a test can reach it. */
+const char *stratum_classify_job_id(uint64_t server_start_ms,
+                                    uint64_t now_wall_ms,
+                                    const char *job_id, int64_t *age_ms_out)
+{
+    if (age_ms_out) *age_ms_out = -1;
+    if (!job_id || !*job_id) return STRATUM_REJECT_KIND_NEVER_ISSUED;
+
+    const char *dash = strchr(job_id, '-');
+    if (!dash || dash == job_id || !dash[1])
+        return STRATUM_REJECT_KIND_NEVER_ISSUED;
+
+    uint64_t ms = 0;
+    for (const char *q = job_id; q < dash; ++q) {
+        int nib = hex_nib(*q);
+        if (nib < 0) return STRATUM_REJECT_KIND_NEVER_ISSUED;
+        /* An id long enough to overflow is not one we minted: refuse it
+         * rather than wrap into a plausible-looking timestamp. */
+        if (ms > (UINT64_MAX >> 4)) return STRATUM_REJECT_KIND_NEVER_ISSUED;
+        ms = (ms << 4) | (uint64_t)nib;
+    }
+    for (const char *q = dash + 1; *q; ++q)
+        if (hex_nib(*q) < 0) return STRATUM_REJECT_KIND_NEVER_ISSUED;
+
+    if (ms > now_wall_ms + JOB_ID_FUTURE_SLACK_MS)
+        return STRATUM_REJECT_KIND_NEVER_ISSUED;
+    if (ms < server_start_ms) return STRATUM_REJECT_KIND_PRE_RESTART;
+
+    if (age_ms_out) *age_ms_out = (int64_t)now_wall_ms - (int64_t)ms;
+    return STRATUM_REJECT_KIND_EVICTED;
 }
 
 /* Decode hex into out (exactly outlen bytes). Returns 0 on success. */
@@ -1002,7 +1045,8 @@ static void submit_rate_report(stratum_server_t *s, stratum_conn_t *c,
                  (unsigned long long)c->rl_limited_total);
         /* Wall clock here, not the monotonic value the interval is measured
          * with: this one is a timestamp that gets stored and read back. */
-        s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(), msg);
+        s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                         msg, NULL, -1);
     }
     c->rl_limited = 0;
     c->rl_reported_ms = now_mono;
@@ -1563,8 +1607,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     size_t addr_len = dot ? (size_t)(dot - worker) : strlen(worker);
     if (addr_len == 0 || addr_len >= sizeof(c->payout_address)) {
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, worker, now_ms(),
-                             "stratum username must start with a bitcoin address");
+            s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
+                             "stratum username must start with a bitcoin address",
+                             NULL, -1);
         }
         cJSON *err = make_error(24,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
@@ -1574,8 +1619,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * which is the only point at which they can still do something about it. */
     if (pps_gated(s)) {
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, worker, now_ms(),
-                             "pps accrual suspended (difficulty below floor)");
+            s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
+                             "pps accrual suspended (difficulty below floor)",
+                             NULL, -1);
         }
         cJSON *err = make_error(24, PPS_GATED_MSG);
         return emit_response(buf, len, id, NULL, err);
@@ -1596,7 +1642,8 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             if (s->cfg.on_reject) {
                 char rmsg[192];
                 snprintf(rmsg, sizeof rmsg, "invalid thunder address: %s", derr);
-                s->cfg.on_reject(s->cfg.ctx, worker, now_ms(), rmsg);
+                s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
+                                 rmsg, NULL, -1);
             }
             c->payout_address[0] = '\0';
             char emsg[192];
@@ -1613,7 +1660,8 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             if (s->cfg.on_reject) {
                 char rmsg[192];
                 snprintf(rmsg, sizeof rmsg, "invalid payout address: %s", derr);
-                s->cfg.on_reject(s->cfg.ctx, worker, now_ms(), rmsg);
+                s->cfg.on_reject(s->cfg.ctx, worker, c->peer_ip, now_ms(),
+                                 rmsg, NULL, -1);
             }
             c->payout_address[0] = '\0';
             char emsg[192];
@@ -1859,8 +1907,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (dedupe_check_and_add(c, job->job_id, en2, ntime, nonce,
                              (uint32_t)submit_version)) {
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "duplicate share");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "duplicate share", NULL, -1);
         }
         cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
@@ -1892,8 +1940,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                  "%zu bytes, expected %zu", c->worker_name, en2_len,
                  job->en2_size);
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "bad extranonce2 size");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "bad extranonce2 size", NULL, -1);
         }
         cJSON *err = make_error(20, "bad extranonce2 size");
         return emit_response(buf, len, id, NULL, err);
@@ -1916,8 +1964,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         pthread_mutex_unlock(&c->state_lock);
         free(en2_bytes);
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "coinbase render failed");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "coinbase render failed", NULL, -1);
         }
         cJSON *err = make_error(25, "coinbase render failed");
         return emit_response(buf, len, id, NULL, err);
@@ -2028,8 +2076,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (!is_block && !meets_worker) {
 	LOG_INFO("stratum: reject from worker '%s' - Reason: low difficulty (Sent Hash > Worker Target)", c->worker_name);
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "low difficulty");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "low difficulty", NULL, -1);
         }
         free(cb);
         cJSON *err = make_error(23, "low difficulty");
@@ -2051,8 +2099,8 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         LOG_INFO("stratum: reject from worker '%s' - Reason: duplicate share "
                  "(hash already credited)", c->worker_name);
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "duplicate share");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "duplicate share", NULL, -1);
         }
         cJSON *err = make_error(22, "duplicate share");
         return emit_response(buf, len, id, NULL, err);
@@ -2173,7 +2221,7 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             s->cfg.on_reject(s->cfg.ctx,
                              c->worker_name[0] ? c->worker_name
                                                : "(unauthorized)",
-                             now_ms(), "unauthorized");
+                             c->peer_ip, now_ms(), "unauthorized", NULL, -1);
         }
         cJSON *err = make_error(24, "unauthorized");
         return emit_response(buf, len, id, NULL, err);
@@ -2193,8 +2241,8 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
     if (!cJSON_IsArray(params) || cJSON_GetArraySize(params) < 5) {
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "bad params");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "bad params", NULL, -1);
         }
         cJSON *err = make_error(20, "bad params");
         return emit_response(buf, len, id, NULL, err);
@@ -2211,8 +2259,9 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * already decided not to pay for. */
     if (pps_gated(s)) {
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "pps accrual suspended (difficulty below floor)");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, now_ms(),
+                             "pps accrual suspended (difficulty below floor)",
+                             NULL, -1);
         }
         cJSON *err = make_error(24, PPS_GATED_MSG);
         return emit_response(buf, len, id, NULL, err);
@@ -2222,9 +2271,19 @@ static int handle_submit(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * the submit below is still reading it. */
     stratum_job_t *job = find_job(s, jid);
     if (!job) {
+        /* One reason string, three different events — classify before
+         * answering. Until this landed, a job we retired at 60 s, an id from
+         * the process that ran before this one, and outright garbage all
+         * incremented the same counter, so the retention window could not be
+         * argued about from data. One clock reading serves both the record and
+         * the age so they cannot disagree. */
+        uint64_t    ts_now     = now_ms();
+        int64_t     job_age_ms = -1;
+        const char *kind =
+            stratum_classify_job_id(s->start_ms, ts_now, jid, &job_age_ms);
         if (s->cfg.on_reject) {
-            s->cfg.on_reject(s->cfg.ctx, c->worker_name, now_ms(),
-                             "stale or unknown job");
+            s->cfg.on_reject(s->cfg.ctx, c->worker_name, c->peer_ip, ts_now,
+                             "stale or unknown job", kind, job_age_ms);
         }
         cJSON *err = make_error(21, "stale or unknown job");
         return emit_response(buf, len, id, NULL, err);
@@ -2822,6 +2881,8 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     pthread_mutex_init(&s->conns_lock, NULL);
     atomic_init(&s->stop, 0);
     atomic_init(&s->conn_count, 0);
+
+    s->start_ms = now_ms();
 
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
