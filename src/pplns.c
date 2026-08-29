@@ -89,7 +89,9 @@ int pplns_compute_payouts(int64_t reward_after_fee,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
-                          pplns_payout_t *payouts, size_t *n_payouts_out) {
+                          pplns_payout_t *payouts, size_t *n_payouts_out,
+                          size_t *n_eligible_out) {
+    if (n_eligible_out) *n_eligible_out = 0;
     if (!addrs || n_addrs == 0 || !payouts || !n_payouts_out ||
         !ledger || !n_ledger_out ||
         reward_after_fee <= 0 || min_payout_sats < COINBASE_DUST_SATS ||
@@ -188,14 +190,22 @@ int pplns_compute_payouts(int64_t reward_after_fee,
     /* Emit the addresses whose cut clears the threshold, best claims first,
      * up to the output cap. A negative claim is an address that was paid early
      * and is repaying; it is never emitted. */
-    size_t n_emit = 0;
-    for (size_t i = 0; i < nw && n_emit < max_outputs; i++) {
+    size_t n_emit = 0, n_eligible = 0;
+    for (size_t i = 0; i < nw; i++) {
         if (rank[i]->claim <= 0.0) break;   /* sorted: nothing better follows */
         double cut = (double)reward_after_fee * rank[i]->claim;
         if (cut < (double)min_payout_sats) break;
-        rank[i]->emit = 1;
-        n_emit++;
+        /* Counted with the cap IGNORED: the caller cannot otherwise tell a cap
+         * that cost someone a payout from one that capped below a set the
+         * payout floor had already excluded. Both look like "fewer paid than
+         * candidates" from outside, and only the first is worth reporting. */
+        n_eligible++;
+        if (n_emit < max_outputs) {
+            rank[i]->emit = 1;
+            n_emit++;
+        }
     }
+    if (n_eligible_out) *n_eligible_out = n_eligible;
     /* A block must pay someone: if the threshold excluded everybody, pay the
      * single largest positive claim regardless. */
     if (n_emit == 0) {

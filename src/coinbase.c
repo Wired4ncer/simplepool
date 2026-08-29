@@ -1277,6 +1277,14 @@ size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
      * the extra slots can never be emitted (there is nobody to pay in them),
      * so this only ever holds the answer DOWN, which is the safe direction. */
     while (n < ceiling && left >= max_b) { left -= max_b; n++; }
+    /* ⚠️ So the returned n is a CEILING, not a claim about how many addresses
+     * exist: with fewer candidates than the ceiling it can exceed the real
+     * candidate count. Harmless — the payout loop is bounded by its own working
+     * set, so a phantom slot never becomes an output — but it also inflates
+     * out_predicted_bytes in that regime, which makes the caller's
+     * under-estimate alarm slack exactly when the cap is not binding. The alarm
+     * is tight when it matters and loose when it does not; a quiet alarm on a
+     * small window is therefore weaker evidence than it looks. */
 
     if (out_predicted_bytes) *out_predicted_bytes = fixed + (left0 - left);
     return n ? n : 1;

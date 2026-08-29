@@ -59,7 +59,7 @@ static void test_paid_in_full_leaves_no_ledger(void) {
     pplns_payout_t payouts[8] = {0};
     size_t np = 0, nl = 0;
     assert(pplns_compute_payouts(REWARD + 7, addrs, 3, ledger, 8, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np) == 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) == 0);
     assert(np == 3);
     assert_conserves(payouts, np, REWARD + 7);
     if (nl != 0) {
@@ -81,7 +81,7 @@ static void test_simple_split(void) {
 
     int rc = pplns_compute_payouts(REWARD, addrs, 2,
                                    ledger, 4, 0, &n_ledger,
-                                   THRESHOLD, 12, payouts, &n_payouts);
+                                   THRESHOLD, 12, payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts == 2);
     assert_conserves(payouts, n_payouts, REWARD);
@@ -101,7 +101,7 @@ static void test_remainder_to_largest(void) {
 
     int rc = pplns_compute_payouts(100000001LL, addrs, 3,
                                    ledger, 8, 0, &n_ledger,
-                                   THRESHOLD, 12, payouts, &n_payouts);
+                                   THRESHOLD, 12, payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts == 3);
     assert_conserves(payouts, n_payouts, 100000001LL);
@@ -119,7 +119,7 @@ static void test_deferred_miner_does_not_shrink_the_coinbase(void) {
 
     int rc = pplns_compute_payouts(REWARD, addrs, 2,
                                    ledger, 8, 0, &n_ledger,
-                                   THRESHOLD, 12, payouts, &n_payouts);
+                                   THRESHOLD, 12, payouts, &n_payouts, NULL);
     assert(rc == 0);
     /* The BitAxe's 0.1% cut is 100,000 sats, under the 1,000,000 threshold. */
     assert(n_payouts == 1);
@@ -145,7 +145,7 @@ static void test_released_claim_does_not_overpay(void) {
     /* Block 1: BitAxe deferred. */
     pplns_addr_t b1[] = { { "whale", 999.0 }, { "bitaxe", 1.0 } };
     assert(pplns_compute_payouts(REWARD, b1, 2, ledger, 8, 0, &n_ledger,
-                                 THRESHOLD, 12, payouts, &n_payouts) == 0);
+                                 THRESHOLD, 12, payouts, &n_payouts, NULL) == 0);
     assert_conserves(payouts, n_payouts, REWARD);
 
     /* Block 2: the BitAxe has done real work and now clears the threshold. Its
@@ -154,7 +154,7 @@ static void test_released_claim_does_not_overpay(void) {
     size_t n_ledger2 = 0;
     assert(pplns_compute_payouts(REWARD, b2, 2, ledger, 8, n_ledger,
                                  &n_ledger2, THRESHOLD, 12,
-                                 payouts, &n_payouts) == 0);
+                                 payouts, &n_payouts, NULL) == 0);
     assert(n_payouts == 2);
     assert_conserves(payouts, n_payouts, REWARD);
 
@@ -178,7 +178,7 @@ static void test_departed_miner_is_still_paid(void) {
 
     pplns_addr_t b1[] = { { "whale", 99.0 }, { "gone", 1.0 } };
     assert(pplns_compute_payouts(REWARD, b1, 2, ledger, 8, 0, &n_ledger,
-                                 5000000LL, 12, payouts, &n_payouts) == 0);
+                                 5000000LL, 12, payouts, &n_payouts, NULL) == 0);
     assert(payout_for(payouts, n_payouts, "gone") == 0);
     assert(claim_for(ledger, n_ledger, "gone") > 0.0);
 
@@ -187,7 +187,7 @@ static void test_departed_miner_is_still_paid(void) {
     pplns_addr_t b2[] = { { "whale", 100.0 } };
     size_t n2 = 0;
     assert(pplns_compute_payouts(REWARD, b2, 1, ledger, 8, n_ledger, &n2,
-                                 500000LL, 12, payouts, &n_payouts) == 0);
+                                 500000LL, 12, payouts, &n_payouts, NULL) == 0);
     assert_conserves(payouts, n_payouts, REWARD);
     assert(payout_for(payouts, n_payouts, "gone") == 1000000LL);
     printf("ok: a departed miner still collects what it is owed\n");
@@ -207,7 +207,7 @@ static void test_max_outputs_cap(void) {
     int rc = pplns_compute_payouts(REWARD, addrs, 20,
                                    ledger, 64, 0, &n_ledger,
                                    COINBASE_DUST_SATS, 12,
-                                   payouts, &n_payouts);
+                                   payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts <= 12);
     assert_conserves(payouts, n_payouts, REWARD);
@@ -237,7 +237,7 @@ static void test_conserves_over_many_blocks(void) {
         size_t n_payouts = 0, n_out = 0;
         int rc = pplns_compute_payouts(reward, addrs, n,
                                        ledger, 256, n_ledger, &n_out,
-                                       THRESHOLD, 12, payouts, &n_payouts);
+                                       THRESHOLD, 12, payouts, &n_payouts, NULL);
         assert(rc == 0);
         assert(n_payouts >= 1 && n_payouts <= 12);
         assert_conserves(payouts, n_payouts, reward);
@@ -289,7 +289,7 @@ static void test_every_payout_clears_the_floor(void) {
     size_t np = 0, nl = 0;
 
     assert(pplns_compute_payouts(reward, addrs, 3, ledger, 8, n_in, &nl,
-                                 floor_sats, 12, payouts, &np) == 0);
+                                 floor_sats, 12, payouts, &np, NULL) == 0);
     assert_conserves(payouts, np, reward);
 
     /* PRECONDITION: on the pre-renormalisation cut, "small" clears the floor --
@@ -334,7 +334,7 @@ static void test_residuals_are_per_address(void) {
     size_t np = 0, nl = 0;
 
     assert(pplns_compute_payouts(REWARD, addrs, 3, ledger, 8, 0, &nl,
-                                 2000000LL, 12, payouts, &np) == 0);
+                                 2000000LL, 12, payouts, &np, NULL) == 0);
     assert(np == 2);
     assert_conserves(payouts, np, REWARD);
 
@@ -368,17 +368,17 @@ static void test_refuses_a_ledger_that_is_not_zero_sum(void) {
     /* b is owed 0.2 of a reward and nobody carries the matching debt. */
     pplns_claim_t broken[8] = { { "b", +0.2 } };
     assert(pplns_compute_payouts(REWARD, addrs, 1, broken, 8, 1, &nl,
-                                 THRESHOLD, 12, payouts, &np) < 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
 
     /* The mirror: a debt with no matching claim. */
     pplns_claim_t broken2[8] = { { "b", -0.2 } };
     assert(pplns_compute_payouts(REWARD, addrs, 1, broken2, 8, 1, &nl,
-                                 THRESHOLD, 12, payouts, &np) < 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
 
     /* Balanced, and the same block is fine. */
     pplns_claim_t ok[8] = { { "b", +0.2 }, { "c", -0.2 } };
     assert(pplns_compute_payouts(REWARD, addrs, 1, ok, 8, 2, &nl,
-                                 THRESHOLD, 12, payouts, &np) == 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) == 0);
     printf("ok: a ledger that does not sum to zero is refused, not absorbed\n");
 }
 
@@ -394,20 +394,20 @@ static void test_rejects_bad_input(void) {
      * of the rows themselves, which is the point of deriving it from them. */
     pplns_addr_t zero_diff[] = { { "a", 0.0 } };
     assert(pplns_compute_payouts(REWARD, zero_diff, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np) < 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
     pplns_addr_t neg_diff[] = { { "a", -1.0 } };
     assert(pplns_compute_payouts(REWARD, neg_diff, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np) < 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
     assert(pplns_compute_payouts(0, addrs, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np) < 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
     assert(pplns_compute_payouts(REWARD, addrs, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 0, payouts, &np) < 0);
+                                 THRESHOLD, 0, payouts, &np, NULL) < 0);
     /* Below the dust limit is not a valid threshold. */
     assert(pplns_compute_payouts(REWARD, addrs, 1, ledger, 4, 0, &nl,
-                                 100, 12, payouts, &np) < 0);
+                                 100, 12, payouts, &np, NULL) < 0);
     /* Ledger capacity too small for the working set. */
     assert(pplns_compute_payouts(REWARD, addrs, 1, ledger, 0, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np) < 0);
+                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
     printf("ok: invalid input refused\n");
 }
 
@@ -470,7 +470,53 @@ static void test_candidate_hist_dedupes_like_the_payout_set(void) {
     printf("ok: candidate histogram dedupes by address, like the payout set\n");
 }
 
+/* n_eligible answers "did the OUTPUT CAP cost anyone a payout?" — a question
+ * the payout count alone cannot answer, because fewer payouts than candidates
+ * is the ordinary state: most candidates are under the floor or repaying. A
+ * caller comparing payouts against candidates reports a loss on nearly every
+ * block, which is how a log line ends up crying wolf until nobody reads it. */
+static void test_eligible_count_separates_cap_from_floor(void) {
+    pplns_claim_t  ledger[16]  = {0};
+    pplns_payout_t payouts[16] = {0};
+    size_t n_payouts = 0, n_ledger = 0, n_eligible = 0;
+
+    /* Five equal miners, all comfortably above the floor, capped at two. The
+     * cap really did cost three people a payout. */
+    pplns_addr_t five[] = { { "a", 20.0 }, { "b", 20.0 }, { "c", 20.0 },
+                            { "d", 20.0 }, { "e", 20.0 } };
+    int rc = pplns_compute_payouts(REWARD, five, 5, ledger, 16, 0, &n_ledger,
+                                   THRESHOLD, 2, payouts, &n_payouts,
+                                   &n_eligible);
+    assert(rc == 0);
+    assert(n_payouts == 2);
+    assert(n_eligible == 5);        /* measured with the cap ignored */
+
+    /* Same five addresses, but three of them so small their cut cannot clear
+     * the floor, and a cap far above the set. Two get paid — and the cap cost
+     * NOBODY anything. A report keyed on "payouts < candidates" would fire
+     * here; one keyed on n_eligible does not. */
+    memset(ledger, 0, sizeof ledger);
+    memset(payouts, 0, sizeof payouts);
+    n_payouts = n_ledger = n_eligible = 0;
+    pplns_addr_t lopsided[] = { { "a", 50.0 },     { "b", 50.0 },
+                                { "c", 0.00001 },  { "d", 0.00001 },
+                                { "e", 0.00001 } };
+    rc = pplns_compute_payouts(REWARD, lopsided, 5, ledger, 16, 0, &n_ledger,
+                               THRESHOLD, 16, payouts, &n_payouts, &n_eligible);
+    assert(rc == 0);
+    assert(n_payouts == 2);
+    assert(n_eligible == 2);        /* the FLOOR excluded the other three */
+    /* The two conditions the caller reports on: the cap is not saturated, and
+     * no more addresses cleared the floor than were paid. Either one alone is
+     * enough to stay silent, and both are false here. */
+    assert(!(n_payouts == 16));
+    assert(!(n_eligible > n_payouts));
+
+    printf("ok: eligible count tells an output cap from a payout floor\n");
+}
+
 int main(void) {
+    test_eligible_count_separates_cap_from_floor();
     test_candidate_hist_dedupes_like_the_payout_set();
     test_simple_split();
     test_paid_in_full_leaves_no_ledger();

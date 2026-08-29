@@ -484,24 +484,6 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                                                    fee_bytes, &headroom_wu,
                                                    &predicted_bytes);
 
-    /* Report the byte budget only when it can actually COST someone a payout,
-     * i.e. when it caps below the number of addresses in play. Lowering a
-     * ceiling of 16 to 12 while four miners are eligible changes nothing, and
-     * logging that as "binds" trains the reader to ignore the line that
-     * matters. Measured in regtest: the first version of this said "binds" on
-     * five consecutive blocks, none of which lost a payout. */
-    if (s->cfg->prop_max_coinbase_bytes > 0) {
-        /* DISTINCT candidates: n_addrs + n_ledger_in double-counts every miner
-         * that is both in the window and carrying a claim, which made this
-         * line claim payouts were being lost on blocks where none were. */
-        if (max_out < candidates)
-            LOG_INFO("coinbase byte budget is costing payouts: %zu of %zu "
-                     "candidates paid — sized on the %zu largest, fee output "
-                     "%zu B, budget %d B. The rest carry forward.",
-                     max_out, candidates, max_out, fee_bytes,
-                     s->cfg->prop_max_coinbase_bytes);
-    }
-
     /* The split is denominated in the difficulty these rows actually carry;
      * `actual_diff` is the walk's own measure of the same window and is used
      * for reporting only. They are two queries against a table the writer
@@ -521,12 +503,12 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                  actual_diff, addr_diff, n_addrs);
     }
 
-    size_t n_payouts = 0, n_ledger_out = 0;
+    size_t n_payouts = 0, n_ledger_out = 0, n_eligible = 0;
     int rc = pplns_compute_payouts(reward_after_fee,
                                    addrs, n_addrs,
                                    ledger, ledger_cap, n_ledger_in, &n_ledger_out,
                                    s->cfg->prop_min_payout_sats, max_out,
-                                   plan->payouts, &n_payouts);
+                                   plan->payouts, &n_payouts, &n_eligible);
     free(addrs);
     if (rc < 0 || n_payouts == 0) {
         free(ledger); free(ledger_in);
@@ -534,6 +516,31 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                  "(rc=%d, %zu addresses, window difficulty %.2f); falling back",
                  rc, n_addrs, actual_diff);
         return 1;
+    }
+
+    /* Report the byte budget only when it can actually COST someone a payout.
+     *
+     * Two conditions, and both are needed. The cap must be SATURATED — if fewer
+     * addresses were paid than the cap allowed, something other than the cap
+     * did the excluding — and more addresses must have cleared the payout floor
+     * than were paid. Comparing payouts against the CANDIDATE count instead
+     * reports a loss on nearly every block, because most candidates are below
+     * the floor or repaying an advance and were never going to be paid.
+     *
+     * ⚠️ This is the same failure as the one measured in regtest earlier: the
+     * first version of this line said "byte budget binds" on five consecutive
+     * blocks that lost nothing, because the arithmetic was right and the claim
+     * the line made about it was false. n_eligible is an upper bound on what an
+     * uncapped run would have emitted, so the line says how many cleared the
+     * floor -- it does not assert an exact number of payouts lost. */
+    if (s->cfg->prop_max_coinbase_bytes > 0 &&
+        n_payouts == max_out && n_eligible > n_payouts) {
+        LOG_INFO("coinbase byte budget is costing payouts: cap %zu reached, "
+                 "%zu of %zu distinct candidates cleared the payout floor — "
+                 "sized on the %zu largest, fee output %zu B, budget %d B. "
+                 "The rest carry forward.",
+                 max_out, n_eligible, candidates, max_out, fee_bytes,
+                 s->cfg->prop_max_coinbase_bytes);
     }
 
     /* Conservation guard. A coinbase must pay the reward exactly: short and the

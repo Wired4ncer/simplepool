@@ -1518,7 +1518,7 @@ static void test_proportional(void) {
     int64_t reward = 1000000LL;
     int rc = pplns_compute_payouts(reward, addrs, n_addrs,
                                    ledger_buf, 16, 0, &n_ledger_out,
-                                   300000LL, 12, payouts, &n_payouts);
+                                   300000LL, 12, payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts >= 1 && n_payouts < n_addrs);
 
@@ -1587,7 +1587,7 @@ static void test_proportional(void) {
     size_t n_second = 0;
     rc = pplns_compute_payouts(reward, addrs, n_addrs,
                                ledger_buf, 16, n_ledger_out, &n_second,
-                               300000LL, 12, payouts, &n_payouts);
+                               300000LL, 12, payouts, &n_payouts, NULL);
     assert(rc == 0);
     rc = store_prop_settle_block(s, base_ts + 300, snapshot, n_snapshot,
                                  ledger_buf, n_second);

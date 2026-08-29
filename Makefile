@@ -160,7 +160,8 @@ asan:
 		src/stratum.c src/coinbase.c src/share.c src/sha256.c src/thunder.c \
 		src/log.c src/cjson/cJSON.c -lpthread
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_store tests/test_store.c \
-		src/store.c src/pplns.c src/log.c $(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
+		src/store.c src/pplns.c src/coinbase.c src/sha256.c src/log.c \
+		$(PLATFORM_LDFLAGS) -lsqlite3 -lpthread
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_coinbase tests/test_coinbase.c \
 		src/coinbase.c src/sha256.c
 	$(CC) $(ASAN_CFLAGS) -o $(ASAN_DIR)/test_share tests/test_share.c \

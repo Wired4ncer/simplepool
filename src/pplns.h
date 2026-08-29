@@ -103,11 +103,20 @@ size_t pplns_candidate_txout_hist(const pplns_addr_t *addrs, size_t n_addrs,
  * anything else describes claims no coinbase can settle. Refusing hands the
  * caller its documented fallback (pay the finder directly) instead of quietly
  * assigning the imbalance to whoever happens to be largest. */
+/* n_eligible_out (optional): how many addresses cleared the payout floor with
+ * max_outputs IGNORED. It is what makes "the output cap cost someone a payout"
+ * answerable: fewer payouts than candidates is the ordinary state — most
+ * candidates are below the floor or repaying an advance — so a caller
+ * comparing payouts against the candidate count reports a loss on nearly every
+ * block. Compare against this instead. It is measured before renormalisation,
+ * so it is an upper bound on what an uncapped run would have emitted, and a
+ * caller must not state it as an exact count of payouts lost. */
 int pplns_compute_payouts(int64_t reward_after_fee,
                           const pplns_addr_t *addrs, size_t n_addrs,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
-                          pplns_payout_t *payouts, size_t *n_payouts_out);
+                          pplns_payout_t *payouts, size_t *n_payouts_out,
+                          size_t *n_eligible_out);
 
 #endif /* SIMPLEPOOL_PPLNS_H */
