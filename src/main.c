@@ -1606,6 +1606,21 @@ int main(int argc, char **argv) {
                  network, network_src, cfg.pool_mode, cfg.fee_bps,
                  cfg.coinbase_tag, cfg.operator_address,
                  pps ? " pool_btc=" : "", pps ? cfg.pool_btc_address : "");
+        /* Say what the payout caps ACTUALLY are at startup. A config value
+         * that is parsed without complaint is not thereby in effect -- an
+         * unknown key here only warns -- and prop_max_coinbase_bytes exists
+         * precisely to prevent a silent drift, so it must not itself be
+         * silent. This line is how "is it on?" gets answered from the journal
+         * instead of from the config file the operator believes is loaded. */
+        if (strcmp(cfg.pool_mode, "proportional") == 0) {
+            if (cfg.prop_max_coinbase_bytes > 0)
+                LOG_INFO("payout caps: max %d outputs, coinbase <= %d bytes",
+                         cfg.prop_max_outputs, cfg.prop_max_coinbase_bytes);
+            else
+                LOG_INFO("payout caps: max %d outputs, no coinbase byte budget "
+                         "(prop_max_coinbase_bytes unset)",
+                         cfg.prop_max_outputs);
+        }
         /* Publish the ports so the dashboard can tell a miner which one to
          * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
          * so this needs no escaping.
