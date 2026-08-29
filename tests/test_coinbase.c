@@ -834,6 +834,169 @@ static void test_scriptsig_over_100_is_rejected(void) {
     printf("ok: oversized coinbase scriptSig rejected (%s)\n", err);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * BIP-350 conformance.
+ *
+ * ⛔ THE TABLES BELOW WERE GENERATED FROM bip-0350.mediawiki, NOT TYPED. A test
+ * vector transcribed by hand is a test that passes for the wrong reason the
+ * moment one character slips, and these strings are deliberately adversarial —
+ * one differs from its neighbour only in the checksum, another carries a single
+ * uppercase letter in the middle to test case rejection. The generator read the
+ * spec and emitted this; the tables are then static, so the suite has no
+ * network dependency.
+ *
+ * ⚠️ "VALID PER BIP-350" AND "WE WILL PAY IT" ARE DIFFERENT QUESTIONS, and the
+ * split into two tables is the point. Three of the eight addresses BIP-350
+ * lists as valid are ones this pool REFUSES on purpose — witness v2, v16, and a
+ * v1 with a 40-byte program. They encode correctly and `validateaddress` calls
+ * them valid; they are also anyone-can-spend under current consensus, so a
+ * coinbase paying one hands the reward to whoever notices first. Refusing costs
+ * that miner an error message at authorize. Accepting costs them a block.
+ * (BIP-341: a v1 program of any length other than 32 remains unencumbered.)
+ * ------------------------------------------------------------------------- */
+/* GENERATED FROM bip-0350.mediawiki — do not hand-edit. */
+static const struct { const char *addr; const char *spk; } bip350_supported[] = {
+    { "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+      "0014751e76e8199196d454941c45d1b3a323f1433bd6" },  /* v0, 20-byte */
+    { "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",
+      "00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262" },  /* v0, 32-byte */
+    { "tb1qqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesrxh6hy",
+      "0020000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433" },  /* v0, 32-byte */
+    { "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c",
+      "5120000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433" },  /* v1, 32-byte */
+    { "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+      "512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" },  /* v1, 32-byte */
+};
+
+static const struct { const char *addr; int witver; size_t proglen; } bip350_refused[] = {
+    { "bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kt5nd6y", 1, 40 },
+    { "BC1SW50QGDZ25J", 16, 2 },
+    { "bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs", 2, 16 },
+};
+
+static const struct { const char *addr; const char *why; } bip350_invalid[] = {
+    /* NOT REACHED BY THE BECH32 PATH — no bc1/tb1/bcrt1 prefix, so it falls
+       through to base58 and is rejected there. Still a rejection. */
+    { "tc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq5zuyut",
+      "Invalid human-readable part" },
+    { "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqh2y7hd",
+      "Invalid checksum (Bech32 instead of Bech32m)" },
+    { "tb1z0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqglt7rf",
+      "Invalid checksum (Bech32 instead of Bech32m)" },
+    { "BC1S0XLXVLHEMJA6C4DQV22UAPCTQUPFHLXM9H8Z3K2E72Q4K9HCZ7VQ54WELL",
+      "Invalid checksum (Bech32 instead of Bech32m)" },
+    { "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kemeawh",
+      "Invalid checksum (Bech32m instead of Bech32)" },
+    { "tb1q0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq24jc47",
+      "Invalid checksum (Bech32m instead of Bech32)" },
+    { "bc1p38j9r5y49hruaue7wxjce0updqjuyyx0kh56v8s25huc6995vvpql3jow4",
+      "Invalid character in checksum" },
+    { "BC130XLXVLHEMJA6C4DQV22UAPCTQUPFHLXM9H8Z3K2E72Q4K9HCZ7VQ7ZWS8R",
+      "Invalid witness version" },
+    { "bc1pw5dgrnzv",
+      "Invalid program length (1 byte)" },
+    { "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v8n0nx0muaewav253zgeav",
+      "Invalid program length (41 bytes)" },
+    { "BC1QR508D6QEJXTDG4Y5R3ZARVARYV98GJ9P",
+      "Invalid program length for witness version 0 (per BIP141)" },
+    { "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vq47Zagq",
+      "Mixed case" },
+    { "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v07qwwzcrf",
+      "zero padding of more than 4 bits" },
+    { "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vpggkg4j",
+      "Non-zero padding in 8-to-5 conversion" },
+    { "bc1gmk9yu",
+      "Empty data section" },
+};
+
+static void hex_of(const uint8_t *b, size_t n, char *out) {
+    static const char *H = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[i*2] = H[b[i] >> 4]; out[i*2+1] = H[b[i] & 15]; }
+    out[n*2] = 0;
+}
+
+static void test_bip350_supported(void) {
+    for (size_t i = 0; i < sizeof bip350_supported / sizeof bip350_supported[0]; i++) {
+        uint8_t spk[64];
+        size_t  spk_len = 0;
+        char    err[192], got[160];
+        int rc = coinbase_address_to_script(bip350_supported[i].addr, spk, sizeof spk,
+                                            &spk_len, err, sizeof err);
+        if (rc != 0) {
+            printf("FAIL: %s rejected: %s\n", bip350_supported[i].addr, err);
+            assert(rc == 0);
+        }
+        hex_of(spk, spk_len, got);
+        if (strcmp(got, bip350_supported[i].spk) != 0) {
+            printf("FAIL: %s\n  want %s\n  got  %s\n",
+                   bip350_supported[i].addr, bip350_supported[i].spk, got);
+            assert(0);
+        }
+    }
+    printf("ok: bip350 supported vectors (%zu) produce the spec's exact scriptPubKey\n",
+           sizeof bip350_supported / sizeof bip350_supported[0]);
+}
+
+static void test_bip350_refused_by_policy(void) {
+    /* These must fail, and the message must say WHY — a miner who pastes a v2
+       address needs to learn something other than "invalid". */
+    for (size_t i = 0; i < sizeof bip350_refused / sizeof bip350_refused[0]; i++) {
+        uint8_t spk[64];
+        size_t  spk_len = 0;
+        char    err[192];
+        err[0] = 0;
+        int rc = coinbase_address_to_script(bip350_refused[i].addr, spk, sizeof spk,
+                                            &spk_len, err, sizeof err);
+        if (rc == 0) {
+            printf("FAIL: %s was PAID; witness v%d/%zu-byte is anyone-can-spend\n",
+                   bip350_refused[i].addr, bip350_refused[i].witver,
+                   bip350_refused[i].proglen);
+            assert(rc != 0);
+        }
+        assert(err[0] != 0);
+    }
+    printf("ok: bip350 well-formed-but-unsafe vectors (%zu) refused with a reason\n",
+           sizeof bip350_refused / sizeof bip350_refused[0]);
+}
+
+static void test_bip350_invalid(void) {
+    for (size_t i = 0; i < sizeof bip350_invalid / sizeof bip350_invalid[0]; i++) {
+        uint8_t spk[64];
+        size_t  spk_len = 0;
+        char    err[192];
+        err[0] = 0;
+        int rc = coinbase_address_to_script(bip350_invalid[i].addr, spk, sizeof spk,
+                                            &spk_len, err, sizeof err);
+        if (rc == 0) {
+            printf("FAIL: accepted invalid address %s (%s)\n",
+                   bip350_invalid[i].addr, bip350_invalid[i].why);
+            assert(rc != 0);
+        }
+        assert(err[0] != 0);
+    }
+    printf("ok: bip350 invalid vectors (%zu) all rejected\n",
+           sizeof bip350_invalid / sizeof bip350_invalid[0]);
+}
+
+/* The regression the weight constant exists to prevent: a taproot payout costs
+   43 bytes on the wire, not 31, and the headroom divider has to know it. */
+static void test_payout_txout_weight_matches_p2tr(void) {
+    uint8_t spk[64];
+    size_t  spk_len = 0;
+    char    err[192];
+    int rc = coinbase_address_to_script(
+        "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+        spk, sizeof spk, &spk_len, err, sizeof err);
+    assert(rc == 0);
+    /* 8-byte value + 1-byte script length + scriptPubKey, non-witness so x4. */
+    size_t wu = (8 + 1 + spk_len) * 4;
+    assert(spk_len == 34);
+    assert(wu == 172);
+    assert(COINBASE_PAYOUT_TXOUT_WU >= wu);
+    printf("ok: payout txout weight constant covers a P2TR output (%zu WU)\n", wu);
+}
+
 int main(void) {
     test_p2pkh_address();
     test_p2wpkh_address();
@@ -853,6 +1016,10 @@ int main(void) {
     test_scriptsig_length_matches_advertised_extranonce();
     test_wrong_width_extranonce_desyncs_the_parse();
     test_scriptsig_over_100_is_rejected();
+    test_bip350_supported();
+    test_bip350_refused_by_policy();
+    test_bip350_invalid();
+    test_payout_txout_weight_matches_p2tr();
     printf("test_coinbase: all tests passed\n");
     return 0;
 }

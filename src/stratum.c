@@ -1556,8 +1556,9 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
 
     /* Username format: <address>[.<rig_label>]. The address part must be
-     * a valid bech32 (P2WPKH) or base58check (P2PKH / P2SH) Bitcoin
-     * address; the optional label is a free-form rig identifier. */
+     * a valid bech32 (P2WPKH / P2WSH), bech32m (P2TR) or base58check
+     * (P2PKH / P2SH) Bitcoin address; the optional label is a free-form rig
+     * identifier. */
     const char *dot = strchr(worker, '.');
     size_t addr_len = dot ? (size_t)(dot - worker) : strlen(worker);
     if (addr_len == 0 || addr_len >= sizeof(c->payout_address)) {

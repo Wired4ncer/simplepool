@@ -255,8 +255,11 @@ address. Format:
 <bitcoin_address>[.<rig_label>]
 ```
 
-- `bitcoin_address` is required and must be a valid bech32 (P2WPKH) or
-  base58check (P2PKH / P2SH) address. It is parsed at authorize time
+- `bitcoin_address` is required and must be a valid bech32 (P2WPKH / P2WSH),
+  bech32m (P2TR) or base58check (P2PKH / P2SH) address. Witness versions 2-16
+  are refused even though they encode correctly: such an output is
+  anyone-can-spend under current consensus, and a coinbase must not build one.
+  It is parsed at authorize time
   and an invalid address is rejected with a clear error and logged in
   the `rejects` table.
 - `rig_label` is optional and lets a single miner (same address) have

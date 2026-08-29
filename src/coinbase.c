@@ -350,21 +350,60 @@ int coinbase_address_to_script(const char *addr,
             set_err(errbuf, errlen, "bech32 5->8 convert failed");
             return -1;
         }
-        if (witver == 0 && prog_len != 20) {
-            set_err(errbuf, errlen, "only P2WPKH (20-byte) v0 supported, got %zu", prog_len);
-            return -1;
-        }
-        if (witver == 0 && prog_len == 20) {
-            /* OP_0 <20-byte push>. */
-            if (cap < 22) return -1;
+        /* Witness v0: P2WPKH (20-byte) or P2WSH (32-byte). Any other length is
+         * invalid per BIP-141 and Core will not relay it. */
+        if (witver == 0) {
+            if (prog_len != 20 && prog_len != 32) {
+                set_err(errbuf, errlen,
+                        "v0 program must be 20 or 32 bytes, got %zu", prog_len);
+                return -1;
+            }
+            /* OP_0 <push prog_len> <program>. */
+            if (cap < prog_len + 2) return -1;
             out[0] = 0x00;
-            out[1] = 0x14;
-            memcpy(out + 2, prog, 20);
-            *out_len = 22;
+            out[1] = (uint8_t)prog_len;
+            memcpy(out + 2, prog, prog_len);
+            *out_len = prog_len + 2;
             return 0;
         }
-        set_err(errbuf, errlen, "unsupported segwit version/program length");
-        return -1;
+
+        /* ⛔ WITNESS v1 ONLY, AND v2-v16 ARE REFUSED ON PURPOSE.
+         *
+         * An output to an unactivated witness version is ANYONE-CAN-SPEND under
+         * current consensus: the script succeeds without a signature, so the
+         * first party to notice takes the coins. `validateaddress` calls such an
+         * address valid, and Core will let a user send to one, because there the
+         * sender is choosing the risk in the moment for one payment.
+         *
+         * A pool coinbase is not that. The miner types an address once and every
+         * block they ever find pays it, unattended — so a typo into a future
+         * version, or an address from a wallet experimenting with one, would
+         * hand block rewards to whoever is watching. Refusing at authorize costs
+         * that miner one clear error message. Accepting costs them a block.
+         *
+         * This is deliberately STRICTER than the address being well-formed. When
+         * a version activates and its outputs become spendable only by their
+         * owner, adding it here is a one-line change made on purpose rather than
+         * a door that was left open. */
+        if (witver != 1) {
+            set_err(errbuf, errlen,
+                    "witness v%u is not spendable-only-by-its-owner under current "
+                    "consensus; a coinbase must not pay it", witver);
+            return -1;
+        }
+        if (prog_len != 32) {
+            set_err(errbuf, errlen,
+                    "v1 (taproot) program must be 32 bytes, got %zu", prog_len);
+            return -1;
+        }
+        /* P2TR: OP_1 <32-byte push>. Verified against the ECX node itself —
+         * validateaddress returns scriptPubKey 5120<program> for a bc1p address. */
+        if (cap < 34) return -1;
+        out[0] = 0x51; /* OP_1 */
+        out[1] = 0x20; /* push 32 */
+        memcpy(out + 2, prog, 32);
+        *out_len = 34;
+        return 0;
     }
 
     /* Base58check: P2PKH or P2SH. */

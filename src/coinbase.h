@@ -128,9 +128,26 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
 int coinbase_template_reward(const char *coinbase_tx_hex, int64_t *out_reward,
                              char *errbuf, size_t errlen);
 
-/* Weight of one extra P2WPKH coinbase output: 8-byte value + 1-byte script
- * length + 22-byte scriptPubKey = 31 bytes, non-witness, so x4. */
-#define COINBASE_PAYOUT_TXOUT_WU 124
+/* Weight of one extra coinbase payout output, sized for the LARGEST kind this
+ * pool will emit: 8-byte value + 1-byte script length + 34-byte P2TR
+ * scriptPubKey = 43 bytes, non-witness, so x4.
+ *
+ * ⛔ 172, NOT 124. It was 124 — the P2WPKH figure — from before taproot payouts
+ * were accepted, and leaving it there would have been a silent block-loss bug
+ * rather than a cosmetic one: this constant divides the weight headroom to
+ * decide how many payouts fit, so understating an output's cost lets MORE
+ * outputs through than actually fit. Sixteen taproot payouts would have been
+ * 768 WU heavier than budgeted, comfortably past COINBASE_WEIGHT_SAFETY_WU, and
+ * the block is then rejected at submitblock — the exact "costs the entire
+ * block" failure the note below this one warns about.
+ *
+ * One number for every output type, deliberately, rather than measuring each
+ * payout's real script: this whole helper over-states on purpose (it counts the
+ * template coinbase as all-non-witness for the same reason), and the operator's
+ * `prop_max_outputs` ceiling is what binds in practice — the weight bound only
+ * takes over on a nearly-full block, which is precisely when erring small is
+ * worth the lost capacity. */
+#define COINBASE_PAYOUT_TXOUT_WU 172
 
 /* Weight deliberately left unused. The server's accounting and ours can differ
  * by a few bytes (varint boundaries, a server that revises its coinbase), and
