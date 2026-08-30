@@ -3243,10 +3243,18 @@ static void test_accepted_candidate_reports_accepted(void) {
  * network_target_be can also make an ordinary hash look like a solved block,
  * which is how those rows came to exist at all.
  *
- * Ring turnover is the trigger: RECENT_JOBS is 8, and on a chain serving
- * several templates a second the ring recycles in seconds, so a submit only
- * has to be slightly slow to be reading freed memory. Here it is forced
- * deterministically — under ASan this aborts without the reference count. */
+ * Ring turnover is the trigger: on a chain serving several templates a second
+ * the ring recycles in seconds, so a submit only has to be slightly slow to be
+ * reading freed memory. Here it is forced deterministically — under ASan this
+ * aborts without the reference count.
+ *
+ * ⚠️ THE PUSH COUNT IS DERIVED FROM STRATUM_RECENT_JOBS, NOT HARDCODED. It was
+ * 24 against a ring of 8. When the ring went 8 → 16 on 2026-08-30 that margin
+ * fell from 3× to 1.5× and the next raise would have pushed fewer jobs than the
+ * ring holds — HELD would still be findable, `gone == NULL` would fail, and had
+ * the assertion been the other way round the test would have passed while
+ * exercising nothing. A fixture whose validity depends on a constant it does
+ * not reference decays silently. → feedback_fixture-invariants-decay-at-scale */
 static void test_job_survives_retirement_while_held(void) {
     obs_t obs = {0};
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
@@ -3267,7 +3275,7 @@ static void test_job_survives_retirement_while_held(void) {
 
     /* Meanwhile the tip watcher churns through enough templates to push HELD
      * out of the retention ring entirely and free it. */
-    for (int i = 0; i < 24; ++i) {
+    for (int i = 0; i < (int)(STRATUM_RECENT_JOBS * 3); ++i) {
         char jid[16];
         snprintf(jid, sizeof jid, "J%d", i);
         stratum_server_set_job(s, make_test_job(jid, net), 1);

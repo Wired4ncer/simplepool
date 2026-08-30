@@ -56,7 +56,44 @@
 /* The retention ring is sized in stratum.h, because main.c's payout-plan ring
  * must be able to cover every job that is still solvable. */
 #define RECENT_JOBS    STRATUM_RECENT_JOBS
-#define RECENT_JOB_TTL_MS 60000
+/* How long a retired job stays solvable. See STRATUM_RECENT_JOBS in stratum.h
+ * — the effective window is the SMALLER of this and the ring's depth, and the
+ * two must be read together.
+ *
+ * ⚠️ The sweep is LAZY: retire_job() is the only caller and it runs only when a
+ * new job is pushed, so the real grace is this value plus the time to the next
+ * job (~31 s at production cadence), and is UNBOUNDED if job production stalls.
+ *
+ * 60 s → 300 s on 2026-08-30, measured rather than chosen. Over 16 h of
+ * instrumented rejects, raising the window to 300 s would have accepted 100%
+ * of the stale shares from both complaining miners (199 and 4,686) and ~95% of
+ * everyone else's. ckpool's equivalent cap is 600 s (stratifier.c, add_base),
+ * so 60 s made us 10× stricter than the reference implementation — that, not
+ * anything on the miners' side, is why rented hashrate bled here and not
+ * elsewhere.
+ *
+ * ⚠️ A share accepted against a job issued before a tip change is credited but
+ * can never win a block. That was already true at 60 s; this widens the window
+ * in which it happens. ckpool instead marks such shares stale (workbase_id <
+ * blockchange_id) while keeping every same-height job valid regardless of age.
+ * Adopting that split is the better long-term shape and is deliberately NOT
+ * bundled here: it would newly REFUSE shares we credit today, at block
+ * boundaries, to exactly the miners this change is meant to help. Ship the
+ * measured fix first; decide the fairness question on its own evidence. */
+#define RECENT_JOB_TTL_MS 300000
+/* The two numbers above must be read together, so tie them together here: the
+ * ring has to be deep enough to still hold a job the TTL considers live, or the
+ * ring silently becomes the real window and the TTL is decoration. That is
+ * exactly the state this pool shipped in until 2026-08-30, in the other
+ * direction — 8 slots that never once bound because the TTL was 60 s.
+ *
+ * ⚠️ 30000 is `bitcoind_poll_interval_ms`'s DEFAULT (config.c:38), not a law:
+ * the cadence is configurable, so this assert checks the shipped configuration,
+ * not every possible one. Lower that key materially below 30 s and the ring
+ * binds first again at runtime, with no build error to warn you. */
+_Static_assert((uint64_t)STRATUM_RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
+               "retention ring too shallow for RECENT_JOB_TTL_MS at the default "
+               "job cadence: raise STRATUM_RECENT_JOBS or lower the TTL");
 /* Per-connection job -> issued-difficulty ring. Must cover every job stratum
  * will still accept a submit for: the recent ring plus the current job,
  * doubled for headroom. See stratum_conn.job_diff. */

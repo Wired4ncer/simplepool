@@ -12,15 +12,29 @@
 typedef struct stratum_job stratum_job_t;
 
 /* How many retired jobs the server keeps solvable, on top of the current one.
- * A submit naming a job older than `current + STRATUM_RECENT_JOBS` is rejected
- * as unknown.
+ *
+ * ⛔ THIS IS NOT THE RETENTION WINDOW ON ITS OWN, and reading it as one has
+ * already cost us. The effective grace is
+ *
+ *     min(RECENT_JOB_TTL_MS, STRATUM_RECENT_JOBS × job cadence)
+ *
+ * and until 2026-08-30 the TTL was 60 s against a ~31 s cadence, so the ring
+ * NEVER bound: all 8 slots were dead capacity and the real window was ~60-90 s.
+ * "8 jobs × 31 s ≈ 4 minutes" is the obvious arithmetic, it is wrong, and it
+ * reached a customer reply once already. Whenever you change one of these two
+ * numbers, read the other. RECENT_JOB_TTL_MS lives in stratum.c.
+ *
+ * Raised 8 → 16 on 2026-08-30 so the ring stays slack at the new 300 s TTL
+ * (16 × 31 s ≈ 496 s). If the cadence ever drops far below 30 s — the fork's
+ * minimum-difficulty window is the case to worry about — the ring binds first
+ * again and this is the number to revisit.
  *
  * Public because anything holding per-job state alongside the server has to
  * retain at least as much of it: pool_mode=proportional keeps a payout plan
  * per job, and a plan ring shorter than this made the oldest still-solvable
  * job settle with no plan — silently paying its finder solo instead of the
  * window. Size against this constant, never against a hand-picked number. */
-#define STRATUM_RECENT_JOBS 8
+#define STRATUM_RECENT_JOBS 16
 
 /* Default listen() backlog. 1024 rather than the kernel's own default: a
  * marketplace order arrives as one burst of hundreds of connections, and the
