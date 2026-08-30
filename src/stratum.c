@@ -2241,11 +2241,16 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (achieved < c->vd_window_min_achieved) {
         c->vd_window_min_achieved = achieved;
     }
-    /* assigned_diff, not c->difficulty: this share was mined against the
+    /* judge_diff, not c->difficulty: this share was mined against the
      * difficulty ITS job went out under, which a retarget earlier in this
-     * window may already have moved on from. */
-    if (assigned_diff > c->vd_window_max_assigned) {
-        c->vd_window_max_assigned = assigned_diff;
+     * window may already have moved on from.
+     *
+     * 📌 Upstream calls this `assigned_diff`; our equivalent is `judge_diff`
+     * (the per-job difficulty from conn_job_diff_lookup, falling back to the
+     * connection's current one). Same quantity, different name — renamed here
+     * rather than aliased so there is one name for it in this file. */
+    if (judge_diff > c->vd_window_max_assigned) {
+        c->vd_window_max_assigned = judge_diff;
     }
     vardiff_maybe_retarget(s, c, now_ms(), buf, len);
     pthread_mutex_unlock(&c->state_lock);
