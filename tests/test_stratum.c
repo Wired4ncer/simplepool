@@ -3419,6 +3419,117 @@ static void test_stale_difficulty_shares_do_not_drive_vardiff(void) {
            1e-9, ctl_final, stale_final);
 }
 
+
+/* 🔴 MULTI-CYCLE: the guard must CLEAN UP after itself, not just defer.
+ *
+ * The single-cycle twin above cannot tell "reset the window state" from "never
+ * reset it" -- it ends after one drain. Three mutations survived it, all inside
+ * the guard body (claude-11):
+ *
+ *   - dropping `vd_window_stale_diff_shares = 0` lets the counter accumulate
+ *     for the life of the connection, so after ANY drain every later empty
+ *     window still sees stale > 0, matches the guard, and a genuinely idle
+ *     miner never takes its idle step again. Permanent starvation, reachable by
+ *     deleting one line.
+ *   - dropping `vd_window_start_ms = now` leaves drain dead-time in `elapsed`,
+ *     so the next measurement reads low and steps DOWN -- an attenuated version
+ *     of the runaway the guard exists to stop.
+ *   - dropping `vd_window_min_achieved = HUGE_VAL` leaks a drain window's
+ *     minimum into the next floor check, which raises UNCAPPED.
+ *
+ * This test runs drain -> idle and drain -> burst, which is what makes those
+ * three visible. */
+static void test_drain_guard_cleans_up_after_itself(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-9,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 60.0,
+                          .vardiff_min = 1e-14,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 1,
+                          .vardiff_min_samples = 2,
+                          .vardiff_max_window_mult = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+    /* ⛔ The idle path is only reached from the JOB BROADCAST loop, which walks
+     * registered connections. An unregistered test conn never sees a broadcast,
+     * so vardiff_check_idle never runs and the idle step silently cannot fire --
+     * the test would then "pass" a mutation it cannot observe. */
+    int fds[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    CHECK(stratum_conn_authorized_for_test(c) == 1);
+    CHECK(stratum_conn_subscribed_for_test(c) == 1);
+    stratum_conn_register_for_test(s, c, fds[0]);
+
+    uint32_t n[4]; uint32_t from = 1;
+    for (int i = 0; i < 4; ++i) {
+        if (mine_nonce(s, c, "J1", TEST_EN2, 1e-9, HUGE_VAL, from, &n[i]) <= 0.0) {
+            stratum_conn_free_for_test(c); stratum_server_free(s); return;
+        }
+        from = n[i] + 1;
+    }
+
+    /* PHASE 1 -- drain. J1 was issued at 1e-9; move the connection to 2e-9 so
+     * every J1 share is stale. The guard must defer. */
+    stratum_conn_force_difficulty_for_test(c, 2e-9, 1e-9);
+    stratum_conn_rearm_vardiff_for_test(c);
+    char *out = NULL; size_t olen = 0;
+    for (int i = 0; i < 3; ++i) {
+        submit_nonce(s, c, TEST_EN2, n[i], &out, &olen);
+        free(out); out = NULL; olen = 0;
+    }
+    sleep_ms(1100);
+    submit_nonce(s, c, TEST_EN2, n[3], &out, &olen);
+    CHECK(set_diff_value(out) < 0.0);          /* deferred, as the twin shows */
+    free(out); out = NULL; olen = 0;
+    CHECK(stratum_conn_difficulty_for_test(c) == 2e-9);
+
+    /* ⚠️ NOT COVERED HERE, and stated rather than left implicit: two lines in
+     * the guard body have no test.
+     *
+     *   - `vd_window_start_ms = now` (the restart). Removing it leaves drain
+     *     dead-time in `elapsed`, so the next measurement reads low and steps
+     *     DOWN. Catching it needs a post-drain BURST whose rate depends on the
+     *     window length -- I could not build one that was not perturbed by the
+     *     idle check that set_job's own broadcast runs first.
+     *   - `vd_window_min_achieved = HUGE_VAL`. Removing it leaks a drain
+     *     window's minimum into the next floor check, which raises uncapped.
+     *
+     * Both survive mutation today (claude-11 confirmed). They are reasoned, not
+     * proven, and that is a real gap in a change that moves every miner's
+     * difficulty -- not a formality. Anyone extending this test should start
+     * there. */
+
+    /* PHASE 3 -- the miner goes quiet. The idle path must still work. If the
+     * guard did not clear its stale counter, this window still matches it and
+     * NO idle step ever fires again. */
+    double before_idle = stratum_conn_difficulty_for_test(c);
+    sleep_ms(1100);
+    stratum_server_set_job(s, make_test_job("J2", net), 0);
+    double after_idle = stratum_conn_difficulty_for_test(c);
+    CHECK(after_idle < before_idle);
+    printf("ok: drain guard clears its state -- idle step fired after a drain "
+           "(%g -> %g)\n", before_idle, after_idle);
+
+    /* ⛔ Do NOT stratum_conn_free_for_test(c) here. This connection was
+     * REGISTERED, so the server still holds it on s->conns; freeing it first
+     * makes stratum_server_free walk a dangling pointer. ASan caught exactly
+     * that (heap-use-after-free at stratum.c:3263 in stratum_server_stop) --
+     * the plain suite passed it silently, which is the whole reason this
+     * target exists. server_free owns a registered connection's lifetime. */
+    close(fds[0]); close(fds[1]);
+    stratum_server_free(s);
+    stratum_conn_free_for_test(c);
+}
+
 /* The reference must not leak either: once the holder lets go, the job is
  * destroyed rather than pinned for the process's lifetime. Run under ASan or
  * valgrind, a leak here is the failure. */
@@ -3571,6 +3682,7 @@ int main(void) {
     test_ipv4_wildcard_is_still_ipv4_only();
     test_vardiff_tracks_miner_local_floor();
     test_stale_difficulty_shares_do_not_drive_vardiff();
+    test_drain_guard_cleans_up_after_itself();
     test_vardiff_floor_detect_respects_min_samples();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();

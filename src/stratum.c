@@ -81,6 +81,14 @@
  * boundaries, to exactly the miners this change is meant to help. Ship the
  * measured fix first; decide the fairness question on its own evidence. */
 #define RECENT_JOB_TTL_MS 300000
+/* 📌 READ vardiff_maybe_retarget BEFORE RAISING THIS. The vardiff retarget
+ * ceiling is vardiff_window_sec * vardiff_max_window_mult (240s at defaults).
+ * When this TTL exceeds that ceiling, a job can be old enough to starve a
+ * retarget window and still young enough for its shares to be accepted --
+ * which produced a downward difficulty runaway when the TTL went 60s -> 300s.
+ * The drain guard there handles it at any values, so this is a pointer rather
+ * than a constraint: no assert, because the code no longer depends on the
+ * inequality. But the next person to raise this will be looking here. */
 /* The two numbers above must be read together, so tie them together here: the
  * ring has to be deep enough to still hold a job the TTL considers live, or the
  * ring silently becomes the real window and the TTL is decoration. That is
@@ -1241,8 +1249,27 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
      * Restart the window rather than merely returning, so the post-drain
      * measurement is taken over a clean interval instead of one padded with
      * dead time. ⚠️ A genuinely idle miner has BOTH counters at zero, does not
-     * match here, and still takes its idle step -- that path is untouched. */
-    if (c->vd_window_shares == 0 && c->vd_window_stale_diff_shares > 0) {
+     * match here, and still takes its idle step -- that path is untouched.
+     *
+     * 📌 The predicate is `stale > current`, not `current == 0`. A PURE drain
+     * was the runaway; a MIXED window is the same fault one notch milder and
+     * was still open with the narrower test: one or two current shares plus a
+     * stale stream does not look empty, so it runs to the 240s ceiling and then
+     * divides those two shares by an elapsed that is mostly drain dead-time --
+     * 2 over 240s reads 0.5 spm against a target of 12, ratio 0.04, and it
+     * takes the idle step down while the miner is working fine. Bounded where
+     * the pure case was not (one 2x step, self-correcting on the next clean
+     * window) but real, and only real since the TTL went to 300s.
+     * Majority-drain is the honest line: if most of what arrived was mined
+     * under a difficulty we are no longer assigning, the window is not a
+     * measurement of the current one. (claude-21 found this band reviewing the
+     * narrower guard.)
+     *
+     * ⚠️ Bounded by construction: stale shares can only come from jobs issued
+     * before the last retarget, and those die at RECENT_JOB_TTL_MS -- after
+     * which their shares are refused outright and stop arriving. So deferral
+     * cannot outlast the retention window. */
+    if (c->vd_window_stale_diff_shares > c->vd_window_shares) {
         c->vd_window_start_ms = now;
         c->vd_window_stale_diff_shares = 0;
         c->vd_window_min_achieved = HUGE_VAL;
@@ -2928,6 +2955,27 @@ static int listener_bind(stratum_server_t *s, struct stratum_listener_slot *ls) 
         LOG_ERROR("stratum bind %s:%d: %s", ba[0] ? ba : "0.0.0.0",
                   ls->pol.port, strerror(errno));
         return -1;
+    }
+    /* Print the derived retarget ceiling next to the compiled-in retention
+     * window. Neither is visible from the config file -- the ceiling is a
+     * product of two keys and the TTL is a #define -- and their relationship
+     * is what opened a difficulty runaway once already. The journal should be
+     * able to answer "was there a drain band on that run?" without anyone
+     * re-deriving it. Same reasoning as the payout-caps line. */
+    {
+        long ceil_ms = (long)s->cfg.vardiff_window_sec * 1000L *
+                       (s->cfg.vardiff_max_window_mult > 0
+                          ? s->cfg.vardiff_max_window_mult : 8);
+        if (!s->cfg.vardiff_enabled || s->cfg.vardiff_window_sec <= 0) {
+            LOG_INFO("stratum: vardiff disabled (job retention %ds)",
+                     RECENT_JOB_TTL_MS / 1000);
+        } else {
+            LOG_INFO("stratum: vardiff retarget ceiling %lds, job retention %ds%s",
+                     ceil_ms / 1000L, RECENT_JOB_TTL_MS / 1000,
+                     ceil_ms < (long)RECENT_JOB_TTL_MS
+                       ? " (ceiling < retention: drain-deferral band exists, guarded)"
+                       : "");
+        }
     }
     LOG_INFO("stratum: listening on %s:%d%s%s (%s)", ba[0] ? ba : "0.0.0.0",
              ls->pol.port,
