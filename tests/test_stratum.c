@@ -3315,7 +3315,8 @@ static void test_job_survives_retirement_while_held(void) {
  * thing -- whether the connection's difficulty changed after the job went out.
  * Same job, same nonces, same submit timing. */
 static void vardiff_stale_diff_case(int change_difficulty_midway,
-                                    double *out_first_setdiff) {
+                                    double *out_first_setdiff,
+                                    double *out_final_diff) {
     obs_t obs = {0};
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
                           .initial_diff = 1e-9,
@@ -3347,7 +3348,7 @@ static void vardiff_stale_diff_case(int change_difficulty_midway,
             printf("DEBUG: mine_nonce failed at i=%d (diff=%g, conn diff=%g)\n",
                    i, md, stratum_conn_difficulty_for_test(c));
             stratum_conn_free_for_test(c); stratum_server_free(s);
-            *out_first_setdiff = -1.0; return;
+            *out_first_setdiff = -2.0; *out_final_diff = -2.0; return;
         }
         from = nonce[i] + 1;
     }
@@ -3382,29 +3383,40 @@ static void vardiff_stale_diff_case(int change_difficulty_midway,
     free(out);
 
     *out_first_setdiff = first;
+    *out_final_diff = stratum_conn_difficulty_for_test(c);
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
 }
 
 static void test_stale_difficulty_shares_do_not_drive_vardiff(void) {
-    double with_change = 0.0, without_change = 0.0;
-    vardiff_stale_diff_case(0, &without_change);
-    vardiff_stale_diff_case(1, &with_change);
-    if (without_change < 0.0 || with_change < 0.0) return;  /* mining failed */
+    double ctl_set = 0.0, ctl_final = 0.0, stale_set = 0.0, stale_final = 0.0;
+    vardiff_stale_diff_case(0, &ctl_set, &ctl_final);
+    vardiff_stale_diff_case(1, &stale_set, &stale_final);
 
-    /* Control: shares that DO match the current difficulty are rate evidence,
-     * and five of them inside a 1s window against a 60 spm target is a rate
-     * spike -- vardiff must raise. Without this half passing, the other half
-     * proves nothing: a test where neither case retargets would look identical
-     * to a working fix. */
-    CHECK(without_change > 1e-9);
+    /* ⛔ -2.0 means the PROBE failed to mine, -1.0 means no set_difficulty was
+     * emitted. They must not share a sentinel: "no retarget" is the SUCCESS
+     * condition here, so folding it in with instrument failure and returning
+     * early would make a correct fix assert nothing at all, silently, while
+     * still counting as a pass. (claude-11 found exactly that hole.) */
+    CHECK(ctl_set > -2.0 && stale_set > -2.0);
 
-    /* The fix: identical shares, but the connection's difficulty moved after
-     * the job was issued. They are not evidence about the new difficulty and
-     * must not push it UP. */
-    CHECK(!(with_change > 2e-9));
-    printf("ok: stale-difficulty shares do not raise vardiff (control raised to %g, stale %g)\n",
-           without_change, with_change);
+    /* Control: shares matching the current difficulty ARE rate evidence, and
+     * five in a 1s window against a 60 spm target is a spike -- vardiff must
+     * raise. Load-bearing: without it, a test where neither half retargets
+     * looks identical to a working fix. */
+    CHECK(ctl_set > 1e-9);
+    CHECK(ctl_final > 1e-9);
+
+    /* 🔴 THE FIX, ASSERTED AS A NUMBER, NOT AS AN INEQUALITY. The earlier
+     * version checked only !(x > 2e-9), which a DOWN-step satisfies -- and a
+     * down-step is precisely the runaway the drain guard exists to stop. That
+     * assertion passed while printing the failure. The difficulty must be
+     * exactly where it was forced, moved neither up nor down. */
+    CHECK(stale_final == 2e-9);
+    CHECK(stale_set < 0.0);
+    printf("ok: stale-difficulty shares neither raise nor lower vardiff "
+           "(control raised %g->%g; stale held at %g)\n",
+           1e-9, ctl_final, stale_final);
 }
 
 /* The reference must not leak either: once the holder lets go, the job is

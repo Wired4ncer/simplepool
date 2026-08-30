@@ -1219,6 +1219,37 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
     uint64_t window_ms  = (uint64_t)s->cfg.vardiff_window_sec * 1000ULL;
     if (elapsed_ms < window_ms) return;
 
+    /* ⛔ A WINDOW WITH ONLY STALE-DIFFICULTY SHARES IS DRAINING, NOT IDLE.
+     *
+     * The miner is demonstrably submitting; we simply have no evidence yet
+     * about its rate at the CURRENT difficulty, because its pipeline still
+     * holds jobs issued before the last retarget. Falling through here reads
+     * observed_spm = 0, takes the idle step, and halves the difficulty every
+     * ceiling period -- all the way to vardiff_min -- while the miner works
+     * perfectly. A downward runaway, and the exact mirror of the upward one
+     * this whole change exists to stop.
+     *
+     * 🔴 REACHABLE ONLY SINCE THE RETENTION WINDOW WENT 60s -> 300s (d0dca6d).
+     * The ceiling here is vardiff_window_sec * vardiff_max_window_mult = 240s,
+     * and 240 < 300 opens a band where a job is old enough to starve the window
+     * and still young enough for its shares to be accepted. At the old 60s TTL
+     * that band was empty: such a job was already evicted and the share came
+     * back a stale reject instead. Neither change is wrong alone. Together they
+     * open this, which is why it took reviewing the COMBINATION to find.
+     * Reproduced walking 3e-9 -> 1.5e-9 -> 7.5e-10 -> 3.75e-10 (claude-11).
+     *
+     * Restart the window rather than merely returning, so the post-drain
+     * measurement is taken over a clean interval instead of one padded with
+     * dead time. ⚠️ A genuinely idle miner has BOTH counters at zero, does not
+     * match here, and still takes its idle step -- that path is untouched. */
+    if (c->vd_window_shares == 0 && c->vd_window_stale_diff_shares > 0) {
+        c->vd_window_start_ms = now;
+        c->vd_window_stale_diff_shares = 0;
+        c->vd_window_min_achieved = HUGE_VAL;
+        c->vd_window_max_assigned = 0.0;
+        return;
+    }
+
     /* A window's share RATE is only meaningful if the window holds enough
      * shares to measure one. At target_spm=12 and a 30s window an on-target
      * connection produces six, and Poisson noise on six samples is +/-41%
