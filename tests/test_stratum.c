@@ -3301,6 +3301,112 @@ static void test_job_survives_retirement_while_held(void) {
     stratum_server_free(s);
 }
 
+
+/* 🔴 Shares mined under a PREVIOUS difficulty must not drive vardiff.
+ *
+ * A retarget sends mining.set_difficulty without re-notifying, so after a
+ * downward step the miner keeps returning shares for jobs issued at the old,
+ * higher difficulty. Counting those as evidence about the NEW difficulty reads
+ * as a rate spike and steps difficulty back up -- then the next window reads
+ * low and it steps down, forever. Measured in production 2026-08-30: 16 of 98
+ * miners cycling, one connection reading 67 spm where ~15 was the truth.
+ *
+ * The twin below is the whole test: the two halves differ in exactly one
+ * thing -- whether the connection's difficulty changed after the job went out.
+ * Same job, same nonces, same submit timing. */
+static void vardiff_stale_diff_case(int change_difficulty_midway,
+                                    double *out_first_setdiff) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-9,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 60.0,
+                          .vardiff_min = 1e-12,
+                          .vardiff_max = 1e15,
+                          .vardiff_window_sec = 1,
+                          .vardiff_min_samples = 2,
+                          .vardiff_max_window_mult = 1,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    handshake(s, c);
+
+    /* Mine five shares against J1, which went out at the connection's
+     * difficulty of 1e-9. */
+    const int N = 6;   /* 5 to fill the window + 1 FRESH one to trigger evaluation */
+    uint32_t nonce[6];
+    uint32_t from = 1;
+    for (int i = 0; i < N; ++i) {
+        double md = mine_nonce(s, c, "J1", TEST_EN2, 1e-9, HUGE_VAL, from, &nonce[i]);
+        if (md <= 0.0) {
+            printf("DEBUG: mine_nonce failed at i=%d (diff=%g, conn diff=%g)\n",
+                   i, md, stratum_conn_difficulty_for_test(c));
+            stratum_conn_free_for_test(c); stratum_server_free(s);
+            *out_first_setdiff = -1.0; return;
+        }
+        from = nonce[i] + 1;
+    }
+
+    /* THE ONE DIFFERENCE. Model a downward retarget having happened after J1
+     * was issued: the connection is now on 2e-9 while J1's recorded difficulty
+     * is still 1e-9, so every share below is a stale-difficulty share. */
+    if (change_difficulty_midway) {
+        stratum_conn_force_difficulty_for_test(c, 2e-9, 1e-9);
+    }
+    /* ⛔ NOT rearm_vardiff_window(): that helper re-sends mining.authorize,
+     * which emits a fresh notify and RE-RECORDS J1's difficulty at whatever is
+     * current. It would overwrite the very mismatch this test exists to create,
+     * making judge_diff equal c->difficulty again -- the test then passes or
+     * fails for a reason that has nothing to do with the fix. Cost me a real
+     * debugging detour; use the direct helper, which only resets the window. */
+    stratum_conn_rearm_vardiff_for_test(c);
+
+    char *out = NULL; size_t olen = 0;
+    double first = -1.0;
+    for (int i = 0; i < N - 1; ++i) {
+        submit_nonce(s, c, TEST_EN2, nonce[i], &out, &olen);
+        double d = set_diff_value(out);
+        if (d > 0.0 && first < 0.0) first = d;
+        free(out); out = NULL; olen = 0;
+    }
+    /* Past the window, then one more submit to trigger evaluation. */
+    sleep_ms(1100);
+    submit_nonce(s, c, TEST_EN2, nonce[N - 1], &out, &olen);   /* fresh, not a repeat */
+    double d = set_diff_value(out);
+    if (d > 0.0 && first < 0.0) first = d;
+    free(out);
+
+    *out_first_setdiff = first;
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+static void test_stale_difficulty_shares_do_not_drive_vardiff(void) {
+    double with_change = 0.0, without_change = 0.0;
+    vardiff_stale_diff_case(0, &without_change);
+    vardiff_stale_diff_case(1, &with_change);
+    if (without_change < 0.0 || with_change < 0.0) return;  /* mining failed */
+
+    /* Control: shares that DO match the current difficulty are rate evidence,
+     * and five of them inside a 1s window against a 60 spm target is a rate
+     * spike -- vardiff must raise. Without this half passing, the other half
+     * proves nothing: a test where neither case retargets would look identical
+     * to a working fix. */
+    CHECK(without_change > 1e-9);
+
+    /* The fix: identical shares, but the connection's difficulty moved after
+     * the job was issued. They are not evidence about the new difficulty and
+     * must not push it UP. */
+    CHECK(!(with_change > 2e-9));
+    printf("ok: stale-difficulty shares do not raise vardiff (control raised to %g, stale %g)\n",
+           without_change, with_change);
+}
+
 /* The reference must not leak either: once the holder lets go, the job is
  * destroyed rather than pinned for the process's lifetime. Run under ASan or
  * valgrind, a leak here is the failure. */
@@ -3452,6 +3558,7 @@ int main(void) {
     test_dual_stack_accepts_ipv6();
     test_ipv4_wildcard_is_still_ipv4_only();
     test_vardiff_tracks_miner_local_floor();
+    test_stale_difficulty_shares_do_not_drive_vardiff();
     test_vardiff_floor_detect_respects_min_samples();
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
