@@ -2276,7 +2276,23 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * max_window_mult logic wait out the drain (240s at defaults) and then act
      * on whatever genuinely current shares arrived. Job cadence is ~31s, so the
      * pipeline drains long before that ceiling. */
-    if (judge_diff == c->difficulty) {
+    /* 🔴 THE PREDICATE IS share_diff, NOT judge_diff, and the difference is a
+     * real leak. judge_diff is the difficulty the share's JOB went out under;
+     * share_diff is what the share was actually CREDITED at, and the grace path
+     * above (~2149) reassigns it to prev_diff for a miner that applied a
+     * set_difficulty one job late. Such a share is on a post-retarget job, so
+     * judge_diff == c->difficulty and it would sail through a judge_diff gate —
+     * while having been mined at the OLD, easier difficulty. That is the same
+     * contamination as the down-leg bug, arriving through the up-leg door.
+     * Gating on the credited difficulty closes both with one comparison.
+     * (claude-21 found this reviewing the judge_diff version.)
+     *
+     * ⚠️ Consequence, accepted: line ~2205 reassigns share_diff to the NETWORK
+     * target difficulty for a hash that is a block but misses the worker
+     * target, so that share is excluded from the rate window too. It is one
+     * share at block-discovery frequency and it is not rate evidence about the
+     * assigned difficulty anyway. */
+    if (share_diff == c->difficulty) {
         c->vd_window_shares++;
         double achieved = target_to_diff(hash_be);
         if (achieved < c->vd_window_min_achieved) {
