@@ -1856,6 +1856,21 @@ static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
      * inert once before — the merge kept the config key and dropped the
      * enforcement (INC-002). Naming it here makes the real guard load-bearing
      * instead of incidental. → feedback_copied-is-not-honoured */
+    /* 🔴 The boot validator checks the CONFIG struct; this checks the one the
+     * server actually runs on. Between them sits a single copy line in main.c,
+     * and this codebase has lost exactly such a line in a merge before — the
+     * max_submits_per_sec key was kept while its enforcement was dropped
+     * (INC-002). If that copy is lost the validator still passes, and the floor
+     * silently degrades to max(0, vardiff_min) = 1 on the shipped default:
+     * every guard in this feature undone by a merge, with no symptom. Refusing
+     * here makes the failure loud, and a refusal already degrades to a floor.
+     * → feedback_copied-is-not-honoured */
+    if (s->cfg.static_diff_min <= 0) {
+        LOG_WARN("stratum: %s requested STATIC difficulty %.0f — REFUSED, "
+                 "static_diff_min is unset so the pin floor would be "
+                 "meaningless", who, req);
+        return -1;
+    }
     if (s->cfg.max_submits_per_sec <= 0) {
         LOG_WARN("stratum: %s requested STATIC difficulty %.0f — REFUSED, "
                  "max_submits_per_sec is 0 so nothing would bound a pinned "
@@ -3138,8 +3153,15 @@ done:
      * this thread was still inside stratum_conn_free_for_test. */
     /* Mirrors the increment in apply_pinned_diff. */
     if (was_pinned) {
+        /* ⚠️ The decrement is its OWN statement, not a log argument. LOG_INFO is
+         * a function call today so an inline atomic_fetch_sub would evaluate —
+         * but the day anyone makes the macro level-gated at compile time, the
+         * decrement vanishes at quiet log levels and pinned_count only ever
+         * rises. A counter that fails precisely when nobody is reading the log
+         * that would reveal it. → feedback_a-guard-can-disable-what-it-guards */
+        int now_pinned = atomic_fetch_sub(&s->pinned_count, 1) - 1;
         LOG_INFO("stratum: pinned connection closed for '%s' (%d pinned now)",
-                 pinned_worker, atomic_fetch_sub(&s->pinned_count, 1) - 1);
+                 pinned_worker, now_pinned);
     }
     atomic_fetch_sub(&s->conn_count, 1);
     return NULL;

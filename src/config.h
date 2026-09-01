@@ -58,8 +58,22 @@ typedef struct {
      * under a 120/s ceiling; and it is servable for the miners actually asking
      * (the worst-rejecting worker on the pool requests exactly 16384 today), so
      * the feature works at its default instead of inviting an operator to lower
-     * it blind. ⚠️ EH-scale hashrate would still exceed the ceiling here, but
-     * that arrives on marketplace ports, which refuse pins outright. */
+     * it blind.
+     *
+     * ⚠️ THE THRESHOLD, so the residual is a number rather than a hand-wave. A
+     * pin here saturates the 120/s submit ceiling with VALID shares at
+     * 120 * 16384 * 2^32 ~= 8.4 PH/s. Above that a legitimate fleet pinned low
+     * sustains a refusal flood vardiff would have corrected in two windows, and
+     * ~900 PH/s has been seen on this pool — so it is live, not theoretical.
+     * ⛔ Do NOT claim marketplace ports contain this. The rental port is a
+     * convention; nothing stops a fleet arriving on the public port anyway.
+     *
+     * 📌 What `sd=` does NOT add is adversarial capability: the per-submit cost
+     * (read, full cJSON_Parse, error object, reply) is paid before the ceiling
+     * check, so any TCP client can inflict it today with zero hashrate and no
+     * pin. The real fix for that is checking the ceiling BEFORE the parse, or
+     * stopping reads on an over-ceiling connection so TCP backpressure moves
+     * the cost to the sender — pre-existing, upstreamable, not this feature. */
     int  static_diff_min;
 
     /* vardiff — auto-adjust each connection's difficulty to keep the

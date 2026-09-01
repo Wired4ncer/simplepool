@@ -3860,6 +3860,29 @@ static void test_sd_beats_d_in_either_order(void) {
 }
 
 
+/* 🔴 The guard for a LOST CONFIG COPY. The boot validator checks the config
+ * struct; the server runs on a copy made by one line in main.c, and this
+ * codebase has lost exactly such a line in a merge before (INC-002 kept the
+ * max_submits_per_sec key and dropped its enforcement). If that copy is lost,
+ * static_diff_min arrives as 0, the validator still passes, and the pin floor
+ * silently degrades to max(0, vardiff_min) = 1 on the shipped default.
+ *
+ * ⚠️ No unit test can catch the lost line itself — these tests build the config
+ * struct directly and never execute main.c. So the guard has to be a RUNTIME
+ * refusal, and this asserts the runtime refusal, not the copy. */
+static void test_sd_refused_when_static_diff_min_is_unset(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server_min(&obs, 1, 120, 1.0, 0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    /* Would pin at 1 if the floor were max(0, vardiff_min). It must refuse
+     * instead, and the refusal degrades to a floor that does not bind. */
+    CHECK(sd_authorize(s, c, "sd=1") == 100000.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 0.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: sd= is refused when static_diff_min is unset\n");
+}
+
 /* 🔴 END-TO-END OVER A REAL SOCKET.
  *
  * Every other sd= test calls stratum_handle_message directly, which skips
@@ -3903,7 +3926,9 @@ static void test_sd_end_to_end_over_a_socket(void) {
         CHECK(write(fd, sub, strlen(sub)) == (ssize_t)strlen(sub));
         sleep_ms(120);
         CHECK(write(fd, aut, strlen(aut)) == (ssize_t)strlen(aut));
-        sleep_ms(350);
+        for (int i = 0; i < 200 && stratum_server_pinned_count_for_test(s) != 1; i++) {
+            sleep_ms(10);
+        }
 
         char rx[8192] = {0};
         size_t got = 0;
@@ -3922,10 +3947,18 @@ static void test_sd_end_to_end_over_a_socket(void) {
         /* ...and the server really pinned, not merely floored. */
         CHECK(stratum_server_pinned_count_for_test(s) == 1);
         close(fd);
-        sleep_ms(250);
+        /* POLL, do not sleep. The teardown runs on the connection's own thread,
+         * so a fixed wait races it — usually long enough, not always, which is
+         * exactly the shape of the ~2/20 flake already in this suite. A flaky
+         * end-to-end test would cast doubt on the very code it vouches for. */
+        int drained = 0;
+        for (int i = 0; i < 200; i++) {
+            if (stratum_server_pinned_count_for_test(s) == 0) { drained = 1; break; }
+            sleep_ms(10);
+        }
         /* The counter must come back down, or a long-running pool would report
          * a pinned population that only ever grows. */
-        CHECK(stratum_server_pinned_count_for_test(s) == 0);
+        CHECK(drained);
     }
     stratum_server_free(s);
     printf("ok: sd= in the password pins a real socket session end to end\n");
@@ -3990,6 +4023,7 @@ int main(void) {
     test_sd_disabled_still_honours_the_floor();
     test_malformed_sd_does_not_kill_a_valid_d();
     test_sd_beats_d_in_either_order();
+    test_sd_refused_when_static_diff_min_is_unset();
     test_sd_end_to_end_over_a_socket();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();
