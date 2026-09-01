@@ -464,11 +464,18 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
      * and the only symptom is a miner pinning arbitrarily low.
      * Same shape as the max_submits_per_sec check above: refuse to boot rather
      * than run with a guard that is silently switched off. */
-    if (!(cfg->vardiff_min > 0.0)) {
+    /* ⛔ GATED ON THE FEATURE THAT NEEDS IT. Unconditional, this refuses to
+     * boot on a config we cannot read from here — and the failure mode is the
+     * pool not starting, discovered at restart, inside a rental-free window,
+     * with stratum down. Nothing about `sd=` is on by default, so a default
+     * deploy would be taking that risk for no benefit. Gated, the check bites
+     * when someone turns pins ON, which is the right place for it. */
+    if (cfg->static_diff_enabled && !(cfg->vardiff_min > 0.0)) {
         set_err(errbuf, errlen,
-                "config: 'vardiff_min' must be greater than 0 (it is the floor "
-                "a static-difficulty request is clamped to)");
-        return -15;
+                "config: 'static_diff_enabled' requires 'vardiff_min' greater "
+                "than 0 — it is the floor a static-difficulty request is "
+                "clamped to, and a 0 floor silently disables that clamp");
+        return -18;
     }
     /* Two listeners on one port, or a listener on listen_port. Caught here
      * because the alternative is a bind() that fails at startup with EADDRINUSE

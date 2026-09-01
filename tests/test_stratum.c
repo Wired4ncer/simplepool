@@ -3719,7 +3719,7 @@ static void test_sd_is_off_by_default(void) {
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     CHECK(sd_authorize(s, c, "sd=4242") == 100000.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
-    printf("ok: sd= is ignored unless static_diff_enabled\n");
+    printf("ok: sd= does not pin unless static_diff_enabled\n");
 }
 
 /* ...and the instrument check for the gate: the same request with the flag on
@@ -3747,16 +3747,50 @@ static void test_sd_is_floored_at_vardiff_min(void) {
 }
 
 /* 🔴 The ceiling, not the floor, is what bounds a pinned flood — so refuse to
- * pin at all when it is off. Lands on initial_diff, i.e. the request was
- * dropped entirely rather than degraded to a floor. */
-static void test_sd_refused_without_a_submit_ceiling(void) {
+ * PIN when it is off. But the request must degrade to a FLOOR, not vanish.
+ *
+ * The request is deliberately ABOVE initial_diff, because that is the only
+ * value that separates the two outcomes: at 200000 a floor raises the
+ * connection and a discard leaves it at 100000. Asserting a request BELOW
+ * initial_diff would pass under both and prove nothing. */
+static void test_sd_refused_falls_back_to_a_floor(void) {
     obs_t obs = {0};
     stratum_server_t *s = sd_server(&obs, 1, 0, 1024.0);
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
-    CHECK(sd_authorize(s, c, "sd=4242") == 100000.0);
+    CHECK(sd_authorize(s, c, "sd=200000") == 200000.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
-    printf("ok: sd= is refused when max_submits_per_sec is 0\n");
+    printf("ok: a refused sd= degrades to a floor, it is not discarded\n");
+}
+
+/* Same for the kill switch, and this is the one that matters operationally:
+ * flipping static_diff_enabled to 0 on a live pool must not drop pinned miners
+ * to initial_diff and re-vardiff them from there. An emergency switch whose own
+ * action causes a share surge is the wrong shape. */
+static void test_sd_disabled_still_honours_the_floor(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 0, 120, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=200000") == 200000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: sd= with the feature off still applies as a floor\n");
+}
+
+/* ⛔ A malformed sd= must not take a valid d= down with it. Both orders, because
+ * the first version of the two-pass parse aborted inside pass 0 and so was
+ * order-independent for valid tokens and kind-dependent for malformed ones. */
+static void test_malformed_sd_does_not_kill_a_valid_d(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 1, 120, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *a = stratum_conn_new_for_test(s);
+    stratum_conn_t *b = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, a, "sd=abc,d=200000") == 200000.0);
+    CHECK(sd_authorize(s, b, "d=200000,sd=abc") == 200000.0);
+    stratum_conn_free_for_test(a); stratum_conn_free_for_test(b);
+    stratum_server_free(s);
+    printf("ok: a malformed sd= leaves a valid d= intact, in either order\n");
 }
 
 /* 🔴 Order-independence. Same two tokens, both orders, same answer — the bug
@@ -3832,7 +3866,9 @@ int main(void) {
     test_sd_is_off_by_default();
     test_sd_pins_when_enabled();
     test_sd_is_floored_at_vardiff_min();
-    test_sd_refused_without_a_submit_ceiling();
+    test_sd_refused_falls_back_to_a_floor();
+    test_sd_disabled_still_honours_the_floor();
+    test_malformed_sd_does_not_kill_a_valid_d();
     test_sd_beats_d_in_either_order();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();

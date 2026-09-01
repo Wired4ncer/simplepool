@@ -1678,7 +1678,8 @@ static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
  *
  * Returns 0 and writes *out on success, -1 if the field carries no usable
  * `d=` token. */
-static int parse_password_diff(const char *pw, double *out, int *pinned) {
+static int parse_password_diff(const char *pw, const char *who,
+                               double *out, int *pinned) {
     if (!pw || !out) return -1;
     if (pinned) *pinned = 0;
     /* ⚠️ TWO PASSES, and the order matters more than it looks. A single
@@ -1706,12 +1707,19 @@ static int parse_password_diff(const char *pw, double *out, int *pinned) {
         char *end = NULL;
         double v = strtod(num, &end);
         if (end == num || !(v > 0.0) || v != v) {
-            /* Logged rather than swallowed: the miner most likely to fumble
-             * this syntax is exactly the one the feature exists for, and a
-             * silent -1 is indistinguishable from "asked for nothing". */
-            LOG_INFO("stratum: unusable %s difficulty request in password",
+            /* ⛔ BREAK, never return. Aborting the whole function here would
+             * make `sd=abc,d=16384` yield NOTHING while `d=abc,sd=16384` still
+             * works — order-independence for valid tokens, kind-dependence for
+             * malformed ones, which is the same failure one level over. A bad
+             * sd= must fall through to the d= pass.
+             * Logged rather than swallowed: the miner most likely to fumble
+             * this syntax is the one this feature exists for, and the fumble
+             * that costs most is the one that also discards the d= they
+             * already send. (claude-a1's finding.) */
+            LOG_INFO("stratum: %s sent an unusable %s difficulty request",
+                     who && who[0] ? who : "(unauthorized)",
                      is_pin ? "sd=" : "d=");
-            return -1;
+            break;
         }
         *out = v;
         if (pinned) *pinned = is_pin;
@@ -1782,21 +1790,32 @@ static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
  * locally before we ever see them.
  *
  * CALLER MUST HOLD c->state_lock. */
-static void apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
-                              double req) {
+/* Returns 0 if the connection was pinned, -1 if the request was REFUSED.
+ *
+ * 🔴 A refusal must fall back to FLOOR semantics at the call site, never to
+ * nothing. Discarding the request entirely is worse than not having the
+ * feature: on a marketplace port `sd=500000` would then be strictly worse than
+ * `d=500000`, and throwing the kill switch on a live pool would drop every
+ * pinned miner to initial_diff and re-vardiff it from there — an emergency
+ * switch whose own action causes a share surge. A miner naming a difficulty is
+ * telling us something true about its hashrate whether or not pins are on.
+ * (claude-a1's finding.) */
+static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
+                             double req) {
     const char *who = c->worker_name[0] ? c->worker_name : "(unauthorized)";
-    if (!(req > 0.0)) return;
+    if (!(req > 0.0)) return -1;
 
     /* Its own switch, not max_suggested_diff's — see config.h. */
     if (!s->cfg.static_diff_enabled) {
         LOG_INFO("stratum: %s requested STATIC difficulty %.0f — `sd=` is "
-                 "disabled (static_diff_enabled=0), ignoring", who, req);
-        return;
+                 "disabled (static_diff_enabled=0), falling back to a floor",
+                 who, req);
+        return -1;
     }
     if (s->cfg.max_suggested_diff <= 0.0) {
         LOG_INFO("stratum: %s requested STATIC difficulty %.0f — requests "
                  "DISABLED (max_suggested_diff <= 0), ignoring", who, req);
-        return;
+        return -1;
     }
     /* 🔴 REFUSE when the submit ceiling is off, because the ceiling — not the
      * difficulty floor — is what actually bounds a pinned flood. Vardiff
@@ -1812,7 +1831,7 @@ static void apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
         LOG_WARN("stratum: %s requested STATIC difficulty %.0f — REFUSED, "
                  "max_submits_per_sec is 0 so nothing would bound a pinned "
                  "flood", who, req);
-        return;
+        return -1;
     }
     /* ⛔ Never on a listener that advertised its own floor. A marketplace port
      * promises a minimum difficulty; the network-difficulty clamp can still
@@ -1825,7 +1844,7 @@ static void apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
         LOG_WARN("stratum: %s requested STATIC difficulty %.0f — REFUSED, this "
                  "listener advertises a floor of %.0f and a pin cannot recover "
                  "from a network-difficulty dip", who, req, c->pol_vardiff_min);
-        return;
+        return -1;
     }
     double asked = req;
     if (req > s->cfg.max_suggested_diff) req = s->cfg.max_suggested_diff;
@@ -1847,8 +1866,9 @@ static void apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
                  req, asked);
     } else {
         LOG_INFO("stratum: %s pinned at difficulty %.0f — vardiff disabled for "
-                 "this connection", c->worker_name, req);
+                 "this connection", who, req);
     }
+    return 0;
 }
 
 /* mining.suggest_difficulty: params[0] is the difficulty the miner wants.
@@ -1900,7 +1920,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             if (cJSON_IsString(p)) {
                 double v;
                 int pin = 0;
-                if (parse_password_diff(p->valuestring, &v, &pin) == 0) {
+                if (parse_password_diff(p->valuestring, worker, &v, &pin) == 0) {
                     pw_diff = v;
                     pw_pinned = pin;
                 }
@@ -2033,13 +2053,15 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * says it wants. `mining.suggest_difficulty` may already have arrived
      * before authorize, in which case re-apply it: the hint above has just
      * overwritten c->difficulty. */
+    int pinned_ok = 0;
     if (pw_pinned && pw_diff > 0.0) {
         /* A pin supersedes everything above it: the replayed hint, the
          * initial_diff default, and any earlier floor request. It is the
          * strongest thing a miner can say about its own difficulty, and the
          * clamps inside apply_pinned_diff are what make that safe. */
-        apply_pinned_diff(s, c, pw_diff);
-    } else {
+        pinned_ok = (apply_pinned_diff(s, c, pw_diff) == 0);
+    }
+    if (!pinned_ok) {
         double req = pw_diff > 0.0 ? pw_diff : c->requested_min_diff;
         if (req > 0.0) {
             apply_requested_diff(s, c, req);
