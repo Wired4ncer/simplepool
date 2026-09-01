@@ -389,6 +389,11 @@ typedef struct {
      * a submit is a miner-visible action; it does not get a default. */
     int    max_submits_per_sec;
 
+    /* Gate for the `sd=<n>` static-difficulty pin. 0 = off (default).
+     * Its own switch rather than max_suggested_diff's, which also gates the
+     * `d=` floor that miners use today. See config.h. */
+    int    static_diff_enabled;
+
     void  *ctx;
     share_observer_fn  on_share;
     difficulty_hint_fn on_difficulty_hint;   /* optional */

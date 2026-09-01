@@ -33,6 +33,14 @@ typedef struct {
      * See stratum.h for why it sits where it does. */
     int  max_submits_per_sec;
 
+    /* Kill switch for the `sd=<n>` static-difficulty request. Default 0 = OFF.
+     *
+     * ⚠️ Deliberately NOT shared with max_suggested_diff. That knob also gates
+     * the `d=` FLOOR request, which real miners use today — so turning pins off
+     * by way of it would also disable floors for everyone, and a switch you
+     * cannot afford to throw is not a kill switch. */
+    int  static_diff_enabled;
+
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
      * to pin every connection to initial_diff (the legacy behaviour). */

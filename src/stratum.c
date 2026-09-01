@@ -500,12 +500,23 @@ struct stratum_conn {
      *
      * ⚠️ THIS DELIBERATELY CONTRADICTS the field above, whose comment rejects
      * pinning as "a denial-of-service hole: `d=1` from a 400 TH/s miner is
-     * ~93,000 shares/sec aimed at the share pipeline". That objection is
-     * correct about an UNCLAMPED pin and is answered by clamping, not by
-     * ignoring it: a pin is floored at conn_vardiff_min() before it is
-     * applied, so `sd=1` becomes the same floor vardiff itself would never go
-     * below. The DoS argument assumed the miner could name any value; it
-     * cannot.
+     * ~93,000 shares/sec aimed at the share pipeline". That objection is REAL
+     * and is not answered by the floor clamp.
+     *
+     * ⛔ The tempting wrong answer, written here first and corrected after
+     * review, was: "a pin is floored at conn_vardiff_min(), so `sd=1` becomes
+     * a difficulty vardiff would never go below anyway." That compares LEVELS.
+     * The hazard is DURATION. Vardiff *visits* the floor and ratchets away
+     * from it within a window or two — that is the entire function of the rate
+     * loop — whereas a pin makes the floor permanent for the life of the
+     * connection. "The pool has accepted this level transiently" is not "the
+     * pool has accepted it indefinitely", and at 400 TH/s the difference is
+     * ~91 shares/sec forever versus a two-window excursion.
+     *
+     * ✅ What actually bounds it is `max_submits_per_sec`, so apply_pinned_diff
+     * REFUSES to pin when that ceiling is off, rather than leaving the real
+     * guard incidental. The floor clamp is kept — it is still the right thing
+     * to do — but it is not the safety argument.
      *
      * WHY A PIN AND NOT A FLOOR. Measured 2026-09-01: `low difficulty` is
      * 97.9% of all pool rejects, and the single worst-rejecting worker (40.2%
@@ -1670,6 +1681,14 @@ static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
 static int parse_password_diff(const char *pw, double *out, int *pinned) {
     if (!pw || !out) return -1;
     if (pinned) *pinned = 0;
+    /* ⚠️ TWO PASSES, and the order matters more than it looks. A single
+     * left-to-right scan makes `d=500,sd=1` and `sd=1,d=500` mean opposite
+     * things with no log line either way — and the natural migration is a
+     * miner APPENDING sd= to a password that already carries d=, which would
+     * silently get no pin and no explanation. A pin is the stronger statement,
+     * so it wins wherever it appears. */
+    for (int pass = 0; pass < 2; ++pass) {
+    const int want_pin = (pass == 0);
     for (const char *p = pw; *p; ++p) {
         /* Match at a token boundary, so "id=7" is not a request. */
         if ((p != pw) && p[-1] != ',' && p[-1] != ';' && p[-1] != ' ') continue;
@@ -1682,15 +1701,22 @@ static int parse_password_diff(const char *pw, double *out, int *pinned) {
          * now is being silently ignored. */
         int is_pin = (p[0] == 's' && p[1] == 'd' && p[2] == '=');
         const char *num = is_pin ? p + 3 : (p[0] == 'd' && p[1] == '=' ? p + 2 : NULL);
-        if (!num) continue;
+        if (!num || is_pin != want_pin) continue;
 
         char *end = NULL;
         double v = strtod(num, &end);
-        if (end == num) return -1;                /* `d=`/`sd=` with no number */
-        if (!(v > 0.0) || v != v) return -1;      /* <= 0, or NaN */
+        if (end == num || !(v > 0.0) || v != v) {
+            /* Logged rather than swallowed: the miner most likely to fumble
+             * this syntax is exactly the one the feature exists for, and a
+             * silent -1 is indistinguishable from "asked for nothing". */
+            LOG_INFO("stratum: unusable %s difficulty request in password",
+                     is_pin ? "sd=" : "d=");
+            return -1;
+        }
         *out = v;
         if (pinned) *pinned = is_pin;
         return 0;
+    }
     }
     return -1;
 }
@@ -1758,11 +1784,47 @@ static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
  * CALLER MUST HOLD c->state_lock. */
 static void apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
                               double req) {
+    const char *who = c->worker_name[0] ? c->worker_name : "(unauthorized)";
     if (!(req > 0.0)) return;
+
+    /* Its own switch, not max_suggested_diff's — see config.h. */
+    if (!s->cfg.static_diff_enabled) {
+        LOG_INFO("stratum: %s requested STATIC difficulty %.0f — `sd=` is "
+                 "disabled (static_diff_enabled=0), ignoring", who, req);
+        return;
+    }
     if (s->cfg.max_suggested_diff <= 0.0) {
         LOG_INFO("stratum: %s requested STATIC difficulty %.0f — requests "
-                 "DISABLED (max_suggested_diff <= 0), ignoring",
-                 c->worker_name[0] ? c->worker_name : "(unauthorized)", req);
+                 "DISABLED (max_suggested_diff <= 0), ignoring", who, req);
+        return;
+    }
+    /* 🔴 REFUSE when the submit ceiling is off, because the ceiling — not the
+     * difficulty floor — is what actually bounds a pinned flood. Vardiff
+     * VISITS a low difficulty and ratchets away from it within a window or
+     * two; a pin makes it permanent, and "the pool has accepted this level
+     * transiently" is not "the pool has accepted it indefinitely". With the
+     * ceiling off there is nothing left holding the bound.
+     * ⚠️ max_submits_per_sec defaults to 0 (off) and has silently regressed to
+     * inert once before — the merge kept the config key and dropped the
+     * enforcement (INC-002). Naming it here makes the real guard load-bearing
+     * instead of incidental. → feedback_copied-is-not-honoured */
+    if (s->cfg.max_submits_per_sec <= 0) {
+        LOG_WARN("stratum: %s requested STATIC difficulty %.0f — REFUSED, "
+                 "max_submits_per_sec is 0 so nothing would bound a pinned "
+                 "flood", who, req);
+        return;
+    }
+    /* ⛔ Never on a listener that advertised its own floor. A marketplace port
+     * promises a minimum difficulty; the network-difficulty clamp can still
+     * pull a connection under it, and under FLOOR semantics vardiff lifts it
+     * back once the chain recovers. Under a pin nothing ever lifts it back,
+     * because vardiff_maybe_retarget returns at the top for the rest of the
+     * connection's life — so the port would quietly serve a rented fleet below
+     * what it was sold. → feedback_never-restart-with-live-rental-offers */
+    if (c->pol_vardiff_min > 0.0) {
+        LOG_WARN("stratum: %s requested STATIC difficulty %.0f — REFUSED, this "
+                 "listener advertises a floor of %.0f and a pin cannot recover "
+                 "from a network-difficulty dip", who, req, c->pol_vardiff_min);
         return;
     }
     double asked = req;
@@ -2017,6 +2079,19 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * config. */
     double net_diff = current_net_diff(s);
     if (net_diff > 0.0 && c->difficulty > net_diff) c->difficulty = net_diff;
+    /* 🔴 The clamp above outranks a pin, and that is correct policy — a share
+     * target above the network target makes the miner discard valid blocks
+     * locally. But it leaves c->difficulty and c->pinned_diff DIVERGED, and
+     * nothing reconciles them afterwards because vardiff_maybe_retarget
+     * early-returns for the rest of the connection's life. Every log line would
+     * report the pin while the miner mined something else. Re-sync here.
+     * ⛔ Do NOT "fix" this by reordering the clamp: it runs last on purpose, to
+     * protect the minimum-difficulty window. */
+    if (c->pinned_diff > 0.0 && c->pinned_diff != c->difficulty) {
+        LOG_INFO("stratum: %s pin %.0f lowered to the network difficulty %.0f",
+                 c->worker_name, c->pinned_diff, c->difficulty);
+        c->pinned_diff = c->difficulty;
+    }
     /* Arm vardiff window for this connection. */
     c->vd_window_start_ms = now_ms();
     c->vd_window_shares = 0;

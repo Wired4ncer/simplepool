@@ -3667,6 +3667,117 @@ static void test_solo_is_never_gated(void) {
     stratum_server_free(s);
 }
 
+
+/* ---- sd= : static difficulty --------------------------------------------
+ *
+ * A pin takes a connection out of vardiff entirely. Every test below asserts
+ * the NUMBER, never a range: a wrong clamp switches the guard off while the
+ * source still reads correct. */
+
+static stratum_server_t *sd_server(obs_t *obs, int enabled, int submit_ceiling,
+                                   double vd_min) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
+                          .initial_diff = 100000.0,
+                          .vardiff_enabled = 1,
+                          .vardiff_target_spm = 12,
+                          .vardiff_min = vd_min,
+                          .vardiff_max = 1e12,
+                          .vardiff_window_sec = 30,
+                          .max_suggested_diff = 1e9,
+                          .max_submits_per_sec = submit_ceiling,
+                          .static_diff_enabled = enabled,
+                          .ctx = obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0) return NULL;
+    uint8_t net[32] = {0}; net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    return s;
+}
+
+/* Authorize with `pw` and return the difficulty the server announced. */
+static double sd_authorize(stratum_server_t *s, stratum_conn_t *c, const char *pw) {
+    char *out = NULL; size_t olen = 0; char msg[256];
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out = NULL; olen = 0;
+    snprintf(msg, sizeof msg,
+             "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"%s\"]}", pw);
+    stratum_handle_message(s, c, msg, &out, &olen);
+    double d = stratum_conn_difficulty_for_test(c);
+    free(out);
+    return d;
+}
+
+/* 🔴 THE GATE. Off by default, and the assertion is that the connection lands
+ * on initial_diff — not merely "not 4242". A pin that silently became a floor
+ * would also miss 4242 while doing something entirely different. */
+static void test_sd_is_off_by_default(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 0, 120, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=4242") == 100000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: sd= is ignored unless static_diff_enabled\n");
+}
+
+/* ...and the instrument check for the gate: the same request with the flag on
+ * must actually pin, or three "not pinned" results would be equally consistent
+ * with sd= never having been wired up at all. */
+static void test_sd_pins_when_enabled(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 1, 120, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=4242") == 4242.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: sd= pins the connection when enabled\n");
+}
+
+/* The floor is the safety argument, so assert the exact value it lands on. */
+static void test_sd_is_floored_at_vardiff_min(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 1, 120, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=1") == 1024.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: sd= below the floor is clamped up to vardiff_min\n");
+}
+
+/* 🔴 The ceiling, not the floor, is what bounds a pinned flood — so refuse to
+ * pin at all when it is off. Lands on initial_diff, i.e. the request was
+ * dropped entirely rather than degraded to a floor. */
+static void test_sd_refused_without_a_submit_ceiling(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 1, 0, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=4242") == 100000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: sd= is refused when max_submits_per_sec is 0\n");
+}
+
+/* 🔴 Order-independence. Same two tokens, both orders, same answer — the bug
+ * being guarded is a single left-to-right scan making these mean opposite
+ * things with no log line either way. */
+static void test_sd_beats_d_in_either_order(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server(&obs, 1, 120, 1024.0);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *a = stratum_conn_new_for_test(s);
+    stratum_conn_t *b = stratum_conn_new_for_test(s);
+    double first  = sd_authorize(s, a, "d=50000,sd=4242");
+    double second = sd_authorize(s, b, "sd=4242,d=50000");
+    CHECK(first == 4242.0);
+    CHECK(second == 4242.0);
+    CHECK(first == second);
+    stratum_conn_free_for_test(a); stratum_conn_free_for_test(b);
+    stratum_server_free(s);
+    printf("ok: sd= wins over d= regardless of token order\n");
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -3718,6 +3829,11 @@ int main(void) {
     test_hint_below_vardiff_min_is_floored();
     test_request_lowers_replayed_hint_at_authorize();
     test_request_below_floor_lowers_only_to_floor();
+    test_sd_is_off_by_default();
+    test_sd_pins_when_enabled();
+    test_sd_is_floored_at_vardiff_min();
+    test_sd_refused_without_a_submit_ceiling();
+    test_sd_beats_d_in_either_order();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();
     test_submit_ceiling_refuses_past_the_limit();

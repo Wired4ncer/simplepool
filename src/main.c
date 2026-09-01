@@ -1831,6 +1831,7 @@ int main(int argc, char **argv) {
     memcpy(stcfg.listeners, cfg.listeners, sizeof stcfg.listeners);
     stcfg.listener_count  = cfg.listener_count;
     stcfg.max_submits_per_sec = cfg.max_submits_per_sec;
+    stcfg.static_diff_enabled = cfg.static_diff_enabled;
     stcfg.initial_diff = cfg.initial_diff;
     snprintf(stcfg.operator_address, sizeof stcfg.operator_address, "%s",
              cfg.operator_address);
