@@ -493,6 +493,35 @@ struct stratum_conn {
      * works regardless of how its hashrate is split. */
     double   requested_min_diff;
 
+    /* A PINNED difficulty, from the stratum password `sd=<n>` ("static
+     * difficulty"). 0 = not pinned. When set, vardiff does not retarget this
+     * connection at all: the difficulty is exactly this value for the life of
+     * the connection.
+     *
+     * ⚠️ THIS DELIBERATELY CONTRADICTS the field above, whose comment rejects
+     * pinning as "a denial-of-service hole: `d=1` from a 400 TH/s miner is
+     * ~93,000 shares/sec aimed at the share pipeline". That objection is
+     * correct about an UNCLAMPED pin and is answered by clamping, not by
+     * ignoring it: a pin is floored at conn_vardiff_min() before it is
+     * applied, so `sd=1` becomes the same floor vardiff itself would never go
+     * below. The DoS argument assumed the miner could name any value; it
+     * cannot.
+     *
+     * WHY A PIN AND NOT A FLOOR. Measured 2026-09-01: `low difficulty` is
+     * 97.9% of all pool rejects, and the single worst-rejecting worker (40.2%
+     * of its own shares) was already sending `d=16384` and being raised off it
+     * by vardiff on every window. A floor cannot express "do not move me" —
+     * which is what a miner with a known, stable hashrate is actually asking
+     * for, and what removes the disagreement that produces a low-difficulty
+     * reject in the first place.
+     *
+     * ⛔ The miner owns the consequences. A pin set far above the fleet's real
+     * rate means long gaps between shares, bad variance, and eventual idle
+     * reaping; a pin far below means a share flood bounded only by the submit
+     * ceiling. Vardiff exists to protect miners from both, and `sd=` is an
+     * explicit request to decline that protection. */
+    double   pinned_diff;
+
     /* The difficulty this connection was on when each recent job was SENT to
      * it — i.e. the difficulty the miner actually mined that job at.
      *
@@ -1215,6 +1244,12 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
                                    char **buf, size_t *len)
 {
     if (!s->cfg.vardiff_enabled) return;
+    /* A pinned connection is not retargeted, ever. Placed before the window
+     * bookkeeping deliberately: leaving the window running would accumulate
+     * state that a later unpin (there is none today) would act on, and would
+     * also keep vd_window_min_achieved warm for the floor guard on a
+     * connection whose difficulty is not vardiff's to move. */
+    if (c->pinned_diff > 0.0) return;
     if (c->vd_window_start_ms == 0) {
         c->vd_window_start_ms = now;
         c->vd_window_shares = 0;
@@ -1632,17 +1667,29 @@ static int handle_configure(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
  *
  * Returns 0 and writes *out on success, -1 if the field carries no usable
  * `d=` token. */
-static int parse_password_diff(const char *pw, double *out) {
+static int parse_password_diff(const char *pw, double *out, int *pinned) {
     if (!pw || !out) return -1;
+    if (pinned) *pinned = 0;
     for (const char *p = pw; *p; ++p) {
-        /* Match `d=` only at a token boundary, so "id=7" is not a request. */
+        /* Match at a token boundary, so "id=7" is not a request. */
         if ((p != pw) && p[-1] != ',' && p[-1] != ';' && p[-1] != ' ') continue;
-        if (p[0] != 'd' || p[1] != '=') continue;
+
+        /* `sd=` — static difficulty, a PIN. Checked before `d=` because the
+         * boundary rule already excludes the `d=` inside `sd=` (its preceding
+         * character is 's', not a separator), so without this branch `sd=` is
+         * simply not a request at all. That is what it means today, which is
+         * why adopting the token breaks no existing miner: anyone sending it
+         * now is being silently ignored. */
+        int is_pin = (p[0] == 's' && p[1] == 'd' && p[2] == '=');
+        const char *num = is_pin ? p + 3 : (p[0] == 'd' && p[1] == '=' ? p + 2 : NULL);
+        if (!num) continue;
+
         char *end = NULL;
-        double v = strtod(p + 2, &end);
-        if (end == p + 2) return -1;              /* `d=` with no number */
+        double v = strtod(num, &end);
+        if (end == num) return -1;                /* `d=`/`sd=` with no number */
         if (!(v > 0.0) || v != v) return -1;      /* <= 0, or NaN */
         *out = v;
+        if (pinned) *pinned = is_pin;
         return 0;
     }
     return -1;
@@ -1657,6 +1704,18 @@ static int parse_password_diff(const char *pw, double *out) {
 static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
                                  double req) {
     if (!(req > 0.0)) return;
+    /* A pin outranks a floor, and the guard lives HERE rather than at the two
+     * call sites so a third caller cannot quietly reintroduce the hole:
+     * `mining.suggest_difficulty` arrives mid-session and would otherwise
+     * raise a pinned connection off its pin, which is exactly the movement
+     * the miner asked us not to make. */
+    if (c->pinned_diff > 0.0) {
+        LOG_INFO("stratum: %s requested difficulty %.0f — ignored, connection "
+                 "is pinned at %.0f",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, c->pinned_diff);
+        return;
+    }
     /* <= 0 disables miner requests entirely -- the deploy gate. It still
      * LOGS what was asked for, so a stage that has the feature switched off
      * measures how many miners already send `d=` out of habit from other
@@ -1678,6 +1737,56 @@ static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
     if (net_diff > 0.0 && req > net_diff) req = net_diff;
     c->requested_min_diff = req;
     if (c->difficulty < req) c->difficulty = req;
+}
+
+/* Apply a miner's requested difficulty as a PIN: exactly this value, and
+ * vardiff leaves the connection alone from here.
+ *
+ * 🔴 THE FLOOR CLAMP IS THE WHOLE SAFETY ARGUMENT, and it must come last.
+ * Without it this is the DoS the `requested_min_diff` comment warns about.
+ * With it, the worst a miner can pin is conn_vardiff_min() — precisely the
+ * difficulty vardiff would refuse to go below anyway — so the pin can never
+ * produce a share rate the pool would not already have accepted.
+ * → feedback_a-guard-can-disable-what-it-guards: assert the NUMBER after
+ *   deploy, not the range.
+ *
+ * The upper clamps are shared with apply_requested_diff and are re-applied
+ * rather than assumed: max_suggested_diff is the operator's ceiling, and a
+ * share target above the network target makes the miner discard valid blocks
+ * locally before we ever see them.
+ *
+ * CALLER MUST HOLD c->state_lock. */
+static void apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
+                              double req) {
+    if (!(req > 0.0)) return;
+    if (s->cfg.max_suggested_diff <= 0.0) {
+        LOG_INFO("stratum: %s requested STATIC difficulty %.0f — requests "
+                 "DISABLED (max_suggested_diff <= 0), ignoring",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)", req);
+        return;
+    }
+    double asked = req;
+    if (req > s->cfg.max_suggested_diff) req = s->cfg.max_suggested_diff;
+    double net_diff = current_net_diff(s);
+    if (net_diff > 0.0 && req > net_diff) req = net_diff;
+    /* LAST, so nothing above can push it back under the floor. */
+    double vd_min = conn_vardiff_min(s, c);
+    if (vd_min > 0.0 && req < vd_min) req = vd_min;
+
+    c->pinned_diff = req;
+    c->difficulty  = req;
+    /* Cleared: a pin is not a floor, and leaving both set would let the
+     * vardiff floor logic act on a connection vardiff no longer touches. */
+    c->requested_min_diff = 0.0;
+
+    if (asked != req) {
+        LOG_INFO("stratum: %s pinned at difficulty %.0f (asked %.0f, clamped)",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, asked);
+    } else {
+        LOG_INFO("stratum: %s pinned at difficulty %.0f — vardiff disabled for "
+                 "this connection", c->worker_name, req);
+    }
 }
 
 /* mining.suggest_difficulty: params[0] is the difficulty the miner wants.
@@ -1718,16 +1827,21 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
     const char *worker = NULL;
     double pw_diff = 0.0;
+    int    pw_pinned = 0;
     if (cJSON_IsArray(params) && cJSON_GetArraySize(params) >= 1) {
         cJSON *w = cJSON_GetArrayItem(params, 0);
         if (cJSON_IsString(w)) worker = w->valuestring;
         /* params[1] is the password. Historically ignored here; it is the
-         * `d=<n>` difficulty request channel. */
+         * `d=<n>` (floor) and `sd=<n>` (pin) difficulty request channel. */
         if (cJSON_GetArraySize(params) >= 2) {
             cJSON *p = cJSON_GetArrayItem(params, 1);
             if (cJSON_IsString(p)) {
                 double v;
-                if (parse_password_diff(p->valuestring, &v) == 0) pw_diff = v;
+                int pin = 0;
+                if (parse_password_diff(p->valuestring, &v, &pin) == 0) {
+                    pw_diff = v;
+                    pw_pinned = pin;
+                }
             }
         }
     }
@@ -1857,7 +1971,13 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * says it wants. `mining.suggest_difficulty` may already have arrived
      * before authorize, in which case re-apply it: the hint above has just
      * overwritten c->difficulty. */
-    {
+    if (pw_pinned && pw_diff > 0.0) {
+        /* A pin supersedes everything above it: the replayed hint, the
+         * initial_diff default, and any earlier floor request. It is the
+         * strongest thing a miner can say about its own difficulty, and the
+         * clamps inside apply_pinned_diff are what make that safe. */
+        apply_pinned_diff(s, c, pw_diff);
+    } else {
         double req = pw_diff > 0.0 ? pw_diff : c->requested_min_diff;
         if (req > 0.0) {
             apply_requested_diff(s, c, req);
