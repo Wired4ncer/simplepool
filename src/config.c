@@ -52,6 +52,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_target_spm = 12.0;   /* ~1 share every 5s per connection */
     cfg->vardiff_min        = 1.0;
     cfg->static_diff_enabled = 0;   /* `sd=` pins are OFF until asked for */
+    cfg->static_diff_min     = 16384;  /* pin floor, independent of vardiff_min */
     cfg->vardiff_max        = 1e12;
     cfg->vardiff_window_sec = 30;
     cfg->vardiff_min_samples     = 20;
@@ -292,6 +293,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "vardiff_min_samples")       == 0) cfg->vardiff_min_samples = atoi(v);
         else if (strcmp(k, "max_suggested_diff")        == 0) cfg->max_suggested_diff = atof(v);
         else if (strcmp(k, "static_diff_enabled")      == 0) cfg->static_diff_enabled = atoi(v);
+        else if (strcmp(k, "static_diff_min")          == 0) cfg->static_diff_min = atoi(v);
         else if (strcmp(k, "vardiff_max_window_mult")   == 0) cfg->vardiff_max_window_mult = atoi(v);
         else if (strcmp(k, "vardiff_idle_step")         == 0) cfg->vardiff_idle_step = atof(v);
         else if (strcmp(k, "clean_jobs_on_refresh")     == 0) cfg->clean_jobs_on_refresh = atoi(v);
@@ -470,11 +472,14 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
      * with stratum down. Nothing about `sd=` is on by default, so a default
      * deploy would be taking that risk for no benefit. Gated, the check bites
      * when someone turns pins ON, which is the right place for it. */
-    if (cfg->static_diff_enabled && !(cfg->vardiff_min > 0.0)) {
+    /* The pin floor is static_diff_min, NOT vardiff_min — deliberately, so the
+     * bound belongs to this feature rather than to a value it does not own.
+     * Validate the one that decides it. */
+    if (cfg->static_diff_enabled && cfg->static_diff_min <= 0) {
         set_err(errbuf, errlen,
-                "config: 'static_diff_enabled' requires 'vardiff_min' greater "
-                "than 0 — it is the floor a static-difficulty request is "
-                "clamped to, and a 0 floor silently disables that clamp");
+                "config: 'static_diff_enabled' requires 'static_diff_min' "
+                "greater than 0 — it is the floor a static-difficulty request "
+                "is clamped to, and a 0 floor silently disables that clamp");
         return -18;
     }
     /* Two listeners on one port, or a listener on listen_port. Caught here

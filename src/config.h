@@ -41,6 +41,27 @@ typedef struct {
      * cannot afford to throw is not a kill switch. */
     int  static_diff_enabled;
 
+    /* 🔴 The minimum a `sd=` pin may resolve to. Default 16384.
+     *
+     * This exists so the pin floor does NOT depend on vardiff_min. vardiff_min
+     * defaults to 1, and a pin at 1 from a large miner is the denial-of-service
+     * the whole design has been arguing about — bounded only by
+     * max_submits_per_sec, and a REFUSED submit still costs a socket read, a
+     * full cJSON_Parse and a reply, because the ceiling is checked inside
+     * handle_submit after the message is already parsed. So the ceiling caps
+     * share processing, not message processing.
+     *
+     * Making the floor a value this feature owns means the guard stops
+     * depending on a config nobody verified. → feedback_a-guard-can-disable-what-it-guards
+     *
+     * Why 16384: at 400 TH/s a pin here offers ~5.7 shares/sec, comfortably
+     * under a 120/s ceiling; and it is servable for the miners actually asking
+     * (the worst-rejecting worker on the pool requests exactly 16384 today), so
+     * the feature works at its default instead of inviting an operator to lower
+     * it blind. ⚠️ EH-scale hashrate would still exceed the ceiling here, but
+     * that arrives on marketplace ports, which refuse pins outright. */
+    int  static_diff_min;
+
     /* vardiff — auto-adjust each connection's difficulty to keep the
      * share rate near `target_spm` shares/minute. Set vardiff_enabled = 0
      * to pin every connection to initial_diff (the legacy behaviour). */

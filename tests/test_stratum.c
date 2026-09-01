@@ -3674,8 +3674,8 @@ static void test_solo_is_never_gated(void) {
  * the NUMBER, never a range: a wrong clamp switches the guard off while the
  * source still reads correct. */
 
-static stratum_server_t *sd_server(obs_t *obs, int enabled, int submit_ceiling,
-                                   double vd_min) {
+static stratum_server_t *sd_server_min(obs_t *obs, int enabled, int submit_ceiling,
+                                       double vd_min, int sd_min) {
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2,
                           .initial_diff = 100000.0,
                           .vardiff_enabled = 1,
@@ -3686,6 +3686,7 @@ static stratum_server_t *sd_server(obs_t *obs, int enabled, int submit_ceiling,
                           .max_suggested_diff = 1e9,
                           .max_submits_per_sec = submit_ceiling,
                           .static_diff_enabled = enabled,
+                          .static_diff_min = sd_min,
                           .ctx = obs, .on_share = on_share,
                           .on_reject = on_reject, .on_block = on_block };
     snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
@@ -3694,6 +3695,12 @@ static stratum_server_t *sd_server(obs_t *obs, int enabled, int submit_ceiling,
     uint8_t net[32] = {0}; net[7] = 0xff; net[8] = 0xff;
     stratum_server_set_job(s, make_test_job("J1", net), 1);
     return s;
+}
+
+/* Most tests do not care about the pin floor; give them the shipped default. */
+static stratum_server_t *sd_server(obs_t *obs, int enabled, int submit_ceiling,
+                                   double vd_min) {
+    return sd_server_min(obs, enabled, submit_ceiling, vd_min, 16384);
 }
 
 /* Authorize with `pw` and return the difficulty the server announced. */
@@ -3710,14 +3717,14 @@ static double sd_authorize(stratum_server_t *s, stratum_conn_t *c, const char *p
 }
 
 /* 🔴 THE GATE. Off by default, and the assertion is that the connection lands
- * on initial_diff — not merely "not 4242". A pin that silently became a floor
- * would also miss 4242 while doing something entirely different. */
+ * on initial_diff — not merely "not 50000". A pin that silently became a floor
+ * would also miss 50000 while doing something entirely different. */
 static void test_sd_is_off_by_default(void) {
     obs_t obs = {0};
     stratum_server_t *s = sd_server(&obs, 0, 120, 1024.0);
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
-    CHECK(sd_authorize(s, c, "sd=4242") == 100000.0);
+    CHECK(sd_authorize(s, c, "sd=50000") == 100000.0);
     CHECK(stratum_conn_pinned_diff_for_test(c) == 0.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: sd= does not pin unless static_diff_enabled\n");
@@ -3731,10 +3738,10 @@ static void test_sd_pins_when_enabled(void) {
     stratum_server_t *s = sd_server(&obs, 1, 120, 1024.0);
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
-    CHECK(sd_authorize(s, c, "sd=4242") == 4242.0);
+    CHECK(sd_authorize(s, c, "sd=50000") == 50000.0);
     /* On the field, not inferred from the difficulty: a floor at 4242 would
      * leave the same difficulty here. */
-    CHECK(stratum_conn_pinned_diff_for_test(c) == 4242.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 50000.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: sd= pins the connection when enabled\n");
 }
@@ -3745,10 +3752,39 @@ static void test_sd_is_floored_at_vardiff_min(void) {
     stratum_server_t *s = sd_server(&obs, 1, 120, 1024.0);
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
-    CHECK(sd_authorize(s, c, "sd=1") == 1024.0);
-    CHECK(stratum_conn_pinned_diff_for_test(c) == 1024.0);
+    CHECK(sd_authorize(s, c, "sd=1") == 16384.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 16384.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
-    printf("ok: sd= below the floor is clamped up to vardiff_min\n");
+    printf("ok: sd= below the floor is clamped up to static_diff_min\n");
+}
+
+/* 🔴 THE POINT OF static_diff_min: the pin floor must NOT depend on
+ * vardiff_min. vardiff_min is 1 here — its shipped default, and the value we
+ * could never confirm on the live host — and a pin at 1 must still be refused
+ * down to static_diff_min rather than honoured. If the floor ever regressed to
+ * conn_vardiff_min() this lands at 1, which is the denial-of-service the whole
+ * design exists to prevent. */
+static void test_sd_floor_does_not_depend_on_vardiff_min(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server_min(&obs, 1, 120, 1.0, 16384);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=1") == 16384.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 16384.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: the pin floor is static_diff_min even when vardiff_min is 1\n");
+}
+
+/* ...and a listener asking for MORE still wins, so a marketplace floor is not
+ * lowered by this. */
+static void test_sd_listener_floor_still_wins_over_static_diff_min(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = sd_server_min(&obs, 1, 120, 50000.0, 16384);
+    CHECK(s != NULL); if (!s) return;
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    CHECK(sd_authorize(s, c, "sd=1") == 50000.0);
+    stratum_conn_free_for_test(c); stratum_server_free(s);
+    printf("ok: a higher vardiff floor still wins over static_diff_min\n");
 }
 
 /* 🔴 The ceiling, not the floor, is what bounds a pinned flood — so refuse to
@@ -3813,10 +3849,10 @@ static void test_sd_beats_d_in_either_order(void) {
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *a = stratum_conn_new_for_test(s);
     stratum_conn_t *b = stratum_conn_new_for_test(s);
-    double first  = sd_authorize(s, a, "d=50000,sd=4242");
-    double second = sd_authorize(s, b, "sd=4242,d=50000");
-    CHECK(first == 4242.0);
-    CHECK(second == 4242.0);
+    double first  = sd_authorize(s, a, "d=50000,sd=50000");
+    double second = sd_authorize(s, b, "sd=50000,d=50000");
+    CHECK(first == 50000.0);
+    CHECK(second == 50000.0);
     CHECK(first == second);
     stratum_conn_free_for_test(a); stratum_conn_free_for_test(b);
     stratum_server_free(s);
@@ -3877,6 +3913,8 @@ int main(void) {
     test_sd_is_off_by_default();
     test_sd_pins_when_enabled();
     test_sd_is_floored_at_vardiff_min();
+    test_sd_floor_does_not_depend_on_vardiff_min();
+    test_sd_listener_floor_still_wins_over_static_diff_min();
     test_sd_refused_falls_back_to_a_floor();
     test_sd_disabled_still_honours_the_floor();
     test_malformed_sd_does_not_kill_a_valid_d();

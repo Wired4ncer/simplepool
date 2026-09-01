@@ -1255,11 +1255,23 @@ static void vardiff_maybe_retarget(stratum_server_t *s, stratum_conn_t *c,
                                    char **buf, size_t *len)
 {
     if (!s->cfg.vardiff_enabled) return;
-    /* A pinned connection is not retargeted, ever. Placed before the window
-     * bookkeeping deliberately: leaving the window running would accumulate
-     * state that a later unpin (there is none today) would act on, and would
-     * also keep vd_window_min_achieved warm for the floor guard on a
-     * connection whose difficulty is not vardiff's to move. */
+    /* A pinned connection is not retargeted, ever.
+     *
+     * ⚠️ WHAT THIS DOES AND DOES NOT DO. It skips the retarget and the window
+     * RESETS that live below. It does NOT stop the per-share accumulation —
+     * vd_window_shares, vd_window_min_achieved and friends are incremented in
+     * the submit path before this is ever called, and none of that is guarded.
+     * So on a pinned connection the window state accrues from authorize and is
+     * never reset. (An earlier version of this comment claimed the placement
+     * prevented that. It does not. — claude-a1)
+     *
+     * Harmless today: nothing reads those fields while pinned. vardiff_check_idle
+     * reads vd_window_shares only to decide whether to call this function, which
+     * returns here anyway, and the idle reaper uses last_activity_ms instead.
+     *
+     * ⛔ BUT WHOEVER IMPLEMENTS UNPIN MUST RE-ARM THE WINDOW FIRST. Otherwise the
+     * first retarget after unpinning computes observed_spm over hours rather than
+     * one window, against a min_achieved taken across the whole session. */
     if (c->pinned_diff > 0.0) return;
     if (c->vd_window_start_ms == 0) {
         c->vd_window_start_ms = now;
@@ -1797,8 +1809,7 @@ static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
  * share target above the network target makes the miner discard valid blocks
  * locally before we ever see them.
  *
- * CALLER MUST HOLD c->state_lock. */
-/* Returns 0 if the connection was pinned, -1 if the request was REFUSED.
+ * RETURNS 0 if the connection was pinned, -1 if the request was REFUSED.
  *
  * 🔴 A refusal must fall back to FLOOR semantics at the call site, never to
  * nothing. Discarding the request entirely is worse than not having the
@@ -1807,7 +1818,9 @@ static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
  * pinned miner to initial_diff and re-vardiff it from there — an emergency
  * switch whose own action causes a share surge. A miner naming a difficulty is
  * telling us something true about its hashrate whether or not pins are on.
- * (claude-a1's finding.) */
+ * (claude-a1's finding.)
+ *
+ * CALLER MUST HOLD c->state_lock. */
 static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
                              double req) {
     const char *who = c->worker_name[0] ? c->worker_name : "(unauthorized)";
@@ -1858,9 +1871,18 @@ static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
     if (req > s->cfg.max_suggested_diff) req = s->cfg.max_suggested_diff;
     double net_diff = current_net_diff(s);
     if (net_diff > 0.0 && req > net_diff) req = net_diff;
-    /* LAST, so nothing above can push it back under the floor. */
+    /* LAST, so nothing above can push it back under the floor.
+     *
+     * 🔴 The floor is max(static_diff_min, conn_vardiff_min). static_diff_min
+     * is the one that matters: vardiff_min defaults to 1, so resting the bound
+     * on it made the guard depend on a config value we could not read from the
+     * laptop — and a pin at 1 from a large miner is the DoS this design keeps
+     * circling. The listener's own floor is still honoured on top, for the case
+     * where a port asks for more. */
+    double floor_diff = (double)s->cfg.static_diff_min;
     double vd_min = conn_vardiff_min(s, c);
-    if (vd_min > 0.0 && req < vd_min) req = vd_min;
+    if (vd_min > floor_diff) floor_diff = vd_min;
+    if (floor_diff > 0.0 && req < floor_diff) req = floor_diff;
 
     c->pinned_diff = req;
     c->difficulty  = req;
@@ -1870,8 +1892,7 @@ static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
 
     if (asked != req) {
         LOG_INFO("stratum: %s pinned at difficulty %.0f (asked %.0f, clamped)",
-                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
-                 req, asked);
+                 who, req, asked);
     } else {
         LOG_INFO("stratum: %s pinned at difficulty %.0f — vardiff disabled for "
                  "this connection", who, req);
@@ -1903,9 +1924,21 @@ static int handle_suggest_difficulty(stratum_server_t *s, stratum_conn_t *c,
     apply_requested_diff(s, c, req);
     double after = c->difficulty;
     pthread_mutex_unlock(&c->state_lock);
-    LOG_INFO("stratum: %s suggested difficulty %.0f -> floor %.0f",
-             c->worker_name[0] ? c->worker_name : "(unauthorized)",
-             req, c->requested_min_diff);
+    /* ⚠️ Two different sentences, because one log line cannot honestly describe
+     * both outcomes. apply_pinned_diff clears requested_min_diff on success, so
+     * the floor wording on a pinned connection printed "-> floor 0" — which
+     * reads as "the floor was set to zero", the most alarming thing this
+     * subsystem could claim, and false. The journal is where this pool's
+     * forensics live; it must not contain that line. (claude-a1) */
+    if (c->pinned_diff > 0.0) {
+        LOG_INFO("stratum: %s suggested difficulty %.0f — ignored, pinned at %.0f",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, c->pinned_diff);
+    } else {
+        LOG_INFO("stratum: %s suggested difficulty %.0f -> floor %.0f",
+                 c->worker_name[0] ? c->worker_name : "(unauthorized)",
+                 req, c->requested_min_diff);
+    }
     /* Only tell an ALREADY-authorized miner; before authorize it has no job
      * yet, and authorize emits the difficulty itself. */
     if (c->authorized && after != before) send_set_difficulty(buf, len, after);

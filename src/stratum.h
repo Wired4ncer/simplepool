@@ -394,6 +394,10 @@ typedef struct {
      * `d=` floor that miners use today. See config.h. */
     int    static_diff_enabled;
 
+    /* Minimum a pin may resolve to. Independent of vardiff_min on
+     * purpose — see config.h. */
+    int    static_diff_min;
+
     void  *ctx;
     share_observer_fn  on_share;
     difficulty_hint_fn on_difficulty_hint;   /* optional */
