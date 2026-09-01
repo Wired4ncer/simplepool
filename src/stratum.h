@@ -443,6 +443,9 @@ int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
                                    const uint8_t **cb2, size_t *cb2_len,
                                    const uint8_t **en1);
 double      stratum_conn_difficulty_for_test(const stratum_conn_t *c);
+/* The pin, or 0 if unpinned. A pin and a floor at the same value are
+ * indistinguishable in c->difficulty, so tests need this to prove a refusal. */
+double      stratum_conn_pinned_diff_for_test(const stratum_conn_t *c);
 /* Apply a listener's difficulty policy to a connection, exactly as the accept
  * path does when a miner arrives on that port. Exposed so per-port policy can
  * be tested without binding a fixed port, which in CI is a race with whatever

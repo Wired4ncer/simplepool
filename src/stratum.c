@@ -1719,7 +1719,7 @@ static int parse_password_diff(const char *pw, const char *who,
             LOG_INFO("stratum: %s sent an unusable %s difficulty request",
                      who && who[0] ? who : "(unauthorized)",
                      is_pin ? "sd=" : "d=");
-            break;
+            continue;   /* not break: `sd=abc,sd=16384` must keep the valid one */
         }
         *out = v;
         if (pinned) *pinned = is_pin;
@@ -1776,11 +1776,19 @@ static void apply_requested_diff(stratum_server_t *s, stratum_conn_t *c,
 /* Apply a miner's requested difficulty as a PIN: exactly this value, and
  * vardiff leaves the connection alone from here.
  *
- * 🔴 THE FLOOR CLAMP IS THE WHOLE SAFETY ARGUMENT, and it must come last.
- * Without it this is the DoS the `requested_min_diff` comment warns about.
- * With it, the worst a miner can pin is conn_vardiff_min() — precisely the
- * difficulty vardiff would refuse to go below anyway — so the pin can never
- * produce a share rate the pool would not already have accepted.
+ * 🔴 THE FLOOR CLAMP IS NOT THE SAFETY ARGUMENT. An earlier version of this
+ * comment said it was — "the pin can never produce a share rate the pool would
+ * not already have accepted" — and that is wrong, because it compares LEVELS
+ * while the hazard is DURATION. Vardiff VISITS its floor and ratchets away
+ * within a window or two; a pin makes that floor permanent. Transiently
+ * accepted is not indefinitely accepted. The full reasoning is on the
+ * `pinned_diff` field; it is summarised here because this is the function a
+ * maintainer opens first, and the wrong argument sat here for two revisions.
+ *
+ * ✅ What actually bounds a pinned flood is max_submits_per_sec, so this
+ * function REFUSES to pin when that ceiling is off. The floor clamp is still
+ * applied and still runs last — it is the right thing to do — but it is a
+ * clamp, not the argument.
  * → feedback_a-guard-can-disable-what-it-guards: assert the NUMBER after
  *   deploy, not the range.
  *
@@ -1920,7 +1928,17 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             if (cJSON_IsString(p)) {
                 double v;
                 int pin = 0;
-                if (parse_password_diff(p->valuestring, worker, &v, &pin) == 0) {
+                /* 🔴 SANITIZED, not raw. sanitize_worker does not run until ~86
+                 * lines below, so `worker` here is still unbounded, unescaped,
+                 * miner-controlled bytes straight out of the JSON — and the
+                 * parser hands it to a printf-family logger. Embedded newlines
+                 * would forge whole journal lines. This pool's forensics ARE
+                 * journal greps, so a miner able to forge lines there can forge
+                 * the evidence. (Found by claude-a1, whose own earlier fix
+                 * introduced the path.) */
+                char wsan[129];
+                sanitize_worker(worker, wsan, sizeof wsan);
+                if (parse_password_diff(p->valuestring, wsan, &v, &pin) == 0) {
                     pw_diff = v;
                     pw_pinned = pin;
                 }
@@ -2803,6 +2821,13 @@ int stratum_conn_coinbase_for_test(stratum_server_t *s, stratum_conn_t *c,
     }
     pthread_rwlock_unlock(&s->job_lock);
     return rc;
+}
+
+/* 0 when the connection is not pinned. Exposed so a test can tell a PIN from a
+ * FLOOR: both leave the same value in c->difficulty, so difficulty alone cannot
+ * prove a refusal actually refused. */
+double stratum_conn_pinned_diff_for_test(const stratum_conn_t *c) {
+    return c ? c->pinned_diff : 0.0;
 }
 
 double stratum_conn_difficulty_for_test(const stratum_conn_t *c) {

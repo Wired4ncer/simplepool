@@ -3718,6 +3718,7 @@ static void test_sd_is_off_by_default(void) {
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     CHECK(sd_authorize(s, c, "sd=4242") == 100000.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 0.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: sd= does not pin unless static_diff_enabled\n");
 }
@@ -3731,6 +3732,9 @@ static void test_sd_pins_when_enabled(void) {
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     CHECK(sd_authorize(s, c, "sd=4242") == 4242.0);
+    /* On the field, not inferred from the difficulty: a floor at 4242 would
+     * leave the same difficulty here. */
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 4242.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: sd= pins the connection when enabled\n");
 }
@@ -3742,6 +3746,7 @@ static void test_sd_is_floored_at_vardiff_min(void) {
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     CHECK(sd_authorize(s, c, "sd=1") == 1024.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 1024.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: sd= below the floor is clamped up to vardiff_min\n");
 }
@@ -3759,6 +3764,11 @@ static void test_sd_refused_falls_back_to_a_floor(void) {
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     CHECK(sd_authorize(s, c, "sd=200000") == 200000.0);
+    /* 🔴 THE SAFETY ASSERTION. A floor and a pin at 200000 leave the SAME
+     * difficulty, so the line above cannot tell them apart — and "not pinned"
+     * is the entire point of refusing when the submit ceiling is off. Without
+     * this, the refusal could break and the test would still pass. */
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 0.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: a refused sd= degrades to a floor, it is not discarded\n");
 }
@@ -3773,6 +3783,7 @@ static void test_sd_disabled_still_honours_the_floor(void) {
     CHECK(s != NULL); if (!s) return;
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     CHECK(sd_authorize(s, c, "sd=200000") == 200000.0);
+    CHECK(stratum_conn_pinned_diff_for_test(c) == 0.0);
     stratum_conn_free_for_test(c); stratum_server_free(s);
     printf("ok: sd= with the feature off still applies as a floor\n");
 }
