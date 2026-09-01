@@ -3859,6 +3859,77 @@ static void test_sd_beats_d_in_either_order(void) {
     printf("ok: sd= wins over d= regardless of token order\n");
 }
 
+
+/* 🔴 END-TO-END OVER A REAL SOCKET.
+ *
+ * Every other sd= test calls stratum_handle_message directly, which skips
+ * accept(), the connection thread, the read loop and the line framing. That
+ * proves the logic and NOT that a miner's password reaches it. This drives the
+ * real path: connect, send subscribe and authorize as a miner's client would,
+ * and read what the server actually writes back on the wire.
+ *
+ * The assertion is on `mining.set_difficulty` — the only thing the miner ever
+ * sees, and the value it will configure itself to. */
+static void test_sd_end_to_end_over_a_socket(void) {
+    obs_t obs = {0};
+    int port = 39434;
+    stratum_server_t *s = NULL;
+    for (int p = port; p < port + 20 && !s; p++) {
+        stratum_cfg_t cfg = { .bind_port = p, .max_conns = 4,
+                              .initial_diff = 100000.0,
+                              .vardiff_enabled = 1, .vardiff_target_spm = 12,
+                              .vardiff_min = 1.0, .vardiff_max = 1e12,
+                              .vardiff_window_sec = 30,
+                              .max_suggested_diff = 1e9,
+                              .max_submits_per_sec = 120,
+                              .static_diff_enabled = 1,
+                              .static_diff_min = 16384,
+                              .ctx = &obs, .on_share = on_share,
+                              .on_reject = on_reject, .on_block = on_block };
+        snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+        if (stratum_server_start(&cfg, &s) == 0) { port = p; break; }
+        s = NULL;
+    }
+    CHECK(s != NULL); if (!s) return;
+    uint8_t net[32] = {0}; net[7] = 0xff; net[8] = 0xff;
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    int fd = dial(AF_INET, port);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        const char *sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
+        const char *aut = "{\"id\":2,\"method\":\"mining.authorize\","
+                          "\"params\":[\"" TEST_ADDR "\",\"x,sd=50000\"]}\n";
+        CHECK(write(fd, sub, strlen(sub)) == (ssize_t)strlen(sub));
+        sleep_ms(120);
+        CHECK(write(fd, aut, strlen(aut)) == (ssize_t)strlen(aut));
+        sleep_ms(350);
+
+        char rx[8192] = {0};
+        size_t got = 0;
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        for (int i = 0; i < 8 && got < sizeof(rx) - 1; i++) {
+            ssize_t n = recv(fd, rx + got, sizeof(rx) - 1 - got, 0);
+            if (n <= 0) break;
+            got += (size_t)n;
+            if (strstr(rx, "mining.set_difficulty")) break;
+        }
+        /* The number the miner is actually told to use. */
+        CHECK(strstr(rx, "\"mining.set_difficulty\"") != NULL);
+        CHECK(strstr(rx, "\"params\":[50000]") != NULL);
+        CHECK(strstr(rx, "\"params\":[100000]") == NULL);   /* not initial_diff */
+        /* ...and the server really pinned, not merely floored. */
+        CHECK(stratum_server_pinned_count_for_test(s) == 1);
+        close(fd);
+        sleep_ms(250);
+        /* The counter must come back down, or a long-running pool would report
+         * a pinned population that only ever grows. */
+        CHECK(stratum_server_pinned_count_for_test(s) == 0);
+    }
+    stratum_server_free(s);
+    printf("ok: sd= in the password pins a real socket session end to end\n");
+}
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -3919,6 +3990,7 @@ int main(void) {
     test_sd_disabled_still_honours_the_floor();
     test_malformed_sd_does_not_kill_a_valid_d();
     test_sd_beats_d_in_either_order();
+    test_sd_end_to_end_over_a_socket();
     test_initial_diff_below_vardiff_min_is_not_floored();
     test_submit_judged_at_the_jobs_own_difficulty();
     test_submit_ceiling_refuses_past_the_limit();

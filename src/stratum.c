@@ -341,6 +341,14 @@ struct stratum_server {
 
     atomic_int  stop;
     atomic_int  conn_count;
+    /* Connections currently pinned by `sd=`. Telemetry, not control: without a
+     * count, "did pinning reduce the low-difficulty rejects" cannot be answered
+     * after a deploy, and that is the only reason the feature exists.
+     * Attribution to a WORKER is journal-side — the per-pin log line carries
+     * the worker name, and `rejects` is keyed on worker_name, so the two join.
+     * ⚠️ That join is only as good as journal retention; a `pinned` column on
+     * rejects would be better and needs a schema migration. */
+    atomic_int  pinned_count;
 
     /* Seeded from the clock at startup (so values differ across restarts) and
      * incremented per subscribe, which is what makes each connection's
@@ -1884,6 +1892,7 @@ static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
     if (vd_min > floor_diff) floor_diff = vd_min;
     if (floor_diff > 0.0 && req < floor_diff) req = floor_diff;
 
+    if (c->pinned_diff <= 0.0) atomic_fetch_add(&s->pinned_count, 1);
     c->pinned_diff = req;
     c->difficulty  = req;
     /* Cleared: a pin is not a floor, and leaving both set would let the
@@ -1891,11 +1900,13 @@ static int apply_pinned_diff(stratum_server_t *s, stratum_conn_t *c,
     c->requested_min_diff = 0.0;
 
     if (asked != req) {
-        LOG_INFO("stratum: %s pinned at difficulty %.0f (asked %.0f, clamped)",
-                 who, req, asked);
+        LOG_INFO("stratum: %s pinned at difficulty %.0f (asked %.0f, clamped) "
+                 "(%d pinned now)", who, req, asked,
+                 atomic_load(&s->pinned_count));
     } else {
         LOG_INFO("stratum: %s pinned at difficulty %.0f — vardiff disabled for "
-                 "this connection", who, req);
+                 "this connection (%d pinned now)", who, req,
+                 atomic_load(&s->pinned_count));
     }
     return 0;
 }
@@ -2891,6 +2902,10 @@ void stratum_conn_force_difficulty_for_test(stratum_conn_t *c,
 int stratum_conn_subscribed_for_test(const stratum_conn_t *c) {
     return c ? c->subscribed : 0;
 }
+int stratum_server_pinned_count_for_test(const stratum_server_t *s) {
+    return s ? atomic_load(&s->pinned_count) : 0;
+}
+
 int stratum_server_conn_count_for_test(const stratum_server_t *s) {
     return s ? atomic_load(&s->conn_count) : 0;
 }
@@ -3104,6 +3119,16 @@ done:
     conn_unregister(s, c);
     close(c->fd);
     c->fd = -1;
+    /* ⛔ CAPTURED BEFORE THE FREE. The pin state and worker name live on the
+     * connection, and everything below runs after stratum_conn_free_for_test.
+     * Reading them afterwards is a use-after-free — the compiler caught it, and
+     * it is the same class of defect as the stratum lifetime bugs upstream took
+     * in #66/#67. Copy what is needed out first. */
+    pthread_mutex_lock(&c->state_lock);
+    int  was_pinned = (c->pinned_diff > 0.0);
+    char pinned_worker[129];
+    snprintf(pinned_worker, sizeof pinned_worker, "%s", c->worker_name);
+    pthread_mutex_unlock(&c->state_lock);
     stratum_conn_free_for_test(c);
     /* Decrement LAST, after this thread has finished touching both the server
      * and its own connection. stratum_server_stop waits for this counter to
@@ -3111,6 +3136,11 @@ done:
      * connection thread will read any of this again" — not "the socket is
      * closed". Decrementing before the free left the counter at zero while
      * this thread was still inside stratum_conn_free_for_test. */
+    /* Mirrors the increment in apply_pinned_diff. */
+    if (was_pinned) {
+        LOG_INFO("stratum: pinned connection closed for '%s' (%d pinned now)",
+                 pinned_worker, atomic_fetch_sub(&s->pinned_count, 1) - 1);
+    }
     atomic_fetch_sub(&s->conn_count, 1);
     return NULL;
 }

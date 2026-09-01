@@ -487,6 +487,8 @@ void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
  * observable form of "no connection thread can touch this server again",
  * which is what makes tearing the server down afterwards safe. */
 int         stratum_server_conn_count_for_test(const stratum_server_t *s);
+/* Connections currently pinned by `sd=`. */
+int         stratum_server_pinned_count_for_test(const stratum_server_t *s);
 
 /* peer_ip of the most recently accepted connection; 0 ok, -1 if none. */
 int stratum_server_last_peer_ip_for_test(stratum_server_t *s, char *out, size_t cap);
