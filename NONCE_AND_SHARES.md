@@ -436,11 +436,13 @@ auth_fail_lockout_sec = 60
   naming the address, not one per refused attempt.
 - **A success forgives the address.** A miner that mistypes twice and
   then fixes it is not made to wait; the window passing clears it too.
-- **Successful calls are budgeted as well:** past ten `mining.authorize`
+- **Successful calls are budgeted as well:** past sixty `mining.authorize`
   calls in ten seconds on one connection, each is refused (no row) and
   counts as a failure. A successful authorize is not free — it replays
   the worker's difficulty from the store — and any client holding a
-  valid address could repeat it as fast as it liked.
+  valid address could repeat it as fast as it liked. Sixty rather than
+  something tighter so a proxy that authorizes a burst of workers over
+  one socket clears it; spam is hundreds a second.
 
 The per-address table is fixed at 1024 slots, probed linearly, evicting
 the entry whose window started earliest when a run is full. A client

@@ -4176,21 +4176,23 @@ static void test_authorize_budget_zero_disables(void) {
     stratum_server_free(s);
 }
 
-/* Successful authorizes are budgeted too: ten in a window, then each one is
- * refused without a reject row and spends the failure budget, which closes
- * the connection on the third. */
+/* Successful authorizes are budgeted too: sixty in a window, then each one
+ * is refused without a reject row and spends the failure budget, which
+ * closes the connection on the third. Sixty so a proxy authorizing a burst
+ * of workers over one socket clears it; the count is asserted exactly, so a
+ * change to the constant has to come through here. */
 static void test_authorize_call_ceiling(void) {
     obs_t obs = {0};
     stratum_server_t *s = auth_test_server(&obs, 3, 60);
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
     int ok = 0;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 60; ++i) {
         int rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(1), &out, &olen);
         ok += (rc == 0 && out && strstr(out, "\"result\":true") != NULL);
         free(out); out = NULL; olen = 0;
     }
-    CHECK(ok == 10);
+    CHECK(ok == 60);
     int rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(2), &out, &olen);
     CHECK(rc == 0);
     CHECK(out && strstr(out, "too many mining.authorize calls") != NULL);
