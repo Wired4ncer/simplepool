@@ -290,6 +290,50 @@ static void test_listener_colliding_with_rental_port_is_refused(void) {
 
 /* ⛔ The submit ceiling ships OFF. Upstream defaults it to 20000; refusing a
  * submit is miner-visible and gets opened by measurement, not by a default. */
+/* The authorize budget ships ON — three failures, one minute — because it
+ * refuses nothing a correct miner does. Both keys parse; a negative budget
+ * and a budget without a window are refused at boot. */
+static void test_auth_budget_defaults_on(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.auth_max_failures == 3);
+    CHECK(cfg.auth_fail_lockout_sec == 60);
+}
+
+static void test_auth_budget_parses_and_validates(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlisten_port = 3334\n"
+             "auth_max_failures = 5\nauth_fail_lockout_sec = 120\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.auth_max_failures == 5);
+    CHECK(cfg.auth_fail_lockout_sec == 120);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlisten_port = 3334\n"
+             "auth_max_failures = 0\nauth_fail_lockout_sec = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);   /* off is a valid state */
+    CHECK(cfg.auth_max_failures == 0);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlisten_port = 3334\n"
+             "auth_max_failures = -1\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "auth_max_failures") != NULL);
+
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlisten_port = 3334\n"
+             "auth_max_failures = 3\nauth_fail_lockout_sec = 0\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "auth_fail_lockout_sec") != NULL);
+}
+
 static void test_max_submits_per_sec_defaults_off(void) {
     proxy_config_t cfg; char err[256] = {0};
     char body[512];
@@ -332,6 +376,8 @@ int main(void) {
     test_listener_colliding_with_listen_port_is_refused();
     test_listener_colliding_with_rental_port_is_refused();
     test_max_submits_per_sec_defaults_off();
+    test_auth_budget_defaults_on();
+    test_auth_budget_parses_and_validates();
     test_listener_label_is_constrained();
     if (failures) { printf("test_config: %d failed\n", failures); return 1; }
     printf("test_config: all tests passed\n");

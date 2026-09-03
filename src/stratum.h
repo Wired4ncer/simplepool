@@ -389,6 +389,27 @@ typedef struct {
      * a submit is a miner-visible action; it does not get a default. */
     int    max_submits_per_sec;
 
+    /* Budget for FAILED mining.authorize. A failed authorize — no worker
+     * name, a malformed username, an address that does not decode — costs a
+     * reject row in the store and a line on the broadcast feed, and nothing
+     * bounded how many of those one client could buy before it had
+     * authenticated at all. It was the cheapest write on the pool, and it
+     * was open to anyone who could reach the port.
+     *
+     * Two limits from the one number. Per connection: the auth_max_failures-th
+     * failure is answered, then the connection is closed. Per peer address:
+     * an address that has failed auth_max_failures times within
+     * auth_fail_lockout_sec is refused at the top of the handler — no
+     * decoding, no reject row, no broadcast — and the connection is closed,
+     * until the window passes. A successful authorize clears the address's
+     * record, so a miner that fixes its username is not made to wait.
+     *
+     * Ships ON. Unlike max_submits_per_sec this refuses nothing a correct
+     * miner does: it only shortens how long a client may keep failing.
+     * 0 disables both limits. */
+    int    auth_max_failures;
+    int    auth_fail_lockout_sec;
+
     /* Gate for the `sd=<n>` static-difficulty pin. 0 = off (default).
      * Its own switch rather than max_suggested_diff's, which also gates the
      * `d=` floor that miners use today. See config.h. */
@@ -459,6 +480,9 @@ void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);
 const char *stratum_conn_payout_address_for_test(const stratum_conn_t *c);
 int         stratum_conn_authorized_for_test(const stratum_conn_t *c);
+/* Test connections never pass through accept(), so their peer_ip is empty
+ * and the per-address authorize lockout has nothing to key on. */
+void        stratum_conn_set_peer_ip_for_test(stratum_conn_t *c, const char *ip);
 
 /* Force the connection's vardiff state directly, bypassing the retarget path.
  *

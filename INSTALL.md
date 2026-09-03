@@ -463,6 +463,13 @@ idle_timeout_authorized_sec = 7200   # a working miner between shares
 # (a fleet on a home-miner port) can cost. 0 disables.
 max_submits_per_sec = 20000
 
+# Failed mining.authorize budget. A client that fails this many times is
+# disconnected, and its address is refused for the lockout window without
+# the pool decoding anything or recording a reject. A successful authorize
+# clears the address. 0 disables.
+auth_max_failures     = 3
+auth_fail_lockout_sec = 60
+
 db_path = /home/simplepool/data/shares.db
 log_level = info
 ```
