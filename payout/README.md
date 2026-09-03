@@ -218,9 +218,16 @@ spends no BMM bids on empty blocks. A failed nudge never fails the tick.
    in-flight row.
 2. `transferBatchDetailed(recipients, fee)` — broadcast. Three RPCs under the
    hood (`create_transfer` → `sign_transaction` → `submit_transaction`); only
-   the last can put a tx on the network. On clean failure (an error before a
-   txid is returned) the rows are DELETEd and the workers are eligible next
-   tick.
+   the last can put a tx on the network — except on thunder >= 0.17.1,
+   where `create_transfer` signs and broadcasts by itself. On a **clean**
+   failure the rows are DELETEd and the workers are eligible next tick: a
+   `sign` failure (local), or a `create`/`submit` the node *answered* with an
+   error (a mempool rejection being the everyday case). On an **unanswered**
+   `create` or `submit` — timeout, dropped connection, anything that is not a
+   JSON-RPC error reply — the rows STAY with `txid=''`: the transaction may
+   already be on the network, and releasing the rows would rebroadcast the
+   batch on the next tick, paying it twice. An error with no stage attached is
+   read the same way. `runOnce()` reports which it was as `ambiguous`.
 3. `attachBatchTxid()` — stamp the txid. The rows **stay** in flight.
 4. On a later tick, once the transaction is confirmed: in ONE SQLite
    transaction across the whole batch, `paid_sats += sats`, append to
@@ -246,9 +253,15 @@ Two situations need an operator. Neither is auto-resolved, because both turn
 on a question only a human can answer: *did this transaction make it onto the
 sidechain?*
 
-**A row with no txid.** The worker died around the broadcast, so it is unknown
-whether anything went out. **Payouts are halted** while it sits there — see
-*One payout at a time* — so this is the one to resolve first. Check the Thunder
+**A row with no txid.** It is unknown whether anything went out. Two things
+produce this: the worker died around the broadcast, or the broadcast itself
+failed without the node answering — a timeout, a dropped connection, or any
+error that is not a JSON-RPC rejection. A rejection *is* an answer ("nothing
+was broadcast"), so those rows are released automatically and the batch simply
+retries; only the genuinely unanswered case is left here, because a broadcast
+that happened cannot be told apart from one that did not, and guessing wrong
+pays the batch twice. **Payouts are halted** while it sits there — see *One
+payout at a time* — so this is the one to resolve first. Check the Thunder
 node, then:
 
 ```sh
