@@ -71,6 +71,12 @@ void proxy_config_defaults(proxy_config_t *cfg) {
      * other gate key: written explicitly, one stage at a time, after
      * measurement. */
     cfg->max_submits_per_sec = 0;
+    /* ON by default, unlike the submit ceiling: this refuses nothing a
+     * correct miner does, it only bounds how long a client may keep failing.
+     * Three failures, then a minute — a misconfigured miner still gets its
+     * error message on every reconnect once the minute has passed. */
+    cfg->auth_max_failures     = 3;
+    cfg->auth_fail_lockout_sec = 60;
     cfg->listener_count = 0;
     cfg->rental_listen_port = 0;
     cfg->rental_min_diff    = 500000.0;
@@ -299,6 +305,8 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "clean_jobs_on_refresh")     == 0) cfg->clean_jobs_on_refresh = atoi(v);
         else if (strcmp(k, "idle_timeout_authorized_sec") == 0) cfg->idle_timeout_authorized_sec = atoi(v);
         else if (strcmp(k, "max_submits_per_sec")       == 0) cfg->max_submits_per_sec = atoi(v);
+        else if (strcmp(k, "auth_max_failures")         == 0) cfg->auth_max_failures = atoi(v);
+        else if (strcmp(k, "auth_fail_lockout_sec")     == 0) cfg->auth_fail_lockout_sec = atoi(v);
         else if (strcmp(k, "listener")                  == 0) {
             char lerr[160];
             if (cfg->listener_count >= STRATUM_MAX_LISTENERS) {
@@ -456,6 +464,19 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         set_err(errbuf, errlen,
                 "config: 'max_submits_per_sec' cannot be negative "
                 "(0 disables the ceiling)");
+        return -14;
+    }
+    if (cfg->auth_max_failures < 0) {
+        set_err(errbuf, errlen,
+                "config: 'auth_max_failures' cannot be negative (0 disables)");
+        return -14;
+    }
+    if (cfg->auth_max_failures > 0 && cfg->auth_fail_lockout_sec <= 0) {
+        /* A budget with no window is a per-connection limit only, and a
+         * client dodges that by reconnecting. Refuse to boot half-armed. */
+        set_err(errbuf, errlen,
+                "config: 'auth_fail_lockout_sec' must be > 0 when "
+                "'auth_max_failures' is set");
         return -14;
     }
 

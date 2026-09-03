@@ -102,3 +102,42 @@ test('mine() uses its own short deadline, not the client timeout', async () => {
     await c.mine();
     assert.equal(seen, 3000, 'a blocking call must not hold the tick for the full timeout');
 });
+
+/* The payout loop tells "the node declined" from "we never got an answer" by
+ * one flag on the error, and the two decide opposite things: release the
+ * batch and retry, or hold it for a human. So the flag is pinned at the one
+ * place that sets it — a JSON-RPC error body — and pinned ABSENT on a
+ * transport failure, which is the case that must never look like a refusal. */
+async function withFetch(impl, fn) {
+    const saved = globalThis.fetch;
+    globalThis.fetch = impl;
+    try { return await fn(); } finally { globalThis.fetch = saved; }
+}
+
+test('an answered RPC error carries rpcRejected', async () => {
+    const c = new ThunderClient('http://127.0.0.1:1');
+    const err = await withFetch(
+        async () => ({ ok: true, json: async () => ({ error: { code: -32000, message: 'utxo double spent' } }) }),
+        () => c._call('submit_transaction', []).then(() => null, e => e));
+    assert.ok(err instanceof Error);
+    assert.equal(err.rpcRejected, true, 'the node ran the method and declined');
+    assert.match(err.message, /utxo double spent/);
+});
+
+test('a transport failure does NOT carry rpcRejected', async () => {
+    const c = new ThunderClient('http://127.0.0.1:1');
+    const err = await withFetch(
+        async () => { throw new Error('ECONNRESET'); },
+        () => c._call('submit_transaction', []).then(() => null, e => e));
+    assert.ok(err instanceof Error);
+    assert.equal(err.rpcRejected, undefined, 'no answer is not a refusal');
+});
+
+test('a non-200 reply does NOT carry rpcRejected', async () => {
+    const c = new ThunderClient('http://127.0.0.1:1');
+    const err = await withFetch(
+        async () => ({ ok: false, status: 502, statusText: 'Bad Gateway' }),
+        () => c._call('submit_transaction', []).then(() => null, e => e));
+    assert.ok(err instanceof Error);
+    assert.equal(err.rpcRejected, undefined, 'a proxy answered, the node may not have');
+});

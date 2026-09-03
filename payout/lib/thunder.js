@@ -49,7 +49,20 @@ export class ThunderClient {
         const body = await res.json();
         if (body.error) {
             const e = body.error;
-            throw new Error(`thunder rpc ${method}: ${e.code} ${e.message}`);
+            const err = new Error(`thunder rpc ${method}: ${e.code} ${e.message}`);
+            /* The node ran the method and answered with an error. For
+             * create_transfer and submit_transaction that is a definitive "not
+             * broadcast" — the ordinary case being a mempool rejection — which
+             * lets the payout loop release the batch and retry instead of
+             * parking it for a human. Everything else that can throw here
+             * (transport failure, abort/timeout, a non-JSON or non-200 reply)
+             * means we never got an answer, carries no such flag, and must be
+             * treated as "it may have gone out". See runOnce in payout.js.
+             *
+             * This flag was lost in the c20d358 merge, which took upstream's
+             * client wholesale; the tests that depend on it stayed. */
+            err.rpcRejected = true;
+            throw err;
         }
         return body.result;
     }

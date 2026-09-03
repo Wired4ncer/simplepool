@@ -50,6 +50,11 @@
 /* Process-wide ring, so it has to cover every live connection's recent
  * submissions across every server rather than just one's. */
 #define SHARE_DEDUPE_RING 16384
+/* Index over the ring: open addressing, linear probing, power-of-two slots.
+ * 4x the ring keeps the load at or under 25%, where a lookup touches ~1.2
+ * slots on average and the longest probe run stays short. 512 KB. */
+#define SHARE_DEDUPE_SLOT_BITS 16
+#define SHARE_DEDUPE_SLOTS (1u << SHARE_DEDUPE_SLOT_BITS)
 /* Matches store.c's REASON_MAX so a submitblock reason survives the trip to
  * the DB intact rather than being truncated twice. */
 #define REASON_TEXT_MAX   128
@@ -108,6 +113,24 @@ _Static_assert((uint64_t)STRATUM_RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
 #define JOB_DIFF_RING  ((STRATUM_RECENT_JOBS + 1) * 2)
 /* Upper bound on a single blocking send to one miner. See conn_socket_setup. */
 #define SEND_TIMEOUT_SEC 10
+
+/* Per-address authorize-failure table: fixed, bounded, no allocation on the
+ * attacker's schedule. 1024 slots keyed by peer address, probed linearly up to
+ * AUTH_FAIL_PROBE deep; a miss with no free slot in the run evicts the entry
+ * whose window started earliest. An attacker spraying addresses can push
+ * others out of the table, which only ever resets THEIR count — the table is
+ * a limiter, not a ledger. */
+#define AUTH_FAIL_SLOTS 1024
+#define AUTH_FAIL_PROBE 8
+
+/* mining.authorize calls per connection per window, success or failure. A
+ * successful authorize is not free either — it replays the worker's
+ * difficulty from the store — and a client that has a valid address can
+ * repeat it as fast as it likes. Nothing legitimate authorizes ten times in
+ * ten seconds; past that each call is treated as a failure and the
+ * connection's failure budget closes it. */
+#define AUTH_CALL_WINDOW_MS     10000
+#define AUTH_MAX_CALLS_PER_WINDOW 10
 
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
  * mining.configure; only these block-header version bits may be rolled by a
@@ -364,9 +387,32 @@ struct stratum_server {
      * arrives on a *different* connection. Keying on the final hash makes the
      * check independent of how the submission was framed (job id,
      * extranonce2, version rolling). */
+    /* Per-address authorize failures. See stratum_cfg_t.auth_max_failures. */
+    pthread_mutex_t auth_fail_lock;
+    struct auth_fail_entry {
+        char     ip[INET6_ADDRSTRLEN];   /* empty = free */
+        uint32_t fails;
+        uint64_t window_start_mono;
+        int      reported;               /* the lockout has been logged once */
+    } auth_fail[AUTH_FAIL_SLOTS];
+
     pthread_mutex_t share_dedupe_lock;
-    uint64_t        share_dedupe[SHARE_DEDUPE_RING];
-    size_t          share_dedupe_head;
+    /* Two structures over one set of keys. The ring is what bounds memory and
+     * decides which hash is forgotten next (the oldest, FIFO). The index is
+     * how a submit asks "have I seen this?" without walking the ring: that
+     * walk was 16384 compares under this one mutex on EVERY credited share,
+     * which at a minimum-difficulty window — every miner on the pool
+     * submitting at its full hash rate — serialised the whole pool through
+     * a 128 KB scan. Now it is a hash lookup, O(1) expected.
+     *
+     * Invariants: the ring never holds a key twice (a key is only inserted
+     * when the index says it is absent); every key in the ring is in the
+     * index and nothing else is; 0 is the empty marker, so a real key of 0
+     * is stored as 1. */
+    uint64_t        share_dedupe_ring[SHARE_DEDUPE_RING];
+    size_t          share_dedupe_head;      /* next ring slot to overwrite */
+    size_t          share_dedupe_count;     /* live keys, <= SHARE_DEDUPE_RING */
+    uint64_t        share_dedupe_index[SHARE_DEDUPE_SLOTS];
 
     pthread_rwlock_t job_lock;
     stratum_job_t   *current_job;          /* protected by job_lock */
@@ -434,6 +480,12 @@ struct stratum_conn {
 
     int      subscribed;
     int      authorized;
+
+    /* Authorize budget state (auth_max_failures). Touched only by this
+     * connection's own thread, inside handle_authorize, so no lock. */
+    uint32_t auth_failures;          /* consecutive failures on this connection */
+    uint64_t auth_call_window_ms;    /* AUTH_CALL_WINDOW_MS accounting */
+    uint32_t auth_calls_in_window;
     uint32_t version_mask;         /* negotiated version-rolling bits; 0 = off */
     char     worker_name[129];     /* full stratum username (sanitized) */
     char     payout_address[128];  /* validated bech32/base58 */
@@ -1972,8 +2024,135 @@ static int handle_suggest_difficulty(stratum_server_t *s, stratum_conn_t *c,
     return 0;
 }
 
+/* ---- authorize budget --------------------------------------------------- */
+
+/* Find the entry for `ip`, or with `create` claim one for it. Caller holds
+ * auth_fail_lock. An entry whose window has passed counts as free: its count
+ * is stale by definition. Returns NULL only when !create and absent. */
+static struct auth_fail_entry *auth_fail_find(stratum_server_t *s, const char *ip,
+                                              uint64_t now_mono, int create) {
+    uint64_t lockout_ms = (uint64_t)s->cfg.auth_fail_lockout_sec * 1000u;
+    size_t home = (size_t)(fnv1a(ip) & (AUTH_FAIL_SLOTS - 1));
+    struct auth_fail_entry *free_slot = NULL, *oldest = NULL;
+    for (size_t k = 0; k < AUTH_FAIL_PROBE; ++k) {
+        struct auth_fail_entry *e = &s->auth_fail[(home + k) & (AUTH_FAIL_SLOTS - 1)];
+        if (e->ip[0] && strcmp(e->ip, ip) == 0) {
+            if (now_mono - e->window_start_mono >= lockout_ms) {
+                /* Expired: forget the old count but keep the slot. */
+                e->fails = 0; e->window_start_mono = now_mono; e->reported = 0;
+            }
+            return e;
+        }
+        int is_free = !e->ip[0] || now_mono - e->window_start_mono >= lockout_ms;
+        if (is_free && !free_slot) free_slot = e;
+        if (!oldest || e->window_start_mono < oldest->window_start_mono) oldest = e;
+    }
+    if (!create) return NULL;
+    struct auth_fail_entry *e = free_slot ? free_slot : oldest;
+    snprintf(e->ip, sizeof e->ip, "%s", ip);
+    e->fails = 0; e->window_start_mono = now_mono; e->reported = 0;
+    return e;
+}
+
+/* Runs at the top of handle_authorize, before the params are even looked at.
+ * Returns 0 to proceed. Returns -1 having written the refusal into buf: the
+ * caller passes that straight up, and the connection thread closes the
+ * socket after writing it. */
+static int auth_gate(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
+                     char **buf, size_t *len, int *over_call_ceiling) {
+    *over_call_ceiling = 0;
+    int max_fail = s->cfg.auth_max_failures;
+    if (max_fail <= 0) return 0;
+    uint64_t mono = mono_ms();
+
+    if (c->peer_ip[0]) {
+        int locked = 0, first = 0;
+        uint64_t retry_s = 0;
+        pthread_mutex_lock(&s->auth_fail_lock);
+        struct auth_fail_entry *e = auth_fail_find(s, c->peer_ip, mono, 0);
+        if (e && e->fails >= (uint32_t)max_fail) {
+            locked = 1;
+            uint64_t lockout_ms = (uint64_t)s->cfg.auth_fail_lockout_sec * 1000u;
+            uint64_t elapsed = mono - e->window_start_mono;
+            retry_s = (lockout_ms > elapsed ? lockout_ms - elapsed + 999 : 0) / 1000;
+            if (!e->reported) { e->reported = 1; first = 1; }
+        }
+        pthread_mutex_unlock(&s->auth_fail_lock);
+        if (locked) {
+            /* Logged once per lockout, not once per refused attempt — a
+             * refusal that costs a journal line is still a per-attempt cost. */
+            if (first) {
+                LOG_WARN("stratum: %s has failed mining.authorize %d times in "
+                         "%ds — refusing further attempts for %llus",
+                         c->peer_ip, max_fail, s->cfg.auth_fail_lockout_sec,
+                         (unsigned long long)retry_s);
+            }
+            char emsg[160];
+            snprintf(emsg, sizeof emsg,
+                     "too many failed authorizations from this address; "
+                     "retry in %llus", (unsigned long long)retry_s);
+            cJSON *err = make_error(24, emsg);
+            emit_response(buf, len, id, NULL, err);
+            return -1;
+        }
+    }
+
+    if (mono - c->auth_call_window_ms >= AUTH_CALL_WINDOW_MS) {
+        c->auth_call_window_ms = mono;
+        c->auth_calls_in_window = 0;
+    }
+    if (++c->auth_calls_in_window > AUTH_MAX_CALLS_PER_WINDOW) *over_call_ceiling = 1;
+    return 0;
+}
+
+/* Every failed authorize ends here with the response already written and
+ * `rc` its return code. Counts the failure against the connection and the
+ * peer address, and turns rc into -1 — close after writing — once the
+ * connection has spent its budget. */
+static int auth_failed(stratum_server_t *s, stratum_conn_t *c, int rc) {
+    int max_fail = s->cfg.auth_max_failures;
+    if (max_fail <= 0) return rc;
+    c->auth_failures++;
+    if (c->peer_ip[0]) {
+        pthread_mutex_lock(&s->auth_fail_lock);
+        struct auth_fail_entry *e = auth_fail_find(s, c->peer_ip, mono_ms(), 1);
+        e->fails++;
+        pthread_mutex_unlock(&s->auth_fail_lock);
+    }
+    if (c->auth_failures >= (uint32_t)max_fail) {
+        LOG_INFO("stratum: closing %s after %u failed mining.authorize attempts",
+                 c->peer_ip[0] ? c->peer_ip : "(test conn)", c->auth_failures);
+        return -1;
+    }
+    return rc;
+}
+
+/* A successful authorize forgives the address: the miner has proved it can
+ * get the username right, and a retry budget it can never rebuild would turn
+ * two typos and a fix into a minute of lockout. */
+static void auth_succeeded(stratum_server_t *s, stratum_conn_t *c) {
+    c->auth_failures = 0;
+    if (s->cfg.auth_max_failures <= 0 || !c->peer_ip[0]) return;
+    pthread_mutex_lock(&s->auth_fail_lock);
+    struct auth_fail_entry *e = auth_fail_find(s, c->peer_ip, mono_ms(), 0);
+    if (e) e->ip[0] = '\0';
+    pthread_mutex_unlock(&s->auth_fail_lock);
+}
+
+void stratum_conn_set_peer_ip_for_test(stratum_conn_t *c, const char *ip) {
+    snprintf(c->peer_ip, sizeof c->peer_ip, "%s", ip ? ip : "");
+}
+
 static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                             cJSON *params, char **buf, size_t *len) {
+    int over_ceiling = 0;
+    if (auth_gate(s, c, id, buf, len, &over_ceiling) < 0) return -1;
+    if (over_ceiling) {
+        /* No reject row for this one: it is the limiter speaking, and a row
+         * per refused call would be the cost the limiter exists to remove. */
+        cJSON *err = make_error(24, "too many mining.authorize calls; slow down");
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
+    }
     const char *worker = NULL;
     double pw_diff = 0.0;
     int    pw_pinned = 0;
@@ -2006,7 +2185,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
     if (!worker) {
         cJSON *err = make_error(24, "missing worker name");
-        return emit_response(buf, len, id, NULL, err);
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
     }
 
     /* Username format: <address>[.<rig_label>]. The address part must be
@@ -2023,7 +2202,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         }
         cJSON *err = make_error(24,
             "stratum username must be <bitcoin_address>[.<rig_label>]");
-        return emit_response(buf, len, id, NULL, err);
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
     }
     /* Refuse before taking the address: the miner learns at connect time,
      * which is the only point at which they can still do something about it. */
@@ -2034,7 +2213,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                              NULL, STRATUM_JOB_AGE_NONE);
         }
         cJSON *err = make_error(24, PPS_GATED_MSG);
-        return emit_response(buf, len, id, NULL, err);
+        return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
     }
 
     memcpy(c->payout_address, worker, addr_len);
@@ -2060,7 +2239,7 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             snprintf(emsg, sizeof emsg,
                      "invalid thunder address in stratum username: %s", derr);
             cJSON *err = make_error(24, emsg);
-            return emit_response(buf, len, id, NULL, err);
+            return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
         }
     } else {
         uint8_t spk[64];
@@ -2078,12 +2257,13 @@ static int handle_authorize(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             snprintf(emsg, sizeof emsg,
                      "invalid payout address in stratum username: %s", derr);
             cJSON *err = make_error(24, emsg);
-            return emit_response(buf, len, id, NULL, err);
+            return auth_failed(s, c, emit_response(buf, len, id, NULL, err));
         }
     }
 
     sanitize_worker(worker, c->worker_name, sizeof(c->worker_name));
     c->authorized = 1;
+    auth_succeeded(s, c);
     /* Prefer what this worker was actually running at. A reconnect or a pool
      * restart otherwise drops it to initial_diff and makes vardiff climb again
      * at 4x per window — minutes of flooding and shed shares for a multi-TH/s
@@ -2235,6 +2415,89 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
     return 0;
 }
 
+/* ---- share dedupe index ------------------------------------------------ */
+
+/* Home slot. fnv1a's low bits are decent but the multiply spreads any
+ * structure across the top bits we actually take. */
+static inline size_t dd_home(uint64_t h) {
+    return (size_t)((h * 0x9E3779B97F4A7C15ull) >> (64 - SHARE_DEDUPE_SLOT_BITS));
+}
+
+static int dd_index_find(const stratum_server_t *s, uint64_t h) {
+    size_t i = dd_home(h);
+    for (;;) {
+        uint64_t k = s->share_dedupe_index[i];
+        if (k == 0) return 0;
+        if (k == h) return 1;
+        i = (i + 1) & (SHARE_DEDUPE_SLOTS - 1);
+    }
+}
+
+/* Caller has already established h is absent. The table can never be full:
+ * it holds at most SHARE_DEDUPE_RING keys in 4x as many slots. */
+static void dd_index_insert(stratum_server_t *s, uint64_t h) {
+    size_t i = dd_home(h);
+    while (s->share_dedupe_index[i] != 0) i = (i + 1) & (SHARE_DEDUPE_SLOTS - 1);
+    s->share_dedupe_index[i] = h;
+}
+
+/* Is `home` in the cyclic half-open interval (hole, j]? A key whose home is
+ * there was placed at j by probing THROUGH the hole's position only if its
+ * home precedes the hole — so it must move back; a key whose home lies after
+ * the hole reached j without passing it and stays. */
+static inline int dd_home_between(size_t hole, size_t home, size_t j) {
+    return (hole <= j) ? (hole < home && home <= j)
+                       : (hole < home || home <= j);
+}
+
+/* Remove h, which must be present. Linear probing cannot just blank a slot:
+ * that would cut the probe chain for every key that was pushed past it, and
+ * a later lookup would stop at the new hole and call a present key absent —
+ * which here means the same share credited twice. Tombstones would fix that
+ * but accumulate for the life of the process under a constant churn of 16384
+ * evictions per 16384 inserts. Backward-shift deletion (Knuth 6.4, R) walks
+ * the rest of the cluster and moves back any key the hole would strand, so
+ * the table stays exactly as if the deleted key had never been inserted. */
+static void dd_index_remove(stratum_server_t *s, uint64_t h) {
+    size_t i = dd_home(h);
+    while (s->share_dedupe_index[i] != h) {
+        if (s->share_dedupe_index[i] == 0) return;   /* not present; cannot happen */
+        i = (i + 1) & (SHARE_DEDUPE_SLOTS - 1);
+    }
+    size_t j = i;
+    for (;;) {
+        j = (j + 1) & (SHARE_DEDUPE_SLOTS - 1);
+        uint64_t k = s->share_dedupe_index[j];
+        if (k == 0) break;
+        if (dd_home_between(i, dd_home(k), j)) continue;
+        s->share_dedupe_index[i] = k;
+        i = j;
+    }
+    s->share_dedupe_index[i] = 0;
+}
+
+/* The set operation on a precomputed key: 1 if present, else record it —
+ * evicting the oldest key when the ring is full — and return 0. */
+static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h) {
+    if (h == 0) h = 1;   /* 0 is the index's empty marker */
+    int dup = 0;
+    pthread_mutex_lock(&s->share_dedupe_lock);
+    if (dd_index_find(s, h)) {
+        dup = 1;
+    } else {
+        if (s->share_dedupe_count == SHARE_DEDUPE_RING) {
+            dd_index_remove(s, s->share_dedupe_ring[s->share_dedupe_head]);
+        } else {
+            s->share_dedupe_count++;
+        }
+        s->share_dedupe_ring[s->share_dedupe_head] = h;
+        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
+        dd_index_insert(s, h);
+    }
+    pthread_mutex_unlock(&s->share_dedupe_lock);
+    return dup;
+}
+
 /* Server-wide dedupe on the assembled header hash. Returns 1 if this exact
  * hash has already been credited on any connection, else records it and
  * returns 0. Called after the header is built, so it catches duplicates the
@@ -2243,18 +2506,21 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
  * id. Two identical hashes represent one solution and must be paid once. */
 static int share_dedupe_check_and_add(stratum_server_t *s,
                                       const uint8_t hash_be[32]) {
-    uint64_t h = fnv1a_bytes(hash_be, 32);
-    int dup = 0;
+    return share_dedupe_key_check_and_add(s, fnv1a_bytes(hash_be, 32));
+}
+
+int stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key) {
+    return share_dedupe_key_check_and_add(s, key);
+}
+
+size_t stratum_share_dedupe_live_for_test(stratum_server_t *s, size_t *index_live) {
+    size_t n = 0;
     pthread_mutex_lock(&s->share_dedupe_lock);
-    for (size_t i = 0; i < SHARE_DEDUPE_RING; ++i) {
-        if (s->share_dedupe[i] == h) { dup = 1; break; }
-    }
-    if (!dup) {
-        s->share_dedupe[s->share_dedupe_head] = h;
-        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
-    }
+    for (size_t i = 0; i < SHARE_DEDUPE_SLOTS; ++i) if (s->share_dedupe_index[i]) n++;
+    size_t count = s->share_dedupe_count;
     pthread_mutex_unlock(&s->share_dedupe_lock);
-    return dup;
+    if (index_live) *index_live = n;
+    return count;
 }
 
 /* Build full block hex from job + coinbase + nonce/ntime. Returns malloc'd
@@ -3446,6 +3712,7 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
 
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
+    pthread_mutex_init(&s->auth_fail_lock, NULL);
 
     /* ⛔ Every slot's fd starts at -1, not the 0 calloc leaves behind. The
      * teardown path below closes `fd >= 0` for every slot up to
@@ -3491,6 +3758,7 @@ bind_failed:
         if (ls->thr_started) { pthread_join(ls->thr, NULL); ls->thr_started = 0; }
     }
     pthread_mutex_destroy(&s->share_dedupe_lock);
+    pthread_mutex_destroy(&s->auth_fail_lock);
     free(s);
     return -1;
 }
@@ -3622,5 +3890,6 @@ void stratum_server_free(stratum_server_t *s) {
     pthread_mutex_destroy(&s->recent_lock);
     pthread_mutex_destroy(&s->conns_lock);
     pthread_mutex_destroy(&s->share_dedupe_lock);
+    pthread_mutex_destroy(&s->auth_fail_lock);
     free(s);
 }

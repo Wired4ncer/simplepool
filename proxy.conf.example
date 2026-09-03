@@ -110,6 +110,16 @@ vardiff_window_sec = 30       # how often to retarget
 # behaviour rather than a symptom.
 max_submits_per_sec = 20000
 
+# Failed mining.authorize budget, per connection AND per peer address. The
+# third failure closes the connection; an address that has failed three
+# times inside the window is refused for the rest of it — no address
+# decoding, no reject row, no broadcast line — because a failed authorize
+# was the cheapest write anyone could buy from the pool without
+# authenticating. A successful authorize clears the address, so a miner that
+# fixes a typo is not made to wait. 0 disables.
+auth_max_failures     = 3
+auth_fail_lockout_sec = 60
+
 # Idle-connection reaper, in seconds. Two budgets, because the two states are
 # not the same risk:
 #

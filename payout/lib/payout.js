@@ -422,9 +422,43 @@ export async function runOnce(ctx, log) {
          * the batching question, and it must never be asked again. */
         if (e.broadcastTxid) ctx._nodeBroadcastsOnCreate = true;
 
+        /* Three outcomes, and which one this is decides whether the rows are
+         * released or kept.
+         *
+         * CLEAN — provably nothing reached the network. sign is local on every
+         * thunder that reaches it. An ANSWERED create or submit (e.rpcRejected:
+         * the node ran the method and declined, a mempool rejection being the
+         * everyday case) is clean too, and must stay cheap: the rows are
+         * released and the next tick retries with paid_sats untouched.
+         *
+         * BROADCAST WITH A TXID — the node sent something we did not intend
+         * (create_transfer on thunder >= 0.17.1 against a multi-address batch).
+         * Handled below: the batch is held against that txid.
+         *
+         * AMBIGUOUS — everything else. An UNANSWERED create or submit (timeout,
+         * transport failure) may already be on the network: on thunder >= 0.17.1
+         * create_transfer signs and broadcasts internally, and an unanswered
+         * submit may have been accepted with the reply lost. Releasing the rows
+         * hands the same batch to the next tick, which rebroadcasts the moment
+         * the first transaction confirms and frees its inputs — paying twice,
+         * every tick, until the reserve is gone. So the rows STAY with txid='':
+         * listDue keeps skipping these workers and listStuck reports them, the
+         * state the crash-semantics contract at the top of this file already
+         * defines. An unknown stage is read the same way: "we do not know where
+         * it failed" means "it may have gone out".
+         *
+         * This policy, and the `ambiguous` field that reports it, came from
+         * 74ebe6e/735c12b and were dropped when c20d358 took upstream's
+         * payout.js wholesale while keeping the tests that pin them. */
+        const knownTxid = e.broadcastTxid || e.txid || null;
+        const clean = !knownTxid &&
+                      (e.stage === 'sign' ||
+                       ((e.stage === 'create' || e.stage === 'submit') &&
+                        e.rpcRejected === true));
+
         recordTxAttempt(db, {
             kind: 'payout', status: e.broadcastTxid ? 'broadcast' : 'failed',
-            stage: e.stage || 'unknown', txid: e.broadcastTxid || null,
+            stage: e.stage || 'unknown', txid: knownTxid,
             rawTx: asRawTx(e.signed || e.unsigned),
             amountSats: totalOwed, feeSats: TX_FEE_SATS,
             destination: batch.length === 1 ? batch[0].address : `${batch.length} recipients`,
@@ -449,14 +483,28 @@ export async function runOnce(ctx, log) {
                 'that txid and halting payouts. Nobody is credited until an operator ' +
                 'reconciles (payout/README.md -> Reconciling by hand).');
             return { attempted: due.length, paid: 0, failed: 0, settled,
-                     waiting_on: e.broadcastTxid, reason: 'broadcast-unintended' };
+                     waiting_on: e.broadcastTxid, reason: 'broadcast-unintended',
+                     ambiguous: true };
         }
 
-        /* The whole batch fails together, which is the point: no worker is
-         * credited for a transaction that did not go out. */
-        abortBatch(db, rowIds);
-        log.warn(`payout: batch of ${batch.length} ${e.stage || 'transfer'} failed: ${e.message}`);
-        return { attempted: due.length, paid: 0, failed: due.length, settled };
+        if (clean) {
+            /* The whole batch fails together, which is the point: no worker is
+             * credited for a transaction that did not go out. */
+            abortBatch(db, rowIds);
+            log.warn(`payout: batch of ${batch.length} failed at ${e.stage} — nothing was ` +
+                     `broadcast, retrying next tick: ${e.message}`);
+            return { attempted: due.length, paid: 0, failed: due.length, settled,
+                     ambiguous: false };
+        }
+
+        log.error(
+            `payout: batch of ${batch.length} failed at ${e.stage || 'an unknown stage'} ` +
+            `and MAY have been broadcast: ${e.message}. Leaving ${batch.length} ` +
+            'in-flight row(s) with no txid so nobody can be paid twice — these ' +
+            'workers stay skipped until an operator reconciles ' +
+            '(payout/README.md -> Reconciling by hand).');
+        return { attempted: due.length, paid: 0, failed: due.length, settled,
+                 ambiguous: true };
     }
 
     /* What this transfer proved about the node, for the next tick's batching

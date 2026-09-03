@@ -33,6 +33,11 @@ typedef struct {
      * See stratum.h for why it sits where it does. */
     int  max_submits_per_sec;
 
+    /* Failed-authorize budget: per connection and per peer address. See
+     * stratum.h. Defaults 3 and 60; 0 disables. */
+    int  auth_max_failures;
+    int  auth_fail_lockout_sec;
+
     /* Kill switch for the `sd=<n>` static-difficulty request. Default 0 = OFF.
      *
      * ⚠️ Deliberately NOT shared with max_suggested_diff. That knob also gates

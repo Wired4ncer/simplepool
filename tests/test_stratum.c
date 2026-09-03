@@ -3963,6 +3963,249 @@ static void test_sd_end_to_end_over_a_socket(void) {
     stratum_server_free(s);
     printf("ok: sd= in the password pins a real socket session end to end\n");
 }
+/* The share-dedupe index under churn. The ring holds SHARE_DEDUPE_RING keys
+ * and the index must answer for exactly those: a key inside the window is a
+ * duplicate, a key that fell out of it is not, and after any amount of
+ * eviction the index holds precisely as many keys as the ring does. That
+ * last equality is what backward-shift deletion has to preserve — a leaked
+ * key would make the index disagree with the ring, and a blanked-instead-of-
+ * shifted slot would make a present key read absent, which is the same share
+ * paid twice. Keys come from a fixed-seed generator so a failure replays. */
+static uint64_t dd_next(uint64_t *st) {   /* splitmix64 */
+    uint64_t z = (*st += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+static void test_share_dedupe_index_tracks_the_ring(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                           .ctx = &obs, .on_reject = on_reject };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    enum { RING = 16384 };   /* SHARE_DEDUPE_RING; a mismatch fails below */
+    uint64_t *keys = malloc(sizeof(uint64_t) * 2 * RING);
+    uint64_t st = 0x5EEDu;
+    for (int i = 0; i < 2 * RING; ++i) keys[i] = dd_next(&st);
+
+    /* Fill exactly one window. Every key is new. */
+    int fresh = 0;
+    for (int i = 0; i < RING; ++i) fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
+    CHECK(fresh == RING);
+    size_t idx = 0, live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING);   /* also proves RING matches the real ring size */
+    CHECK(idx == RING);
+    /* Everything in the window is a duplicate, and saying so changes nothing. */
+    int dups = 0;
+    for (int i = 0; i < RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+    CHECK(dups == RING);
+    live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING && idx == RING);
+
+    /* A second window evicts the first one key at a time, in order. Every
+     * new key is fresh; every evicted key is fresh again; the ones still
+     * inside the window stay duplicates throughout. */
+    fresh = 0;
+    for (int i = RING; i < 2 * RING; ++i) {
+        fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
+        if ((i & 1023) == 0) {
+            live = stratum_share_dedupe_live_for_test(s, &idx);
+            CHECK(live == RING && idx == RING);
+            /* Oldest surviving key and the newest are both present... */
+            CHECK(stratum_share_dedupe_key_for_test(s, keys[i - RING + 1]) == 1);
+            CHECK(stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+        }
+    }
+    CHECK(fresh == RING);
+    live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING && idx == RING);
+    dups = 0;
+    for (int i = RING; i < 2 * RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+    CHECK(dups == RING);
+    /* ...and the whole first window is gone. Each of these re-inserts,
+     * evicting the oldest of the second window in turn, so check the tail
+     * of the second window is still intact afterwards. */
+    fresh = 0;
+    for (int i = 0; i < 256; ++i) fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
+    CHECK(fresh == 256);
+    dups = 0;
+    for (int i = RING + 256; i < 2 * RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+    CHECK(dups == RING - 256);
+    live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING && idx == RING);
+
+    /* 0 is the empty marker and is stored as 1; both read back as present. */
+    CHECK(stratum_share_dedupe_key_for_test(s, 0) == 0);
+    CHECK(stratum_share_dedupe_key_for_test(s, 0) == 1);
+    CHECK(stratum_share_dedupe_key_for_test(s, 1) == 1);
+
+    free(keys);
+    stratum_server_free(s);
+}
+
+/* ---- authorize budget ---------------------------------------------------- */
+
+#define BAD_AUTH_LINE(n) \
+    "{\"id\":" #n ",\"method\":\"mining.authorize\",\"params\":[\"alice.w1\",\"x\"]}"
+#define GOOD_AUTH_LINE(n) \
+    "{\"id\":" #n ",\"method\":\"mining.authorize\",\"params\":[\"" TEST_ADDR "\",\"x\"]}"
+
+static stratum_server_t *auth_test_server(obs_t *obs, int max_fail, int lockout) {
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 8, .initial_diff = 1.0,
+                           .auth_max_failures = max_fail,
+                           .auth_fail_lockout_sec = lockout,
+                           .ctx = obs, .on_reject = on_reject };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    return s;
+}
+
+/* The third failure on one connection is answered and then the connection
+ * is closed (rc -1). Each failure up to the budget still records a reject —
+ * the budget is what makes that bounded. */
+static void test_authorize_failures_close_the_connection(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = auth_test_server(&obs, 3, 60);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    int rc = stratum_handle_message(s, c, BAD_AUTH_LINE(1), &out, &olen);
+    CHECK(rc == 0); CHECK(obs.rejects == 1); free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, c, BAD_AUTH_LINE(2), &out, &olen);
+    CHECK(rc == 0); CHECK(obs.rejects == 2); free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, c, BAD_AUTH_LINE(3), &out, &olen);
+    CHECK(rc == -1);                       /* close after writing */
+    CHECK(obs.rejects == 3);
+    CHECK(out && strstr(out, "\"error\"") != NULL);   /* the answer still went out */
+    CHECK(!stratum_conn_authorized_for_test(c));
+    free(out);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* An address that has spent its budget is refused on a NEW connection, at
+ * the top of the handler: a valid username gets the lockout error, nothing
+ * is decoded, no reject is recorded, and the connection is closed. Another
+ * address is unaffected. A success clears the record; the window expiring
+ * clears it too. */
+static void test_authorize_lockout_is_per_address(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = auth_test_server(&obs, 3, 1);   /* 1 s window */
+    char *out = NULL; size_t olen = 0;
+
+    stratum_conn_t *a = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(a, "203.0.113.7");
+    for (int i = 0; i < 3; ++i) {
+        stratum_handle_message(s, a, BAD_AUTH_LINE(1), &out, &olen); free(out); out = NULL; olen = 0;
+    }
+    CHECK(obs.rejects == 3);
+    stratum_conn_free_for_test(a);
+
+    /* Same address, fresh connection, VALID username: locked out. */
+    stratum_conn_t *b = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(b, "203.0.113.7");
+    int rc = stratum_handle_message(s, b, GOOD_AUTH_LINE(2), &out, &olen);
+    CHECK(rc == -1);
+    CHECK(!stratum_conn_authorized_for_test(b));
+    CHECK(out && strstr(out, "too many failed authorizations") != NULL);
+    CHECK(obs.rejects == 3);               /* no row for a refused attempt */
+    free(out); out = NULL; olen = 0;
+    stratum_conn_free_for_test(b);
+
+    /* A different address is not. */
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(c, "203.0.113.8");
+    rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(3), &out, &olen);
+    CHECK(rc == 0);
+    CHECK(stratum_conn_authorized_for_test(c));
+    free(out); out = NULL; olen = 0;
+    stratum_conn_free_for_test(c);
+
+    /* The window passes and the locked address is welcome again. */
+    sleep_ms(1100);
+    stratum_conn_t *d = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(d, "203.0.113.7");
+    rc = stratum_handle_message(s, d, GOOD_AUTH_LINE(4), &out, &olen);
+    CHECK(rc == 0);
+    CHECK(stratum_conn_authorized_for_test(d));
+    free(out); out = NULL; olen = 0;
+    stratum_conn_free_for_test(d);
+
+    /* Two failures, then a success, forgives the address: two more failures
+     * on the next connection do not lock it (that would be four in a row
+     * without the reset). */
+    stratum_conn_t *e = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(e, "203.0.113.9");
+    stratum_handle_message(s, e, BAD_AUTH_LINE(5), &out, &olen); free(out); out = NULL; olen = 0;
+    stratum_handle_message(s, e, BAD_AUTH_LINE(6), &out, &olen); free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, e, GOOD_AUTH_LINE(7), &out, &olen);
+    CHECK(rc == 0); CHECK(stratum_conn_authorized_for_test(e));
+    free(out); out = NULL; olen = 0;
+    stratum_conn_free_for_test(e);
+    stratum_conn_t *f = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(f, "203.0.113.9");
+    stratum_handle_message(s, f, BAD_AUTH_LINE(8), &out, &olen); free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, f, BAD_AUTH_LINE(9), &out, &olen);
+    CHECK(rc == 0);                        /* second failure, not locked */
+    free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, f, GOOD_AUTH_LINE(10), &out, &olen);
+    CHECK(rc == 0); CHECK(stratum_conn_authorized_for_test(f));
+    free(out);
+    stratum_conn_free_for_test(f);
+
+    stratum_server_free(s);
+}
+
+/* 0 disables: a connection may fail forever, exactly as before. */
+static void test_authorize_budget_zero_disables(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = auth_test_server(&obs, 0, 60);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    stratum_conn_set_peer_ip_for_test(c, "203.0.113.7");
+    char *out = NULL; size_t olen = 0;
+    int closed = 0;
+    for (int i = 0; i < 12; ++i) {
+        if (stratum_handle_message(s, c, BAD_AUTH_LINE(1), &out, &olen) < 0) closed = 1;
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(!closed);
+    CHECK(obs.rejects == 12);
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
+/* Successful authorizes are budgeted too: ten in a window, then each one is
+ * refused without a reject row and spends the failure budget, which closes
+ * the connection on the third. */
+static void test_authorize_call_ceiling(void) {
+    obs_t obs = {0};
+    stratum_server_t *s = auth_test_server(&obs, 3, 60);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    int ok = 0;
+    for (int i = 0; i < 10; ++i) {
+        int rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(1), &out, &olen);
+        ok += (rc == 0 && out && strstr(out, "\"result\":true") != NULL);
+        free(out); out = NULL; olen = 0;
+    }
+    CHECK(ok == 10);
+    int rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(2), &out, &olen);
+    CHECK(rc == 0);
+    CHECK(out && strstr(out, "too many mining.authorize calls") != NULL);
+    free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(3), &out, &olen);
+    CHECK(rc == 0); free(out); out = NULL; olen = 0;
+    rc = stratum_handle_message(s, c, GOOD_AUTH_LINE(4), &out, &olen);
+    CHECK(rc == -1);                       /* third refusal closes */
+    free(out);
+    CHECK(obs.rejects == 0);               /* none of it wrote a row */
+    CHECK(stratum_conn_authorized_for_test(c));   /* the earlier success stands */
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -3997,6 +4240,7 @@ int main(void) {
     test_extranonce1_unique_across_connections();
     test_stop_waits_for_connection_threads();
     test_dedupe_same_hash_across_job_ids();
+    test_share_dedupe_index_tracks_the_ring();
     test_rejected_candidate_is_not_a_block();
     test_accepted_candidate_reports_accepted();
     test_job_survives_retirement_while_held();
@@ -4038,6 +4282,10 @@ int main(void) {
     test_job_id_classification_is_three_way();
     test_stale_reject_carries_a_job_age();
     test_reject_records_the_peer_ip();
+    test_authorize_failures_close_the_connection();
+    test_authorize_lockout_is_per_address();
+    test_authorize_budget_zero_disables();
+    test_authorize_call_ceiling();
     printf("test_stratum: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
