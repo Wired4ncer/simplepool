@@ -126,11 +126,18 @@ _Static_assert((uint64_t)STRATUM_RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
 /* mining.authorize calls per connection per window, success or failure. A
  * successful authorize is not free either — it replays the worker's
  * difficulty from the store — and a client that has a valid address can
- * repeat it as fast as it likes. Nothing legitimate authorizes ten times in
- * ten seconds; past that each call is treated as a failure and the
- * connection's failure budget closes it. */
+ * repeat it as fast as it likes. Past the ceiling each call is treated as a
+ * failure and the connection's failure budget closes it.
+ *
+ * 60, not the 10 this shipped with. The ceiling exists to stop deliberate
+ * spam, and spam is hundreds a second; a proxy that multiplexes workers over
+ * one socket and authorizes them in a burst is the legitimate pattern that
+ * has to clear it, and whether any marketplace on the rental port does that
+ * is not known. Being wrong there costs a blacklisting. 60 in 10 s is far
+ * above any burst a proxy needs and still two orders of magnitude under a
+ * flood. */
 #define AUTH_CALL_WINDOW_MS     10000
-#define AUTH_MAX_CALLS_PER_WINDOW 10
+#define AUTH_MAX_CALLS_PER_WINDOW 60
 
 /* BIP320 reserved version-rolling bits (ASICBoost). Advertised in
  * mining.configure; only these block-header version bits may be rolled by a
