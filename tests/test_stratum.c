@@ -3963,6 +3963,88 @@ static void test_sd_end_to_end_over_a_socket(void) {
     stratum_server_free(s);
     printf("ok: sd= in the password pins a real socket session end to end\n");
 }
+/* The share-dedupe index under churn. The ring holds SHARE_DEDUPE_RING keys
+ * and the index must answer for exactly those: a key inside the window is a
+ * duplicate, a key that fell out of it is not, and after any amount of
+ * eviction the index holds precisely as many keys as the ring does. That
+ * last equality is what backward-shift deletion has to preserve — a leaked
+ * key would make the index disagree with the ring, and a blanked-instead-of-
+ * shifted slot would make a present key read absent, which is the same share
+ * paid twice. Keys come from a fixed-seed generator so a failure replays. */
+static uint64_t dd_next(uint64_t *st) {   /* splitmix64 */
+    uint64_t z = (*st += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+static void test_share_dedupe_index_tracks_the_ring(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
+                           .ctx = &obs, .on_reject = on_reject };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    enum { RING = 16384 };   /* SHARE_DEDUPE_RING; a mismatch fails below */
+    uint64_t *keys = malloc(sizeof(uint64_t) * 2 * RING);
+    uint64_t st = 0x5EEDu;
+    for (int i = 0; i < 2 * RING; ++i) keys[i] = dd_next(&st);
+
+    /* Fill exactly one window. Every key is new. */
+    int fresh = 0;
+    for (int i = 0; i < RING; ++i) fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
+    CHECK(fresh == RING);
+    size_t idx = 0, live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING);   /* also proves RING matches the real ring size */
+    CHECK(idx == RING);
+    /* Everything in the window is a duplicate, and saying so changes nothing. */
+    int dups = 0;
+    for (int i = 0; i < RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+    CHECK(dups == RING);
+    live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING && idx == RING);
+
+    /* A second window evicts the first one key at a time, in order. Every
+     * new key is fresh; every evicted key is fresh again; the ones still
+     * inside the window stay duplicates throughout. */
+    fresh = 0;
+    for (int i = RING; i < 2 * RING; ++i) {
+        fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
+        if ((i & 1023) == 0) {
+            live = stratum_share_dedupe_live_for_test(s, &idx);
+            CHECK(live == RING && idx == RING);
+            /* Oldest surviving key and the newest are both present... */
+            CHECK(stratum_share_dedupe_key_for_test(s, keys[i - RING + 1]) == 1);
+            CHECK(stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+        }
+    }
+    CHECK(fresh == RING);
+    live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING && idx == RING);
+    dups = 0;
+    for (int i = RING; i < 2 * RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+    CHECK(dups == RING);
+    /* ...and the whole first window is gone. Each of these re-inserts,
+     * evicting the oldest of the second window in turn, so check the tail
+     * of the second window is still intact afterwards. */
+    fresh = 0;
+    for (int i = 0; i < 256; ++i) fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
+    CHECK(fresh == 256);
+    dups = 0;
+    for (int i = RING + 256; i < 2 * RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
+    CHECK(dups == RING - 256);
+    live = stratum_share_dedupe_live_for_test(s, &idx);
+    CHECK(live == RING && idx == RING);
+
+    /* 0 is the empty marker and is stored as 1; both read back as present. */
+    CHECK(stratum_share_dedupe_key_for_test(s, 0) == 0);
+    CHECK(stratum_share_dedupe_key_for_test(s, 0) == 1);
+    CHECK(stratum_share_dedupe_key_for_test(s, 1) == 1);
+
+    free(keys);
+    stratum_server_free(s);
+}
+
 int main(void) {
     test_subscribe();
     test_authorize_triggers_setdiff_notify();
@@ -3997,6 +4079,7 @@ int main(void) {
     test_extranonce1_unique_across_connections();
     test_stop_waits_for_connection_threads();
     test_dedupe_same_hash_across_job_ids();
+    test_share_dedupe_index_tracks_the_ring();
     test_rejected_candidate_is_not_a_block();
     test_accepted_candidate_reports_accepted();
     test_job_survives_retirement_while_held();

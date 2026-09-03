@@ -50,6 +50,11 @@
 /* Process-wide ring, so it has to cover every live connection's recent
  * submissions across every server rather than just one's. */
 #define SHARE_DEDUPE_RING 16384
+/* Index over the ring: open addressing, linear probing, power-of-two slots.
+ * 4x the ring keeps the load at or under 25%, where a lookup touches ~1.2
+ * slots on average and the longest probe run stays short. 512 KB. */
+#define SHARE_DEDUPE_SLOT_BITS 16
+#define SHARE_DEDUPE_SLOTS (1u << SHARE_DEDUPE_SLOT_BITS)
 /* Matches store.c's REASON_MAX so a submitblock reason survives the trip to
  * the DB intact rather than being truncated twice. */
 #define REASON_TEXT_MAX   128
@@ -365,8 +370,22 @@ struct stratum_server {
      * check independent of how the submission was framed (job id,
      * extranonce2, version rolling). */
     pthread_mutex_t share_dedupe_lock;
-    uint64_t        share_dedupe[SHARE_DEDUPE_RING];
-    size_t          share_dedupe_head;
+    /* Two structures over one set of keys. The ring is what bounds memory and
+     * decides which hash is forgotten next (the oldest, FIFO). The index is
+     * how a submit asks "have I seen this?" without walking the ring: that
+     * walk was 16384 compares under this one mutex on EVERY credited share,
+     * which at a minimum-difficulty window — every miner on the pool
+     * submitting at its full hash rate — serialised the whole pool through
+     * a 128 KB scan. Now it is a hash lookup, O(1) expected.
+     *
+     * Invariants: the ring never holds a key twice (a key is only inserted
+     * when the index says it is absent); every key in the ring is in the
+     * index and nothing else is; 0 is the empty marker, so a real key of 0
+     * is stored as 1. */
+    uint64_t        share_dedupe_ring[SHARE_DEDUPE_RING];
+    size_t          share_dedupe_head;      /* next ring slot to overwrite */
+    size_t          share_dedupe_count;     /* live keys, <= SHARE_DEDUPE_RING */
+    uint64_t        share_dedupe_index[SHARE_DEDUPE_SLOTS];
 
     pthread_rwlock_t job_lock;
     stratum_job_t   *current_job;          /* protected by job_lock */
@@ -2235,6 +2254,89 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
     return 0;
 }
 
+/* ---- share dedupe index ------------------------------------------------ */
+
+/* Home slot. fnv1a's low bits are decent but the multiply spreads any
+ * structure across the top bits we actually take. */
+static inline size_t dd_home(uint64_t h) {
+    return (size_t)((h * 0x9E3779B97F4A7C15ull) >> (64 - SHARE_DEDUPE_SLOT_BITS));
+}
+
+static int dd_index_find(const stratum_server_t *s, uint64_t h) {
+    size_t i = dd_home(h);
+    for (;;) {
+        uint64_t k = s->share_dedupe_index[i];
+        if (k == 0) return 0;
+        if (k == h) return 1;
+        i = (i + 1) & (SHARE_DEDUPE_SLOTS - 1);
+    }
+}
+
+/* Caller has already established h is absent. The table can never be full:
+ * it holds at most SHARE_DEDUPE_RING keys in 4x as many slots. */
+static void dd_index_insert(stratum_server_t *s, uint64_t h) {
+    size_t i = dd_home(h);
+    while (s->share_dedupe_index[i] != 0) i = (i + 1) & (SHARE_DEDUPE_SLOTS - 1);
+    s->share_dedupe_index[i] = h;
+}
+
+/* Is `home` in the cyclic half-open interval (hole, j]? A key whose home is
+ * there was placed at j by probing THROUGH the hole's position only if its
+ * home precedes the hole — so it must move back; a key whose home lies after
+ * the hole reached j without passing it and stays. */
+static inline int dd_home_between(size_t hole, size_t home, size_t j) {
+    return (hole <= j) ? (hole < home && home <= j)
+                       : (hole < home || home <= j);
+}
+
+/* Remove h, which must be present. Linear probing cannot just blank a slot:
+ * that would cut the probe chain for every key that was pushed past it, and
+ * a later lookup would stop at the new hole and call a present key absent —
+ * which here means the same share credited twice. Tombstones would fix that
+ * but accumulate for the life of the process under a constant churn of 16384
+ * evictions per 16384 inserts. Backward-shift deletion (Knuth 6.4, R) walks
+ * the rest of the cluster and moves back any key the hole would strand, so
+ * the table stays exactly as if the deleted key had never been inserted. */
+static void dd_index_remove(stratum_server_t *s, uint64_t h) {
+    size_t i = dd_home(h);
+    while (s->share_dedupe_index[i] != h) {
+        if (s->share_dedupe_index[i] == 0) return;   /* not present; cannot happen */
+        i = (i + 1) & (SHARE_DEDUPE_SLOTS - 1);
+    }
+    size_t j = i;
+    for (;;) {
+        j = (j + 1) & (SHARE_DEDUPE_SLOTS - 1);
+        uint64_t k = s->share_dedupe_index[j];
+        if (k == 0) break;
+        if (dd_home_between(i, dd_home(k), j)) continue;
+        s->share_dedupe_index[i] = k;
+        i = j;
+    }
+    s->share_dedupe_index[i] = 0;
+}
+
+/* The set operation on a precomputed key: 1 if present, else record it —
+ * evicting the oldest key when the ring is full — and return 0. */
+static int share_dedupe_key_check_and_add(stratum_server_t *s, uint64_t h) {
+    if (h == 0) h = 1;   /* 0 is the index's empty marker */
+    int dup = 0;
+    pthread_mutex_lock(&s->share_dedupe_lock);
+    if (dd_index_find(s, h)) {
+        dup = 1;
+    } else {
+        if (s->share_dedupe_count == SHARE_DEDUPE_RING) {
+            dd_index_remove(s, s->share_dedupe_ring[s->share_dedupe_head]);
+        } else {
+            s->share_dedupe_count++;
+        }
+        s->share_dedupe_ring[s->share_dedupe_head] = h;
+        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
+        dd_index_insert(s, h);
+    }
+    pthread_mutex_unlock(&s->share_dedupe_lock);
+    return dup;
+}
+
 /* Server-wide dedupe on the assembled header hash. Returns 1 if this exact
  * hash has already been credited on any connection, else records it and
  * returns 0. Called after the header is built, so it catches duplicates the
@@ -2243,18 +2345,21 @@ static int dedupe_check_and_add(stratum_conn_t *c, const char *jid,
  * id. Two identical hashes represent one solution and must be paid once. */
 static int share_dedupe_check_and_add(stratum_server_t *s,
                                       const uint8_t hash_be[32]) {
-    uint64_t h = fnv1a_bytes(hash_be, 32);
-    int dup = 0;
+    return share_dedupe_key_check_and_add(s, fnv1a_bytes(hash_be, 32));
+}
+
+int stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key) {
+    return share_dedupe_key_check_and_add(s, key);
+}
+
+size_t stratum_share_dedupe_live_for_test(stratum_server_t *s, size_t *index_live) {
+    size_t n = 0;
     pthread_mutex_lock(&s->share_dedupe_lock);
-    for (size_t i = 0; i < SHARE_DEDUPE_RING; ++i) {
-        if (s->share_dedupe[i] == h) { dup = 1; break; }
-    }
-    if (!dup) {
-        s->share_dedupe[s->share_dedupe_head] = h;
-        s->share_dedupe_head = (s->share_dedupe_head + 1) % SHARE_DEDUPE_RING;
-    }
+    for (size_t i = 0; i < SHARE_DEDUPE_SLOTS; ++i) if (s->share_dedupe_index[i]) n++;
+    size_t count = s->share_dedupe_count;
     pthread_mutex_unlock(&s->share_dedupe_lock);
-    return dup;
+    if (index_live) *index_live = n;
+    return count;
 }
 
 /* Build full block hex from job + coinbase + nonce/ntime. Returns malloc'd

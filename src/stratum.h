@@ -487,6 +487,15 @@ void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
  * observable form of "no connection thread can touch this server again",
  * which is what makes tearing the server down afterwards safe. */
 int         stratum_server_conn_count_for_test(const stratum_server_t *s);
+
+/* Server-wide share dedupe, on a precomputed key rather than a header hash:
+ * 1 = already recorded, 0 = recorded now. Lets a test drive the index through
+ * eviction with keys it chooses. */
+int    stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key);
+/* Returns the ring's live count; *index_live gets the number of occupied
+ * index slots. The two must be equal — that equality is the whole invariant
+ * of backward-shift deletion. */
+size_t stratum_share_dedupe_live_for_test(stratum_server_t *s, size_t *index_live);
 /* Connections currently pinned by `sd=`. */
 int         stratum_server_pinned_count_for_test(const stratum_server_t *s);
 
