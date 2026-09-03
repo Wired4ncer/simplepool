@@ -315,6 +315,19 @@ someone debug their config.
 rows on the workers page but the same payout address on the admin
 view.
 
+**"too many failed authorizations from this address; retry in Ns":**
+the miner's firmware has retried a bad username three times within a
+minute (`auth_max_failures` / `auth_fail_lockout_sec`), and the pool is
+now refusing the address without decoding anything until the minute is
+up. This is the authorize budget doing its job — see
+`NONCE_AND_SHARES.md`, *Two limits on cheap requests*. Nothing to do on
+the pool side: the first *successful* authorize clears it instantly, so
+once they fix the username the next reconnect goes through. The journal
+has one `WARN` per lockout naming the address, which is how you find
+who it was. Only the first three failures per minute per address reach
+the `rejects` table, so a miner debugging a typo still gets their error
+text there; a flood does not.
+
 ---
 
 ## Taking rented hashrate (Braiins, NiceHash)

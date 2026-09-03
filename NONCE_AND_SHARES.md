@@ -292,7 +292,13 @@ would be effort spent to reach the same answer more slowly.
 10. **Global hash dedupe.** If this exact hash has already been
     credited — on any connection, under any job id — → reject with
     `duplicate share`. One solution is one solution regardless of how
-    the submission was framed.
+    the submission was framed. The pool remembers the last 16,384
+    credited hashes, oldest forgotten first, and answers the question
+    with a hash-table lookup rather than a scan of all 16,384 (which is
+    what it did until `3bc3064`, under one mutex, on every share: fine
+    at real difficulty, a ~23,000 shares/s ceiling for the whole pool at
+    a minimum-difficulty window). See *Two limits on cheap requests*
+    below for the numbers.
 11. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
     `network_target`, and version fields (this is what appears in
     `logs/simplepool.log`).
@@ -378,6 +384,74 @@ A connection's share rate is also capped outright by
 hashrate and assigned difficulty from being badly mismatched — a fleet
 pointed at a home-miner port is the usual cause — and past the ceiling
 a submit is refused before any validation work.
+
+### Two limits on cheap requests
+
+Both of these exist because the pool's stratum port is public and a
+client on it can make the pool do work before it has proved anything.
+Neither changes what a correctly configured miner sees.
+
+**The share-dedupe index.** Step 10 of the validation flow has to ask
+"has this exact hash been credited already?" on every share that
+reaches it. Until `3bc3064` that was a walk of a 16,384-entry ring
+under a single mutex shared by every connection thread — 128 KB of
+compares per share, serialised. Measured (miss case, the common one):
+
+| | per share | pool-wide ceiling |
+|---|---|---|
+| linear scan (before) | 42,725 ns | ~23,400 shares/s |
+| hashed index (now) | 247 ns | ~4,050,000 shares/s |
+
+The old ceiling was invisible at real difficulty and would have been the
+binding constraint at a minimum-difficulty window, when the
+network-difficulty clamp has every miner submitting at its full hash
+rate. The ring is still there — it is what bounds memory (16,384 keys)
+and decides which hash is forgotten next — but it is now indexed by an
+open-addressed hash table with four slots per entry, so the load never
+passes 25%. Eviction uses backward-shift deletion rather than
+tombstones, because a table that deletes 16,384 keys per 16,384 inserts
+for the life of the process would otherwise fill with tombstones and
+degrade back toward the scan. The invariant a test holds it to: the
+index contains exactly the ring's keys, after any amount of churn.
+
+**The authorize budget.** A failed `mining.authorize` — no worker name,
+a malformed username, an address that does not decode — used to cost a
+reject row in the store's event ring, a line on the broadcast feed and
+a journal line, per attempt, from a client that had not authenticated
+at all. Since `64a120a` it is budgeted by two config keys:
+
+```
+auth_max_failures     = 3     # 0 disables both limits
+auth_fail_lockout_sec = 60
+```
+
+- **Per connection:** the `auth_max_failures`-th failure is answered as
+  before, then the socket is closed.
+- **Per peer address:** an address that has failed `auth_max_failures`
+  times inside `auth_fail_lockout_sec` is refused at the top of the
+  handler — before the parameters are read, so no address decoding, no
+  reject row, no broadcast line — with
+  `too many failed authorizations from this address; retry in Ns`, and
+  the connection is closed. The journal gets one `WARN` per lockout
+  naming the address, not one per refused attempt.
+- **A success forgives the address.** A miner that mistypes twice and
+  then fixes it is not made to wait; the window passing clears it too.
+- **Successful calls are budgeted as well:** past ten `mining.authorize`
+  calls in ten seconds on one connection, each is refused (no row) and
+  counts as a failure. A successful authorize is not free — it replays
+  the worker's difficulty from the store — and any client holding a
+  valid address could repeat it as fast as it liked.
+
+The per-address table is fixed at 1024 slots, probed linearly, evicting
+the entry whose window started earliest when a run is full. A client
+spraying source addresses can therefore only ever reset someone else's
+*count*; it cannot grow the table. It is a limiter, not a ledger.
+
+It ships **on**, unlike `max_submits_per_sec`, because it refuses
+nothing a correct miner does — it only shortens how long a client may
+keep failing. A budget without a window (`auth_fail_lockout_sec = 0`
+with `auth_max_failures > 0`) is refused at boot: a per-connection limit
+alone is dodged by reconnecting.
 
 ### Difficulty of a share
 
