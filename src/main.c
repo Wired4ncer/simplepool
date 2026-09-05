@@ -169,6 +169,10 @@ typedef struct {
      * still accept a submit for — see PROP_PLAN_RING. */
     prop_plan_t     prop_plans[PROP_PLAN_RING];
     size_t          prop_plan_next;
+    /* Highest coinbase fixed cost seen against the byte budget, in bytes.
+     * Guarded by `lock`. 0 until the first proportional template. See the
+     * byte-pressure alarm in prop_build_plan. */
+    size_t          prop_fixed_bytes_hwm;
 
     /* Live PPS rate, refreshed whenever a new template arrives. Read on the
      * share path, so it is an atomic double rather than taking `lock` —
@@ -256,10 +260,12 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
                                             size_t hist_len,
                                             size_t fee_txout_bytes,
                                             int64_t *out_headroom_wu,
-                                            size_t *out_predicted_bytes) {
+                                            size_t *out_predicted_bytes,
+                                            size_t *out_fixed_bytes) {
     size_t ceiling = (size_t)cfg->prop_max_outputs;
     if (ceiling > PROP_PLAN_MAX_PAY) ceiling = PROP_PLAN_MAX_PAY;
     if (out_predicted_bytes) *out_predicted_bytes = 0;
+    if (out_fixed_bytes) *out_fixed_bytes = 0;
     if (!t->coinbasetxn_hex) {
         if (out_headroom_wu) *out_headroom_wu = -1;
         return ceiling;
@@ -296,7 +302,7 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
                               ss_growth, size_hist, hist_len,
                               fee_output ? fee_txout_bytes : 0,
                               (size_t)cfg->prop_max_coinbase_bytes, ceiling,
-                              out_predicted_bytes);
+                              out_predicted_bytes, out_fixed_bytes);
         if (by_bytes < n) n = by_bytes;
     }
     return n;
@@ -477,12 +483,72 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                                                   ledger_in, n_ledger_in,
                                                   cand_hist, PPLNS_TXOUT_HIST_LEN);
     size_t fee_bytes = prop_fee_txout_bytes(s->cfg, fee_sats > 0);
-    size_t predicted_bytes = 0;
+    size_t predicted_bytes = 0, fixed_bytes = 0;
     size_t max_out = prop_max_outputs_for_template(t, s->cfg, fee_sats > 0,
                                                    candidates ? cand_hist : NULL,
                                                    PPLNS_TXOUT_HIST_LEN,
                                                    fee_bytes, &headroom_wu,
-                                                   &predicted_bytes);
+                                                   &predicted_bytes, &fixed_bytes);
+
+    /* 🔔 THE LEADING INDICATOR. Report the coinbase's fixed cost the first time
+     * it reaches a level it has not reached before.
+     *
+     * The existing "byte budget is costing payouts" line is a LAGGING one: it
+     * fires only once the cap has already bound, i.e. once miners have already
+     * stopped being paid. What actually moves is the fixed cost -- the
+     * template's own coinbase, which carries the enforcer's drivechain
+     * OP_RETURN messages and grows as sidechains are adopted. On alphanet it
+     * went 93 -> 212 B of OP_RETURN between 2026-08-28 and 09-05 and payout
+     * slots fell 16 -> 9 in lockstep, with nothing to see it happen.
+     *
+     * A high-water mark rather than a per-template line, because the message
+     * load swings block to block (2-6 messages observed): reporting every
+     * template would bury the trend in noise, and reporting only the maximum
+     * is exactly the trend. It re-arms at startup, so the journal always
+     * records where the pool stands after a restart.
+     *
+     * ⛔ ALARM, NEVER A GATE -- the same rule the byte budget itself carries.
+     * Nothing here refuses a template or changes a payout; a coinbase past the
+     * budget is a perfectly valid block, and suppressing it would convert a
+     * marketplace preference into a lost block. */
+    if (s->cfg->prop_max_coinbase_bytes > 0 && fixed_bytes > 0) {
+        size_t budget = (size_t)s->cfg->prop_max_coinbase_bytes;
+        pthread_mutex_lock(&s->lock);
+        int is_new_high = fixed_bytes > s->prop_fixed_bytes_hwm;
+        if (is_new_high) s->prop_fixed_bytes_hwm = fixed_bytes;
+        pthread_mutex_unlock(&s->lock);
+        if (is_new_high) {
+            size_t left = (fixed_bytes < budget) ? budget - fixed_bytes : 0;
+            /* ⚠️ A BEST CASE, and labelled as one. It divides by the SMALLEST
+             * output we can emit, so the real count is this or fewer -- the
+             * budget is actually spent on the k largest candidates, and one
+             * taproot payee costs 43 B where this assumes 31. Quoting it as
+             * the capacity would understate the danger, which is the wrong
+             * direction for an alarm. max_out beside it is the real answer for
+             * this template. */
+            size_t at_most = left / COINBASE_MIN_PAYOUT_TXOUT_BYTES;
+            /* Escalate on the number a miner actually feels -- how many can be
+             * paid out of THIS template -- not on the byte count, which means
+             * nothing without the budget beside it, and not on the best case,
+             * which would delay the alarm past the emergency. */
+            if (max_out <= 2)
+                LOG_ERROR("coinbase byte pressure: %zu B of the %zu B budget is "
+                          "spent before ANY miner is paid; %zu B left, and this "
+                          "template caps payouts at %zu. The pool is at or near "
+                          "paying a single miner per block. This is the "
+                          "template's own coinbase growing -- its drivechain "
+                          "OP_RETURNs -- not a pool setting: raising "
+                          "prop_max_outputs cannot recover it.",
+                          fixed_bytes, budget, left, max_out);
+            else
+                LOG_WARN("coinbase byte pressure: %zu B of the %zu B budget is "
+                         "spent before ANY miner is paid (new high); %zu B left "
+                         "affords at most %zu payouts at %d B each, and this "
+                         "template caps at %zu.",
+                         fixed_bytes, budget, left, at_most,
+                         COINBASE_MIN_PAYOUT_TXOUT_BYTES, max_out);
+        }
+    }
 
     /* The split is denominated in the difficulty these rows actually carry;
      * `actual_diff` is the walk's own measure of the same window and is used
