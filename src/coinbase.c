@@ -1204,10 +1204,12 @@ size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
                                          size_t fee_txout_bytes,
                                          size_t budget_bytes,
                                          size_t ceiling,
-                                         size_t *out_predicted_bytes) {
+                                         size_t *out_predicted_bytes,
+                                         size_t *out_fixed_bytes) {
     if (out_predicted_bytes) *out_predicted_bytes = 0;
+    if (out_fixed_bytes) *out_fixed_bytes = 0;
     const size_t max_b = 8 + 1 + 34;   /* P2TR / P2WSH, the largest we emit */
-    const size_t min_b = 8 + 1 + 22;   /* P2WPKH, the smallest we emit */
+    const size_t min_b = COINBASE_MIN_PAYOUT_TXOUT_BYTES;  /* P2WPKH */
     if (ceiling < 1) ceiling = 1;
     if (budget_bytes == 0) return ceiling;          /* cap disabled */
 
@@ -1237,6 +1239,9 @@ size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
             fee_txout_bytes = max_b;
         fixed += fee_txout_bytes;
     }
+    /* Reported whether or not anything fits: a fixed cost that has eaten the
+     * whole budget is exactly the case the caller most needs to hear about. */
+    if (out_fixed_bytes) *out_fixed_bytes = fixed;
     if (fixed >= budget_bytes) return 1;            /* nothing fits; pay one */
     size_t left = budget_bytes - fixed;
     const size_t left0 = left;

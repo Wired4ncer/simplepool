@@ -156,6 +156,11 @@ int coinbase_template_payout_slot_bytes(const char *coinbase_tx_hex,
  * `prop_max_outputs` ceiling is what binds in practice — the weight bound only
  * takes over on a nearly-full block, which is precisely when erring small is
  * worth the lost capacity. */
+/* The smallest payout output we ever emit: 8 B value + 1 B script length +
+ * 22 B P2WPKH scriptPubKey. It is the unit the byte budget is really spent in,
+ * so it is also the unit "how many more payouts would fit" is measured in. */
+#define COINBASE_MIN_PAYOUT_TXOUT_BYTES (8 + 1 + 22)
+
 #define COINBASE_PAYOUT_TXOUT_WU 172
 
 /* Weight deliberately left unused. The server's accounting and ours can differ
@@ -243,7 +248,21 @@ size_t coinbase_payout_txout_bytes(const char *address);
  * candidate left so much slack that an under-estimate was structurally
  * impossible, and summing the k largest deliberately removes that slack. 0
  * means "not computed" (the cap is disabled, or the budget is too small for
- * even one payout). */
+ * even one payout).
+ *
+ * out_fixed_bytes (optional) receives the coinbase's FIXED cost against the
+ * budget -- everything that is spent before a single miner is paid: the
+ * template's own coinbase (its OP_RETURN drivechain messages and the witness
+ * commitment included), less the spendable slot our first payout replaces,
+ * plus the scriptSig the builder splices in, plus the operator fee output.
+ *
+ * It is exported because it is the LEADING indicator of payout capacity. The
+ * returned count only tells you what fits today; this tells you how much of
+ * the budget has already been consumed by something the pool does not control.
+ * On alphanet the template's drivechain messages grew 93 -> 212 B between
+ * 2026-08-28 and 09-05 and payout slots fell 16 -> 9 in lockstep, silently --
+ * nothing alarmed, because the only signal was a cap that had already bound.
+ * 0 means "not computed" (the cap is disabled). */
 size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
                                          size_t template_slot_bytes,
                                          size_t scriptsig_growth_bytes,
@@ -252,7 +271,8 @@ size_t coinbase_max_payout_outputs_bytes(size_t template_coinbase_bytes,
                                          size_t fee_txout_bytes,
                                          size_t budget_bytes,
                                          size_t ceiling,
-                                         size_t *out_predicted_bytes);
+                                         size_t *out_predicted_bytes,
+                                         size_t *out_fixed_bytes);
 
 size_t coinbase_max_payout_outputs(int64_t weight_limit,
                                    int64_t tx_weight_total,
