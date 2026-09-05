@@ -1024,63 +1024,55 @@ static void test_refill_holds_under_a_binding_floor(void) {
            "(%zu ledgers, reservation changed the outcome %zu times)\n", trials, differed);
 }
 
-/* The dust re-check must drop the SMALLEST offender.
+/* The dust re-check must drop the SMALLEST offender, not the largest.
  *
- * Dropping the largest instead still terminates and still conserves, so every
- * other property test stays green -- but it discards a payable address in
- * favour of an unpayable one and the reservation then pays FEWER than
- * carry_slots = 0 would have. It needs its own regime to surface: very few
- * addresses, two or three slots, and a floor large enough that the emitted set
- * is repeatedly re-cut. */
+ * When renormalisation pushes MORE THAN ONE emitted address under the floor,
+ * the loop has a choice about which to drop. Dropping the smallest keeps the
+ * larger claim -- the address with the better right to the slot. Dropping the
+ * largest instead still terminates, still conserves, and still emits the same
+ * NUMBER of payouts, so every other property test in this file stays green: it
+ * silently pays the wrong miner.
+ *
+ * Reduced from a differential fuzz against the mutant, which differs on 23 of
+ * 1,500,000 random ledgers -- rare, deterministic, and invisible to any
+ * assertion about counts. (⚠️ Review reported the mutant can also pay FEWER in
+ * ~8/10,000 of its own generator's shapes. This generator produced 0 such cases
+ * in 1.5M, so that stronger claim is NOT what this test pins down.)
+ *
+ * Here `top` is comfortably payable. `lesser` and `greater` both clear the
+ * floor on their pre-renormalisation cut and both fall under it afterwards, so
+ * exactly one must go: `lesser`, the smaller claim of the two. */
 static void test_dust_check_drops_the_smallest_offender(void) {
-    unsigned st = 5150905u;
-    size_t trials = 0, differed = 0;
-    for (size_t t = 0; t < 60000; t++) {
-        st = st * 1103515245u + 12345u;
-        size_t n = 2 + (st >> 19) % 4;              /* 2-5 addresses */
-        size_t maxout = 2 + (st >> 13) % 2;         /* 2-3 slots */
-        int64_t floor_sats = REWARD / 20 + (int64_t)((st >> 3) % (2 * REWARD / 5));
-        pplns_addr_t addrs[8];
-        pplns_claim_t base[16] = {0};
-        double carrysum = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            st = st * 1103515245u + 12345u;
-            snprintf(addrs[i].address, sizeof addrs[i].address, "d%zu", i);
-            addrs[i].total_difficulty = (double)((st >> 12) % 400) + 1.0;
-            snprintf(base[i].address, sizeof base[i].address, "d%zu", i);
-            /* Tiny positive carries against one large negative -- the shape
-             * that puts a barely-payable address into the emitted set. */
-            base[i].claim_fraction = (double)((st >> 5) % 300) / 10000.0;
-            carrysum += base[i].claim_fraction;
-        }
-        base[0].claim_fraction -= carrysum;
-        size_t got[4]; int ok = 1;
-        for (size_t carry = 0; carry < 4 && carry < maxout; carry++) {
-            pplns_claim_t ledger[16] = {0};
-            pplns_payout_t payouts[8] = {0};
-            memcpy(ledger, base, sizeof base);
-            size_t np = 0, nl = 0;
-            if (pplns_compute_payouts(REWARD, addrs, n, ledger, 16, n, &nl,
-                                      floor_sats, maxout, carry,
-                                      payouts, &np, NULL) != 0) { ok = 0; break; }
-            assert_conserves(payouts, np, REWARD);
-            for (size_t i = 0; i < np; i++) assert(payouts[i].sats >= floor_sats || np == 1);
-            got[carry] = np;
-        }
-        if (!ok) continue;
-        trials++;
-        for (size_t carry = 1; carry < 4 && carry < maxout; carry++) {
-            if (got[carry] != got[0]) differed++;
-            if (got[carry] < got[0]) {
-                fprintf(stderr, "DUST CHECK COST A PAYOUT: n=%zu maxout=%zu carry=%zu "
-                        "floor=%lld (%zu vs %zu)\n", n, maxout, carry,
-                        (long long)floor_sats, got[carry], got[0]);
-                abort();
-            }
-        }
-    }
-    assert(trials > 1000);
-    printf("ok: the dust check drops the smallest offender (%zu ledgers)\n", trials);
+    /* ⚠️ `greater` is placed BEFORE `lesser` in the array on purpose. The dust
+     * loop walks the working set in array order but must choose by CLAIM, so
+     * if array order and claim order agreed here, a mutant that simply drops
+     * the first offender it encounters would pass this test by coincidence. */
+    pplns_addr_t addrs[4] = {
+        { "repaying", 9.0 }, { "top", 278.0 }, { "greater", 158.0 }, { "lesser", 152.0 }
+    };
+    pplns_claim_t ledger[8] = {0};
+    snprintf(ledger[0].address, sizeof ledger[0].address, "repaying"); ledger[0].claim_fraction = -0.0715;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "top");      ledger[1].claim_fraction =  0.0297;
+    snprintf(ledger[2].address, sizeof ledger[2].address, "lesser");   ledger[2].claim_fraction =  0.0234;
+    snprintf(ledger[3].address, sizeof ledger[3].address, "greater");  ledger[3].claim_fraction =  0.0184;
+
+    const int64_t FLOOR = 27312906LL;      /* ~27% of the reward: it must BIND */
+    pplns_payout_t payouts[8] = {0};
+    size_t np = 0, nl = 0;
+    assert(pplns_compute_payouts(REWARD, addrs, 4, ledger, 8, 4, &nl,
+                                 FLOOR, /*max_outputs*/ 4, /*carry_slots*/ 1,
+                                 payouts, &np, NULL) == 0);
+    assert_conserves(payouts, np, REWARD);
+    /* Precondition: the dust check really did have to cut the set down --
+     * three addresses were emitted on merit and only two survive. */
+    assert(np == 2);
+    for (size_t i = 0; i < np; i++) assert(payouts[i].sats >= FLOOR);
+    assert(payout_for(payouts, np, "top") > 0);
+    /* The choice under test: the smaller of the two offenders is the one
+     * deferred, so the larger claim keeps the slot. */
+    assert(payout_for(payouts, np, "greater") > 0);
+    assert(payout_for(payouts, np, "lesser") == 0);
+    printf("ok: the dust check defers the smaller of two offenders\n");
 }
 
 /* A reserved slot belongs to someone actually OWED from a previous block.
