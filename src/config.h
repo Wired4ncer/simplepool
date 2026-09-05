@@ -238,6 +238,22 @@ typedef struct {
     double prop_window_k;
     int64_t prop_min_payout_sats;
     int prop_max_outputs;
+    /* prop_carry_slots reserves this many of the AVAILABLE payout outputs for
+     * the addresses owed most from previous blocks, instead of for the largest
+     * claims in this one. 0 (the default) is the pure largest-claim selection.
+     *
+     * Why it is needed: selection ranks on window_fraction + carry, and a large
+     * miner's window fraction alone outweighs the biggest carry a small miner
+     * can build up, so the large miners retake the top slots on every block and
+     * the deferred queue never advances. Measured 2026-09-05: 12 addresses took
+     * 91% of 279 payout slots over 31 blocks while 88 addresses holding
+     * 1.2751 ECX were paid nothing -- 28 of them already above the payout floor.
+     *
+     * It is a FREQUENCY control, not an amount: the claim ledger is zero-sum
+     * either way and nobody's total changes. It also costs no coinbase bytes,
+     * which matters because the byte budget is set by NiceHash marketplace
+     * compatibility and is not ours to spend. See pplns.h. */
+    int prop_carry_slots;
     /* prop_max_coinbase_bytes caps the SERIALIZED SIZE of the coinbase, in
      * bytes, as a second limit alongside prop_max_outputs. 0 disables it.
      *

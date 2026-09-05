@@ -45,6 +45,22 @@ static int cmp_claim_desc(const void *a, const void *b) {
     return 0;
 }
 
+/* Deferral order: how much this address was owed BEFORE this block's shares.
+ *
+ * Sorting on old_claim rather than claim is the whole point of the reserved
+ * slots. claim includes window_fraction, which is precisely the term that lets
+ * a large miner outrank every deferred small one on every block. old_claim is
+ * what the pool still owes from earlier blocks and nothing else, so the
+ * longest-deferred address sorts first and an address just paid -- which went
+ * carry-negative absorbing the deferred share as an advance -- sorts last. */
+static int cmp_old_claim_desc(const void *a, const void *b) {
+    const work_t *const *x = (const work_t *const *)a;
+    const work_t *const *y = (const work_t *const *)b;
+    if ((*x)->old_claim > (*y)->old_claim) return -1;
+    if ((*x)->old_claim < (*y)->old_claim) return 1;
+    return 0;
+}
+
 /* Documented in pplns.h. Mirrors find_work's dedupe deliberately: same rule,
  * same two arrays, same order, so the set sized here is the set that gets
  * paid. It is O(n^2) in the number of addresses, exactly like find_work — a
@@ -89,6 +105,7 @@ int pplns_compute_payouts(int64_t reward_after_fee,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
+                          size_t carry_slots,
                           pplns_payout_t *payouts, size_t *n_payouts_out,
                           size_t *n_eligible_out) {
     if (n_eligible_out) *n_eligible_out = 0;
@@ -187,6 +204,16 @@ int pplns_compute_payouts(int64_t reward_after_fee,
     for (size_t i = 0; i < nw; i++) rank[i] = &w[i];
     qsort(rank, nw, sizeof(*rank), cmp_claim_desc);
 
+    /* Hold back the reserved slots so the merit pass cannot consume the whole
+     * cap. Merit always keeps at least one slot: a block's largest legitimate
+     * claimant is never displaced wholesale by the deferral queue, and at
+     * max_outputs == 1 (a template whose byte budget left room for a single
+     * payout) the reservation disappears entirely rather than handing that one
+     * output to someone other than the top claim. */
+    size_t reserved = carry_slots;
+    if (reserved + 1 > max_outputs) reserved = max_outputs - 1;
+    const size_t merit_cap = max_outputs - reserved;
+
     /* Emit the addresses whose cut clears the threshold, best claims first,
      * up to the output cap. A negative claim is an address that was paid early
      * and is repaying; it is never emitted. */
@@ -198,14 +225,63 @@ int pplns_compute_payouts(int64_t reward_after_fee,
         /* Counted with the cap IGNORED: the caller cannot otherwise tell a cap
          * that cost someone a payout from one that capped below a set the
          * payout floor had already excluded. Both look like "fewer paid than
-         * candidates" from outside, and only the first is worth reporting. */
+         * candidates" from outside, and only the first is worth reporting.
+         *
+         * Counted against the FULL cap, not merit_cap: it answers "how many
+         * would an uncapped run have emitted", which the reservation does not
+         * change. Reserving slots must not make the byte budget look like it
+         * cost more payouts than it did. */
         n_eligible++;
-        if (n_emit < max_outputs) {
+        if (n_emit < merit_cap) {
             rank[i]->emit = 1;
             n_emit++;
         }
     }
     if (n_eligible_out) *n_eligible_out = n_eligible;
+
+    /* Fill the reserved slots from the deferral queue: the addresses owed most
+     * from earlier blocks, subject to exactly the same eligibility rules the
+     * merit pass applies. Ordered by old_claim, so this cannot be starved by a
+     * large miner's window fraction -- which is the failure it exists to fix.
+     *
+     * The floor test is `continue`, not `break`: old_claim order says nothing
+     * about claim order, so a below-floor address here does not imply the rest
+     * are below it too. Only the old_claim <= 0 test may break, because that
+     * one IS the sort key. */
+    if (reserved > 0 && n_emit < max_outputs) {
+        work_t **byold = (work_t **)calloc(nw, sizeof(*byold));
+        if (!byold) { free(rank); free(w); return -1; }
+        for (size_t i = 0; i < nw; i++) byold[i] = &w[i];
+        qsort(byold, nw, sizeof(*byold), cmp_old_claim_desc);
+        for (size_t i = 0; i < nw && n_emit < max_outputs; i++) {
+            work_t *e = byold[i];
+            if (e->old_claim <= 0.0) break; /* sorted: nobody else is waiting */
+            if (e->emit) continue;
+            if (e->claim <= 0.0) continue;  /* unreachable while window >= 0 */
+            double cut = (double)reward_after_fee * e->claim;
+            if (cut < (double)min_payout_sats) continue;
+            e->emit = 1;
+            n_emit++;
+        }
+        free(byold);
+    }
+
+    /* Give back any reserved slot the deferral queue could not fill.
+     *
+     * ⛔ Without this, turning the reservation on could pay FEWER addresses
+     * than turning it off -- exactly the regression a fairness change must not
+     * ship. Whenever there is no queue to serve, the selection collapses back
+     * to the pure largest-claim one. */
+    if (n_emit < max_outputs) {
+        for (size_t i = 0; i < nw && n_emit < max_outputs; i++) {
+            if (rank[i]->claim <= 0.0) break;
+            double cut = (double)reward_after_fee * rank[i]->claim;
+            if (cut < (double)min_payout_sats) break;
+            if (rank[i]->emit) continue;
+            rank[i]->emit = 1;
+            n_emit++;
+        }
+    }
     /* A block must pay someone: if the threshold excluded everybody, pay the
      * single largest positive claim regardless. */
     if (n_emit == 0) {
