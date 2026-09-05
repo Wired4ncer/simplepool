@@ -508,6 +508,7 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                                    addrs, n_addrs,
                                    ledger, ledger_cap, n_ledger_in, &n_ledger_out,
                                    s->cfg->prop_min_payout_sats, max_out,
+                                   (size_t)s->cfg->prop_carry_slots,
                                    plan->payouts, &n_payouts, &n_eligible);
     free(addrs);
     if (rc < 0 || n_payouts == 0) {
@@ -648,12 +649,13 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     LOG_INFO("proportional: %zu payout outputs over %.2f window difficulty "
              "(want %.1f x network %.2f = %.2f, floor %d s, window spans %llu s), "
              "reward-after-fee %lld sats, %zu deferred claims, "
-             "cap %zu of %d (weight headroom %lld WU)",
+             "cap %zu of %d (weight headroom %lld WU), rotation %d",
              n_payouts, actual_diff, s->cfg->prop_window_k, net_diff, want_diff,
              s->cfg->prop_window_min_sec,
              (unsigned long long)((now - start_ms) / 1000),
              (long long)reward_after_fee, n_ledger_out,
-             max_out, s->cfg->prop_max_outputs, (long long)headroom_wu);
+             max_out, s->cfg->prop_max_outputs, (long long)headroom_wu,
+             s->cfg->prop_carry_slots);
     return 0;
 }
 
@@ -1684,6 +1686,16 @@ int main(int argc, char **argv) {
                 LOG_INFO("payout caps: max %d outputs, no coinbase byte budget "
                          "(prop_max_coinbase_bytes unset)",
                          cfg.prop_max_outputs);
+            /* Same reasoning as the line above: a fairness knob that is off
+             * looks exactly like one that is on and doing nothing. */
+            if (cfg.prop_carry_slots > 0)
+                LOG_INFO("payout rotation: %d of the available slots reserved "
+                         "for the longest-deferred claims",
+                         cfg.prop_carry_slots);
+            else
+                LOG_INFO("payout rotation: OFF (prop_carry_slots unset) — slots "
+                         "go to the largest claims, which on this pool means "
+                         "the same addresses every block");
         }
         /* Publish the ports so the dashboard can tell a miner which one to
          * dial. Labels are constrained to [A-Za-z0-9_-] at config parse time,
