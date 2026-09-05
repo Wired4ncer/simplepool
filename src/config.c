@@ -93,6 +93,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->prop_window_k = 3.0;
     cfg->prop_min_payout_sats = 1000000LL;  /* ~0.01 ECX at current subsidy */
     cfg->prop_max_outputs = 12;
+    cfg->prop_carry_slots = 0;   /* off: an upgrade never silently reprices */
     /* 0 = off, so an upgrade never silently changes how many miners a block
      * pays. The operator opts in with a measured number. */
     cfg->prop_max_coinbase_bytes = 0;
@@ -340,6 +341,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "prop_window_k")             == 0) cfg->prop_window_k = atof(v);
         else if (strcmp(k, "prop_min_payout_sats")      == 0) cfg->prop_min_payout_sats = (int64_t)atoll(v);
         else if (strcmp(k, "prop_max_outputs")          == 0) cfg->prop_max_outputs = atoi(v);
+        else if (strcmp(k, "prop_carry_slots")          == 0) cfg->prop_carry_slots = atoi(v);
         else if (strcmp(k, "prop_max_coinbase_bytes")   == 0) cfg->prop_max_coinbase_bytes = atoi(v);
         else if (strcmp(k, "prop_window_min_sec")       == 0) cfg->prop_window_min_sec = atoi(v);
         else if (strcmp(k, "pps_min_network_difficulty") == 0) cfg->pps_min_network_difficulty = atof(v);
@@ -438,6 +440,19 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
             set_err(errbuf, errlen,
                     "config: 'prop_max_outputs' must be in [1, 64]");
             return -12;
+        }
+        /* Must leave the largest claim a slot. The selection clamps this per
+         * template anyway (the cap moves block to block with the byte budget),
+         * but a config that reads "reserve 12 of 12" says something the pool
+         * will never do, and a value that silently means something else is how
+         * a knob becomes folklore. Refuse it here where it can be corrected. */
+        if (cfg->prop_carry_slots < 0 ||
+            cfg->prop_carry_slots >= cfg->prop_max_outputs) {
+            set_err(errbuf, errlen,
+                    "config: 'prop_carry_slots' must be in [0, prop_max_outputs "
+                    "- 1] -- it reserves slots WITHIN prop_max_outputs, and the "
+                    "largest claim always keeps one");
+            return -18;
         }
         /* The floor is not 0-or-anything: a budget too small to hold the
          * template's own coinbase plus one payout cannot be satisfied by

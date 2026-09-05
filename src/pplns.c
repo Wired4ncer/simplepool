@@ -28,6 +28,7 @@ typedef struct {
     double  claim;            /* window_fraction + old_claim */
     int64_t paid;             /* sats actually emitted */
     int     emit;
+    int     dropped;          /* removed by the dust re-check; never re-picked */
 } work_t;
 
 static work_t *find_work(work_t *w, size_t n, const char *addr) {
@@ -43,6 +44,33 @@ static int cmp_claim_desc(const void *a, const void *b) {
     if ((*x)->claim > (*y)->claim) return -1;
     if ((*x)->claim < (*y)->claim) return 1;
     return 0;
+}
+
+/* Deferral order: how much this address was owed BEFORE this block's shares.
+ *
+ * Sorting on old_claim rather than claim is the whole point of the reserved
+ * slots. claim includes window_fraction, which is precisely the term that lets
+ * a large miner outrank every deferred small one on every block. old_claim is
+ * what the pool still owes from earlier blocks and nothing else, so the
+ * longest-deferred address sorts first and an address just paid -- which went
+ * carry-negative absorbing the deferred share as an advance -- sorts last. */
+static int cmp_old_claim_desc(const void *a, const void *b) {
+    const work_t *const *x = (const work_t *const *)a;
+    const work_t *const *y = (const work_t *const *)b;
+    if ((*x)->old_claim > (*y)->old_claim) return -1;
+    if ((*x)->old_claim < (*y)->old_claim) return 1;
+    /* ⛔ Ties are broken deterministically, and that is not cosmetic.
+     * qsort is not stable, so without this two runs over the SAME ledger could
+     * hand a reserved slot to different addresses -- a payout decision settled
+     * by the libc sort implementation. Equal carries are common: every address
+     * that has never been deferred sits at exactly 0.0.
+     *
+     * Falling back to claim, then to the address itself, also makes the tie
+     * order agree with the order the give-back pass would have used, so which
+     * of the two passes fills a slot stops being observable. */
+    if ((*x)->claim > (*y)->claim) return -1;
+    if ((*x)->claim < (*y)->claim) return 1;
+    return strcmp((*x)->address, (*y)->address);
 }
 
 /* Documented in pplns.h. Mirrors find_work's dedupe deliberately: same rule,
@@ -89,6 +117,7 @@ int pplns_compute_payouts(int64_t reward_after_fee,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
+                          size_t carry_slots,
                           pplns_payout_t *payouts, size_t *n_payouts_out,
                           size_t *n_eligible_out) {
     if (n_eligible_out) *n_eligible_out = 0;
@@ -187,74 +216,181 @@ int pplns_compute_payouts(int64_t reward_after_fee,
     for (size_t i = 0; i < nw; i++) rank[i] = &w[i];
     qsort(rank, nw, sizeof(*rank), cmp_claim_desc);
 
-    /* Emit the addresses whose cut clears the threshold, best claims first,
-     * up to the output cap. A negative claim is an address that was paid early
-     * and is repaying; it is never emitted. */
-    size_t n_emit = 0, n_eligible = 0;
+    /* Hold back the reserved slots so the merit pass cannot consume the whole
+     * cap. Merit always keeps at least one slot: a block's largest legitimate
+     * claimant is never displaced wholesale by the deferral queue, and at
+     * max_outputs == 1 (a template whose byte budget left room for a single
+     * payout) the reservation disappears entirely rather than handing that one
+     * output to someone other than the top claim. */
+    /* ⛔ Compared with no arithmetic on the untrusted side. `reserved + 1 >
+     * max_outputs` wraps to 0 at SIZE_MAX, the clamp then does not fire, and
+     * merit_cap = max_outputs - SIZE_MAX wraps to max_outputs + 1 -- the merit
+     * loop emits one more address than the write loop below can store, so an
+     * address counted in `distributed` and in the ledger is silently never
+     * paid and the block mints less than the reward. max_outputs == 0 is
+     * already refused above, so max_outputs - 1 cannot underflow here. */
+    size_t reserved = carry_slots;
+    if (reserved >= max_outputs) reserved = max_outputs - 1;
+    const size_t merit_cap = max_outputs - reserved;
+
+    /* Count the eligible ONCE, before any selection.
+     *
+     * Its documented meaning is "how many cleared the floor with max_outputs
+     * IGNORED", and the selection below may run several times, so counting it
+     * in the merit pass would multiply it by the number of passes. Measured
+     * against the full cap and before renormalisation, exactly as before. */
+    size_t n_eligible = 0;
     for (size_t i = 0; i < nw; i++) {
         if (rank[i]->claim <= 0.0) break;   /* sorted: nothing better follows */
         double cut = (double)reward_after_fee * rank[i]->claim;
         if (cut < (double)min_payout_sats) break;
-        /* Counted with the cap IGNORED: the caller cannot otherwise tell a cap
-         * that cost someone a payout from one that capped below a set the
-         * payout floor had already excluded. Both look like "fewer paid than
-         * candidates" from outside, and only the first is worth reporting. */
         n_eligible++;
-        if (n_emit < max_outputs) {
+    }
+    if (n_eligible_out) *n_eligible_out = n_eligible;
+
+    /* Deferral order, built once: the sort key does not change as addresses are
+     * dropped, so re-sorting per pass would only cost time. */
+    work_t **byold = NULL;
+    if (reserved > 0) {
+        byold = (work_t **)calloc(nw, sizeof(*byold));
+        if (!byold) { free(rank); free(w); return -1; }
+        for (size_t i = 0; i < nw; i++) byold[i] = &w[i];
+        qsort(byold, nw, sizeof(*byold), cmp_old_claim_desc);
+    }
+
+    /* Select, then let the dust re-check settle, then -- if the reservation is
+     * in use -- SELECT AGAIN with whatever it dropped excluded.
+     *
+     * 🔴 Why the re-selection exists. The dust re-check runs on the
+     * RENORMALISED payouts, which are not the pre-renormalisation cuts the
+     * selection tested. The carry pass deliberately picks small deferred
+     * claims, and those are exactly the ones that fall under the floor after
+     * renormalisation. When a single pass dropped one, its slot stayed empty
+     * and the merit address it had displaced was never restored -- so turning
+     * the reservation on could pay FEWER addresses than leaving it off,
+     * precisely in the regime where the floor binds, and the address it cost
+     * was the deferred miner the feature exists to serve.
+     *
+     * ⛔ The re-selection is gated on `reserved > 0` so the carry_slots == 0
+     * path stays byte-identical to the behaviour before this feature existed.
+     * "Off changes nothing" is a stronger guarantee than "off is a bit better",
+     * and an upgrade must never silently reprice a payout.
+     *
+     * Terminates: every extra pass is entered only after marking at least one
+     * more address `dropped`, and `dropped` is never cleared, so there are at
+     * most nw passes. */
+    size_t n_emit = 0;
+    double emit_claim = 0.0;
+    for (;;) {
+        for (size_t i = 0; i < nw; i++) w[i].emit = 0;
+        n_emit = 0;
+
+        /* Merit: the largest claims, best first, up to the unreserved slots.
+         * A negative claim is an address that was paid early and is repaying;
+         * it is never emitted. */
+        for (size_t i = 0; i < nw && n_emit < merit_cap; i++) {
+            if (rank[i]->claim <= 0.0) break;
+            double cut = (double)reward_after_fee * rank[i]->claim;
+            if (cut < (double)min_payout_sats) break;
+            if (rank[i]->dropped) continue;
             rank[i]->emit = 1;
             n_emit++;
         }
-    }
-    if (n_eligible_out) *n_eligible_out = n_eligible;
-    /* A block must pay someone: if the threshold excluded everybody, pay the
-     * single largest positive claim regardless. */
-    if (n_emit == 0) {
-        if (rank[0]->claim <= 0.0) { free(rank); free(w); return -1; }
-        rank[0]->emit = 1;
-        n_emit = 1;
-    }
 
-    /* Renormalise over the emitted set, so the coinbase pays out the reward
-     * exactly. Whoever is deferred this block keeps their claim; whoever is
-     * paid absorbs the deferred share as an advance and goes claim-negative.
-     *
-     * ⚠️ The threshold above was applied to the PRE-renormalisation cut, and the
-     * two are not the same number. The scale is reward/emit_claim, and
-     * emit_claim exceeds 1.0 whenever a negative claim sits OUTSIDE the emitted
-     * set — which is the state after any block that advanced someone, i.e. the
-     * normal one. Every emitted address is then paid strictly less than the cut
-     * that admitted it.
-     *
-     * That gap can carry an admitted address below the dust limit, and
-     * coinbase_build_from_template_multi refuses the WHOLE build if any output
-     * is under it. Since one coinbase is shared by every connection in this
-     * mode, that is not a lost payout — it is every miner getting "coinbase
-     * render failed" and the pool serving no work for that template.
-     *
-     * So re-check against what will actually be paid and drop the smallest
-     * offender until the set is stable. Dropping only ever RAISES what the
-     * remaining addresses are paid — emit_claim falls, so the scale rises — so
-     * this terminates and can never re-break an address it has already cleared.
-     * The dropped address is deferred, not robbed: its claim rolls forward in
-     * the ledger exactly as a below-threshold one does. */
-    double emit_claim = 0.0;
-    for (;;) {
-        emit_claim = 0.0;
-        for (size_t i = 0; i < nw; i++) if (w[i].emit) emit_claim += w[i].claim;
-        if (!(emit_claim > 0.0)) { free(rank); free(w); return -1; }
-        if (n_emit <= 1) break;          /* a block must pay someone */
-
-        work_t *worst = NULL;
-        for (size_t i = 0; i < nw; i++) {
-            if (!w[i].emit) continue;
-            double d = (double)reward_after_fee * (w[i].claim / emit_claim);
-            if (d >= (double)min_payout_sats) continue;
-            if (!worst || w[i].claim < worst->claim) worst = &w[i];
+        /* Reserved slots: the addresses owed most from earlier blocks, under
+         * exactly the same eligibility rules. Ordered by old_claim, so this
+         * cannot be starved by a large miner's window fraction -- which is the
+         * failure it exists to fix.
+         *
+         * The floor test is `continue`, not `break`: old_claim order says
+         * nothing about claim order, so a below-floor address here does not
+         * imply the rest are below it too. Only the old_claim <= 0 test may
+         * break, because that one IS the sort key. */
+        if (reserved > 0 && n_emit < max_outputs) {
+            for (size_t i = 0; i < nw && n_emit < max_outputs; i++) {
+                work_t *e = byold[i];
+                if (e->old_claim <= 0.0) break;  /* sorted: nobody else waits */
+                if (e->emit || e->dropped) continue;
+                if (e->claim <= 0.0) continue;   /* unreachable while win >= 0 */
+                double cut = (double)reward_after_fee * e->claim;
+                if (cut < (double)min_payout_sats) continue;
+                e->emit = 1;
+                n_emit++;
+            }
         }
-        if (!worst) break;
-        worst->emit = 0;
-        n_emit--;
+
+        /* Hand back any slot the deferral queue could not fill. Gated on
+         * `reserved > 0`: with no reservation the merit pass already took
+         * every slot it was entitled to, so this could only ever be a no-op. */
+        if (reserved > 0 && n_emit < max_outputs) {
+            for (size_t i = 0; i < nw && n_emit < max_outputs; i++) {
+                if (rank[i]->claim <= 0.0) break;
+                double cut = (double)reward_after_fee * rank[i]->claim;
+                if (cut < (double)min_payout_sats) break;
+                if (rank[i]->emit || rank[i]->dropped) continue;
+                rank[i]->emit = 1;
+                n_emit++;
+            }
+        }
+
+        /* A block must pay someone: if the threshold excluded everybody, pay
+         * the single largest positive claim regardless. */
+        if (n_emit == 0) {
+            if (rank[0]->claim <= 0.0) { free(byold); free(rank); free(w); return -1; }
+            rank[0]->emit = 1;
+            n_emit = 1;
+        }
+
+        /* Renormalise over the emitted set, so the coinbase pays out the reward
+         * exactly. Whoever is deferred this block keeps their claim; whoever is
+         * paid absorbs the deferred share as an advance and goes claim-negative.
+         *
+         * ⚠️ The threshold above was applied to the PRE-renormalisation cut, and
+         * the two are not the same number. The scale is reward/emit_claim, and
+         * emit_claim exceeds 1.0 whenever a negative claim sits OUTSIDE the
+         * emitted set — which is the state after any block that advanced
+         * someone, i.e. the normal one. Every emitted address is then paid
+         * strictly less than the cut that admitted it.
+         *
+         * That gap can carry an admitted address below the dust limit, and
+         * coinbase_build_from_template_multi refuses the WHOLE build if any
+         * output is under it. Since one coinbase is shared by every connection
+         * in this mode, that is not a lost payout — it is every miner getting
+         * "coinbase render failed" and the pool serving no work for that
+         * template.
+         *
+         * So re-check against what will actually be paid and drop the smallest
+         * offender until the set is stable. Dropping only ever RAISES what the
+         * remaining addresses are paid — emit_claim falls, so the scale rises —
+         * so this terminates and can never re-break an address it has already
+         * cleared. The dropped address is deferred, not robbed: its claim rolls
+         * forward in the ledger exactly as a below-threshold one does. */
+        int dropped_any = 0;
+        for (;;) {
+            emit_claim = 0.0;
+            for (size_t i = 0; i < nw; i++) if (w[i].emit) emit_claim += w[i].claim;
+            if (!(emit_claim > 0.0)) { free(byold); free(rank); free(w); return -1; }
+            if (n_emit <= 1) break;          /* a block must pay someone */
+
+            work_t *worst = NULL;
+            for (size_t i = 0; i < nw; i++) {
+                if (!w[i].emit) continue;
+                double d = (double)reward_after_fee * (w[i].claim / emit_claim);
+                if (d >= (double)min_payout_sats) continue;
+                if (!worst || w[i].claim < worst->claim) worst = &w[i];
+            }
+            if (!worst) break;
+            worst->emit = 0;
+            worst->dropped = 1;
+            n_emit--;
+            dropped_any = 1;
+        }
+
+        if (reserved == 0) break;          /* legacy path: one pass, as before */
+        if (!dropped_any) break;           /* stable */
+        if (n_emit >= max_outputs) break;  /* nothing to hand back */
     }
+    free(byold);
 
     int64_t distributed = 0;
     for (size_t i = 0; i < nw; i++) {

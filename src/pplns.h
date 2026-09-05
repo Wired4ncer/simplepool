@@ -96,6 +96,54 @@ size_t pplns_candidate_txout_hist(const pplns_addr_t *addrs, size_t n_addrs,
  *         a dust output fails the whole coinbase build.
  * max_outputs: cap on payout outputs (block weight, see the plan note §2). The
  *         smallest cuts are deferred until the list fits.
+ * carry_slots: how many of max_outputs are reserved for the addresses owed most
+ *         from PREVIOUS blocks, rather than for the largest claims this one.
+ *         0 restores the pure largest-claim selection exactly.
+ *
+ *         Why this exists: ranking on `claim` alone is window_fraction +
+ *         old_claim, and a large miner's window fraction on its own dwarfs the
+ *         biggest carry a small miner can accumulate. The large miners
+ *         therefore retake the top slots on EVERY block -- their negative carry
+ *         never gets deep enough to fall below the small claimants before the
+ *         next block's window fraction tops them back up -- and the deferred
+ *         queue does not advance. Measured on alphanet 2026-09-05: over 31
+ *         blocks, 279 payout slots reached 34 distinct addresses, 12 of which
+ *         took 91%, while 88 addresses holding 1.2751 ECX of claims were paid
+ *         nothing. 28 of those were already above min_payout_sats, so the floor
+ *         was not what excluded them.
+ *
+ *         The priority signal is `old_claim`, the carry the ledger already
+ *         holds, and NOT a timestamp. It needs no new column and cannot go
+ *         stale: what the ledger owes an address from earlier blocks IS how
+ *         long and how badly it has been deferred, and an address just paid is
+ *         carry-NEGATIVE and so sorts to the bottom by construction.
+ *         (prop_ledger.last_settled_ts cannot serve here -- it is rewritten for
+ *         every row on every settlement, paid or not.)
+ *
+ *         A reserved slot that goes unfilled is handed BACK to the
+ *         largest-claim selection -- both when the deferral queue is empty and
+ *         when the post-renormalisation dust re-check empties it, which is the
+ *         harder case: the carry pass picks small deferred claims, and those
+ *         are exactly the ones that fall under the floor once payouts are
+ *         renormalised over the emitted set. Selection therefore re-runs with
+ *         whatever the dust check dropped excluded, until the set is stable.
+ *         ⛔ Without that re-run, turning the reservation ON paid FEWER
+ *         addresses than leaving it off, precisely in the regime where the
+ *         floor binds -- and the address it cost was the deferred miner this
+ *         feature exists to serve. Found by review, and now covered by a
+ *         20,000-ledger property test as well as the minimal reproduction.
+ *
+ *         The re-run is gated on carry_slots > 0 so the carry_slots == 0 path
+ *         stays byte-identical to the behaviour before this feature existed:
+ *         verified against the parent implementation over 300,000 random
+ *         ledgers, comparing payouts and the resulting ledger field by field.
+ *
+ *         This does not change what anyone is OWED -- the ledger is zero-sum
+ *         either way -- only how often they are paid. Nor does it widen the
+ *         coinbase: at most max_outputs are emitted whichever addresses are
+ *         chosen, which is exactly the bound coinbase_max_payout_outputs_bytes
+ *         relies on (it charges the k LARGEST candidates by byte size, so it is
+ *         an upper bound whichever k are selected).
  *
  * Returns 0 on success, -1 on invalid input — which now includes a stored
  * ledger that is materially not zero-sum. That is unrepresentable rather than
@@ -116,6 +164,7 @@ int pplns_compute_payouts(int64_t reward_after_fee,
                           pplns_claim_t *ledger, size_t ledger_cap,
                           size_t n_ledger_in, size_t *n_ledger_out,
                           int64_t min_payout_sats, size_t max_outputs,
+                          size_t carry_slots,
                           pplns_payout_t *payouts, size_t *n_payouts_out,
                           size_t *n_eligible_out);
 

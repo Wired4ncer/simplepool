@@ -59,7 +59,7 @@ static void test_paid_in_full_leaves_no_ledger(void) {
     pplns_payout_t payouts[8] = {0};
     size_t np = 0, nl = 0;
     assert(pplns_compute_payouts(REWARD + 7, addrs, 3, ledger, 8, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) == 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) == 0);
     assert(np == 3);
     assert_conserves(payouts, np, REWARD + 7);
     if (nl != 0) {
@@ -81,7 +81,7 @@ static void test_simple_split(void) {
 
     int rc = pplns_compute_payouts(REWARD, addrs, 2,
                                    ledger, 4, 0, &n_ledger,
-                                   THRESHOLD, 12, payouts, &n_payouts, NULL);
+                                   THRESHOLD, 12, 0, payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts == 2);
     assert_conserves(payouts, n_payouts, REWARD);
@@ -101,7 +101,7 @@ static void test_remainder_to_largest(void) {
 
     int rc = pplns_compute_payouts(100000001LL, addrs, 3,
                                    ledger, 8, 0, &n_ledger,
-                                   THRESHOLD, 12, payouts, &n_payouts, NULL);
+                                   THRESHOLD, 12, 0, payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts == 3);
     assert_conserves(payouts, n_payouts, 100000001LL);
@@ -119,7 +119,7 @@ static void test_deferred_miner_does_not_shrink_the_coinbase(void) {
 
     int rc = pplns_compute_payouts(REWARD, addrs, 2,
                                    ledger, 8, 0, &n_ledger,
-                                   THRESHOLD, 12, payouts, &n_payouts, NULL);
+                                   THRESHOLD, 12, 0, payouts, &n_payouts, NULL);
     assert(rc == 0);
     /* The BitAxe's 0.1% cut is 100,000 sats, under the 1,000,000 threshold. */
     assert(n_payouts == 1);
@@ -145,7 +145,7 @@ static void test_released_claim_does_not_overpay(void) {
     /* Block 1: BitAxe deferred. */
     pplns_addr_t b1[] = { { "whale", 999.0 }, { "bitaxe", 1.0 } };
     assert(pplns_compute_payouts(REWARD, b1, 2, ledger, 8, 0, &n_ledger,
-                                 THRESHOLD, 12, payouts, &n_payouts, NULL) == 0);
+                                 THRESHOLD, 12, 0, payouts, &n_payouts, NULL) == 0);
     assert_conserves(payouts, n_payouts, REWARD);
 
     /* Block 2: the BitAxe has done real work and now clears the threshold. Its
@@ -153,7 +153,7 @@ static void test_released_claim_does_not_overpay(void) {
     pplns_addr_t b2[] = { { "whale", 900.0 }, { "bitaxe", 100.0 } };
     size_t n_ledger2 = 0;
     assert(pplns_compute_payouts(REWARD, b2, 2, ledger, 8, n_ledger,
-                                 &n_ledger2, THRESHOLD, 12,
+                                 &n_ledger2, THRESHOLD, 12, 0,
                                  payouts, &n_payouts, NULL) == 0);
     assert(n_payouts == 2);
     assert_conserves(payouts, n_payouts, REWARD);
@@ -178,7 +178,7 @@ static void test_departed_miner_is_still_paid(void) {
 
     pplns_addr_t b1[] = { { "whale", 99.0 }, { "gone", 1.0 } };
     assert(pplns_compute_payouts(REWARD, b1, 2, ledger, 8, 0, &n_ledger,
-                                 5000000LL, 12, payouts, &n_payouts, NULL) == 0);
+                                 5000000LL, 12, 0, payouts, &n_payouts, NULL) == 0);
     assert(payout_for(payouts, n_payouts, "gone") == 0);
     assert(claim_for(ledger, n_ledger, "gone") > 0.0);
 
@@ -187,7 +187,7 @@ static void test_departed_miner_is_still_paid(void) {
     pplns_addr_t b2[] = { { "whale", 100.0 } };
     size_t n2 = 0;
     assert(pplns_compute_payouts(REWARD, b2, 1, ledger, 8, n_ledger, &n2,
-                                 500000LL, 12, payouts, &n_payouts, NULL) == 0);
+                                 500000LL, 12, 0, payouts, &n_payouts, NULL) == 0);
     assert_conserves(payouts, n_payouts, REWARD);
     assert(payout_for(payouts, n_payouts, "gone") == 1000000LL);
     printf("ok: a departed miner still collects what it is owed\n");
@@ -206,7 +206,7 @@ static void test_max_outputs_cap(void) {
 
     int rc = pplns_compute_payouts(REWARD, addrs, 20,
                                    ledger, 64, 0, &n_ledger,
-                                   COINBASE_DUST_SATS, 12,
+                                   COINBASE_DUST_SATS, 12, 0,
                                    payouts, &n_payouts, NULL);
     assert(rc == 0);
     assert(n_payouts <= 12);
@@ -237,7 +237,7 @@ static void test_conserves_over_many_blocks(void) {
         size_t n_payouts = 0, n_out = 0;
         int rc = pplns_compute_payouts(reward, addrs, n,
                                        ledger, 256, n_ledger, &n_out,
-                                       THRESHOLD, 12, payouts, &n_payouts, NULL);
+                                       THRESHOLD, 12, 0, payouts, &n_payouts, NULL);
         assert(rc == 0);
         assert(n_payouts >= 1 && n_payouts <= 12);
         assert_conserves(payouts, n_payouts, reward);
@@ -289,7 +289,7 @@ static void test_every_payout_clears_the_floor(void) {
     size_t np = 0, nl = 0;
 
     assert(pplns_compute_payouts(reward, addrs, 3, ledger, 8, n_in, &nl,
-                                 floor_sats, 12, payouts, &np, NULL) == 0);
+                                 floor_sats, 12, 0, payouts, &np, NULL) == 0);
     assert_conserves(payouts, np, reward);
 
     /* PRECONDITION: on the pre-renormalisation cut, "small" clears the floor --
@@ -334,7 +334,7 @@ static void test_residuals_are_per_address(void) {
     size_t np = 0, nl = 0;
 
     assert(pplns_compute_payouts(REWARD, addrs, 3, ledger, 8, 0, &nl,
-                                 2000000LL, 12, payouts, &np, NULL) == 0);
+                                 2000000LL, 12, 0, payouts, &np, NULL) == 0);
     assert(np == 2);
     assert_conserves(payouts, np, REWARD);
 
@@ -368,17 +368,17 @@ static void test_refuses_a_ledger_that_is_not_zero_sum(void) {
     /* b is owed 0.2 of a reward and nobody carries the matching debt. */
     pplns_claim_t broken[8] = { { "b", +0.2 } };
     assert(pplns_compute_payouts(REWARD, addrs, 1, broken, 8, 1, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) < 0);
 
     /* The mirror: a debt with no matching claim. */
     pplns_claim_t broken2[8] = { { "b", -0.2 } };
     assert(pplns_compute_payouts(REWARD, addrs, 1, broken2, 8, 1, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) < 0);
 
     /* Balanced, and the same block is fine. */
     pplns_claim_t ok[8] = { { "b", +0.2 }, { "c", -0.2 } };
     assert(pplns_compute_payouts(REWARD, addrs, 1, ok, 8, 2, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) == 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) == 0);
     printf("ok: a ledger that does not sum to zero is refused, not absorbed\n");
 }
 
@@ -394,20 +394,20 @@ static void test_rejects_bad_input(void) {
      * of the rows themselves, which is the point of deriving it from them. */
     pplns_addr_t zero_diff[] = { { "a", 0.0 } };
     assert(pplns_compute_payouts(REWARD, zero_diff, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) < 0);
     pplns_addr_t neg_diff[] = { { "a", -1.0 } };
     assert(pplns_compute_payouts(REWARD, neg_diff, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) < 0);
     assert(pplns_compute_payouts(0, addrs, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) < 0);
     assert(pplns_compute_payouts(REWARD, addrs, 1, ledger, 4, 0, &nl,
-                                 THRESHOLD, 0, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 0, 0, payouts, &np, NULL) < 0);
     /* Below the dust limit is not a valid threshold. */
     assert(pplns_compute_payouts(REWARD, addrs, 1, ledger, 4, 0, &nl,
-                                 100, 12, payouts, &np, NULL) < 0);
+                                 100, 12, 0, payouts, &np, NULL) < 0);
     /* Ledger capacity too small for the working set. */
     assert(pplns_compute_payouts(REWARD, addrs, 1, ledger, 0, 0, &nl,
-                                 THRESHOLD, 12, payouts, &np, NULL) < 0);
+                                 THRESHOLD, 12, 0, payouts, &np, NULL) < 0);
     printf("ok: invalid input refused\n");
 }
 
@@ -485,7 +485,7 @@ static void test_eligible_count_separates_cap_from_floor(void) {
     pplns_addr_t five[] = { { "a", 20.0 }, { "b", 20.0 }, { "c", 20.0 },
                             { "d", 20.0 }, { "e", 20.0 } };
     int rc = pplns_compute_payouts(REWARD, five, 5, ledger, 16, 0, &n_ledger,
-                                   THRESHOLD, 2, payouts, &n_payouts,
+                                   THRESHOLD, 2, 0, payouts, &n_payouts,
                                    &n_eligible);
     assert(rc == 0);
     assert(n_payouts == 2);
@@ -502,7 +502,7 @@ static void test_eligible_count_separates_cap_from_floor(void) {
                                 { "c", 0.00001 },  { "d", 0.00001 },
                                 { "e", 0.00001 } };
     rc = pplns_compute_payouts(REWARD, lopsided, 5, ledger, 16, 0, &n_ledger,
-                               THRESHOLD, 16, payouts, &n_payouts, &n_eligible);
+                               THRESHOLD, 16, 0, payouts, &n_payouts, &n_eligible);
     assert(rc == 0);
     assert(n_payouts == 2);
     assert(n_eligible == 2);        /* the FLOOR excluded the other three */
@@ -513,6 +513,606 @@ static void test_eligible_count_separates_cap_from_floor(void) {
     assert(!(n_eligible > n_payouts));
 
     printf("ok: eligible count tells an output cap from a payout floor\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * Payout rotation (prop_carry_slots).
+ *
+ * The bug these cover, measured on alphanet 2026-09-05: over 31 blocks the pool
+ * emitted 279 payout slots to 34 distinct addresses, 12 of which took 91% of
+ * them, while 88 addresses holding real claims were paid NOTHING -- 28 of those
+ * already above the payout floor. Selection ranks on window_fraction +
+ * old_claim, and a whale's window fraction alone outranks any carry a small
+ * miner can accumulate, so the deferred queue never advances.
+ * ------------------------------------------------------------------------- */
+
+/* Simulate `blocks` blocks of a pool with a graded size distribution -- miner i
+ * contributes r^i of the work -- and report how many DISTINCT miners were paid
+ * at least once.
+ *
+ * ⚠️ What this fixture does and does NOT model. It reproduces a real ranking
+ * effect: with a long tail and few slots, the same addresses sit at the top and
+ * the tail is reached slowly. It does NOT reproduce the alphanet 2026-09-05
+ * observation (34 of 155 candidates paid over 31 blocks) -- every shape tried,
+ * including intermittent miners and a 120-address tail, pays far more of the
+ * field than production did. The renormalised advance swings a paid address
+ * carry-negative hard enough to rotate it out, and that mechanism works here.
+ *
+ * So do not read a green run as proof that the production complaint is fixed.
+ * The claim this file supports is narrower and is the one asserted below:
+ * reserved slots reach more of the tail, and never fewer. Establishing what
+ * actually limited production to 34 addresses needs per-block eligibility
+ * instrumentation the pool does not currently emit. */
+static size_t run_rotation_sim(size_t carry_slots, size_t max_outputs,
+                               size_t n, size_t blocks, double r) {
+    enum { MAXN = 64 };
+    pplns_addr_t   addrs[MAXN];
+    pplns_claim_t  ledger[MAXN * 2];
+    pplns_payout_t payouts[MAXN];
+    char  names[MAXN][32];
+    int   paid_ever[MAXN];
+    size_t n_ledger = 0;
+
+    assert(n <= MAXN);
+    memset(ledger, 0, sizeof ledger);
+    memset(paid_ever, 0, sizeof paid_ever);
+    for (size_t i = 0; i < n; i++) snprintf(names[i], sizeof names[i], "m%03zu", i);
+
+    for (size_t b = 0; b < blocks; b++) {
+        /* Iterated rather than pow(): the suite links no libm, and a geometric
+         * series does not need it. */
+        double weight = 1000.0;
+        for (size_t i = 0; i < n; i++) {
+            snprintf(addrs[i].address, sizeof addrs[i].address, "m%03zu", i);
+            addrs[i].total_difficulty = weight;
+            weight *= r;
+        }
+        size_t np = 0, nl = 0;
+        int rc = pplns_compute_payouts(REWARD, addrs, n,
+                                       ledger, MAXN * 2, n_ledger, &nl,
+                                       THRESHOLD, max_outputs, carry_slots,
+                                       payouts, &np, NULL);
+        assert(rc == 0);
+        /* The invariants must hold on every block of every shape, not just at
+         * the end: a fairness change that broke conservation or the zero-sum
+         * ledger would be far worse than the unfairness it set out to fix. */
+        assert_conserves(payouts, np, REWARD);
+        assert(np <= max_outputs);
+        assert(fabs(sum_claims(ledger, nl)) < 1e-9);
+        for (size_t i = 0; i < n; i++)
+            if (payout_for(payouts, np, names[i]) > 0) paid_ever[i] = 1;
+        n_ledger = nl;
+    }
+    size_t distinct = 0;
+    for (size_t i = 0; i < n; i++) if (paid_ever[i]) distinct++;
+    return distinct;
+}
+
+/* ⛔ The precondition is asserted INSIDE the fixture, not assumed. If the tail
+ * is not actually being left out at carry_slots=0 then this shape no longer
+ * describes the problem, and "rotation reaches more of it" would be green for
+ * no reason. */
+static void test_rotation_reaches_more_of_the_tail(void) {
+    const size_t N = 40, BLOCKS = 20, CAP = 4;
+    const double R = 0.86;
+
+    size_t without = run_rotation_sim(0, CAP, N, BLOCKS, R);
+    size_t with    = run_rotation_sim(2, CAP, N, BLOCKS, R);
+
+    assert(without < N);        /* precondition: the tail really is left out */
+    assert(with > without);     /* the reserved slots reach further into it */
+    assert(with <= N);
+
+    printf("ok: reserved slots reach further into the tail (%zu -> %zu of %zu)\n",
+           without, with, N);
+}
+
+/* ⛔ The regression a fairness change must not ship: turning rotation ON must
+ * never pay FEWER addresses than leaving it off. When there is no deferral
+ * queue to serve, the reserved slots are handed back to the largest claims. */
+static void test_rotation_never_pays_fewer(void) {
+    pplns_addr_t addrs[6];
+    for (size_t i = 0; i < 6; i++) {
+        snprintf(addrs[i].address, sizeof addrs[i].address, "addr%zu", i);
+        addrs[i].total_difficulty = 100.0 - (double)i;
+    }
+    for (size_t carry = 0; carry < 5; carry++) {
+        pplns_claim_t ledger[16] = {0};
+        pplns_payout_t payouts[16] = {0};
+        size_t np = 0, nl = 0;
+        /* Fresh ledger: nobody is owed anything, so the queue is empty. */
+        assert(pplns_compute_payouts(REWARD, addrs, 6, ledger, 16, 0, &nl,
+                                     THRESHOLD, 5, carry,
+                                     payouts, &np, NULL) == 0);
+        assert(np == 5);                    /* the cap, whatever carry says */
+        assert_conserves(payouts, np, REWARD);
+    }
+    printf("ok: rotation with an empty queue still fills every slot\n");
+}
+
+/* A reserved slot is not a bypass. The carry pass applies the SAME floor the
+ * merit pass does, because an emitted output below the dust limit fails the
+ * whole coinbase build -- and in proportional mode that is every miner getting
+ * "coinbase render failed", not one lost payout. */
+static void test_rotation_respects_the_floor(void) {
+    pplns_addr_t addrs[2] = { { "big", 1000.0 }, { "dust", 1.0 } };
+    /* "dust" is owed something, but far too little to clear the floor. */
+    pplns_claim_t ledger[8] = {0};
+    snprintf(ledger[0].address, sizeof ledger[0].address, "dust");
+    ledger[0].claim_fraction = 0.000001;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "big");
+    ledger[1].claim_fraction = -0.000001;
+
+    pplns_payout_t payouts[8] = {0};
+    size_t np = 0, nl = 0;
+    assert(pplns_compute_payouts(REWARD, addrs, 2, ledger, 8, 2, &nl,
+                                 THRESHOLD, 4, 3,
+                                 payouts, &np, NULL) == 0);
+    /* Precondition: "dust" really is the head of the deferral queue. */
+    assert(payout_for(payouts, np, "dust") == 0);
+    assert_conserves(payouts, np, REWARD);
+    printf("ok: a reserved slot still respects the payout floor\n");
+}
+
+/* At max_outputs == 1 -- a template whose byte budget left room for a single
+ * payout, which the live pool hit 14 times in 30 h -- the reservation must
+ * disappear rather than hand that one output to the deferral queue. */
+static void test_rotation_yields_the_last_slot_to_merit(void) {
+    pplns_addr_t addrs[2] = { { "big", 900.0 }, { "waiting", 100.0 } };
+    pplns_claim_t ledger[8] = {0};
+    snprintf(ledger[0].address, sizeof ledger[0].address, "waiting");
+    ledger[0].claim_fraction = 0.05;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "big");
+    ledger[1].claim_fraction = -0.05;
+
+    pplns_payout_t payouts[8] = {0};
+    size_t np = 0, nl = 0;
+    assert(pplns_compute_payouts(REWARD, addrs, 2, ledger, 8, 2, &nl,
+                                 THRESHOLD, 1, 8,   /* carry >> max_outputs */
+                                 payouts, &np, NULL) == 0);
+    assert(np == 1);
+    assert(payout_for(payouts, np, "big") == REWARD);
+    assert_conserves(payouts, np, REWARD);
+    printf("ok: the last slot always belongs to the largest claim\n");
+}
+
+/* ⛔ REGRESSION, found by independent review of the first version of this
+ * feature. The dust re-check runs on the RENORMALISED payouts, not on the cuts
+ * the selection tested, and the carry pass deliberately picks small deferred
+ * claims -- exactly the ones that fall under the floor after renormalisation.
+ * In the first version a dropped carry pick left its slot EMPTY and the merit
+ * address it had displaced was never restored, so turning the reservation on
+ * paid FEWER addresses than leaving it off. This is the reviewer's minimal
+ * reproduction, verbatim. */
+static void test_rotation_refills_a_slot_the_dust_check_empties(void) {
+    pplns_addr_t addrs[] = { { "A", 30.0 }, { "B", 50.0 }, { "C", 20.0 } };
+    /* Zero-sum by construction: +0.389 +0.011 -0.400 == 0. */
+    pplns_claim_t base[3] = {0};
+    snprintf(base[0].address, sizeof base[0].address, "A"); base[0].claim_fraction =  0.389;
+    snprintf(base[1].address, sizeof base[1].address, "D"); base[1].claim_fraction =  0.011;
+    snprintf(base[2].address, sizeof base[2].address, "N"); base[2].claim_fraction = -0.400;
+
+    size_t counts[2];
+    for (size_t carry = 0; carry < 2; carry++) {
+        pplns_claim_t ledger[16] = {0};
+        pplns_payout_t payouts[16] = {0};
+        memcpy(ledger, base, sizeof base);
+        size_t np = 0, nl = 0;
+        assert(pplns_compute_payouts(REWARD, addrs, 3, ledger, 16, 3, &nl,
+                                     THRESHOLD, 3, carry,
+                                     payouts, &np, NULL) == 0);
+        assert_conserves(payouts, np, REWARD);
+        for (size_t i = 0; i < np; i++) assert(payouts[i].sats >= THRESHOLD);
+        counts[carry] = np;
+    }
+    /* Precondition: the shape really does fill every slot without rotation. */
+    assert(counts[0] == 3);
+    /* The fix: it still fills every slot WITH rotation. Was 2 before. */
+    assert(counts[1] >= counts[0]);
+    printf("ok: a slot the dust check empties is refilled (%zu -> %zu payouts)\n",
+           counts[0], counts[1]);
+}
+
+/* The carry pass must `continue` past a below-floor address, not `break`.
+ * It is ordered by old_claim, which says nothing about claim, so a small
+ * deferred claim sitting at the head of the queue must not hide the payable
+ * ones behind it. Mutating that `continue` to `break` survived the first
+ * version of this suite. */
+static void test_carry_pass_skips_below_floor_without_stopping(void) {
+    /* Window sums to 1.0; carries sum to 0.0. */
+    pplns_addr_t addrs[] = { { "M", 50.0 }, { "A", 0.0 }, { "B", 20.0 }, { "C", 30.0 } };
+    pplns_claim_t ledger[16] = {0};
+    snprintf(ledger[0].address, sizeof ledger[0].address, "A"); ledger[0].claim_fraction =  0.008;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "B"); ledger[1].claim_fraction =  0.007;
+    snprintf(ledger[2].address, sizeof ledger[2].address, "C"); ledger[2].claim_fraction = -0.015;
+
+    pplns_payout_t payouts[16] = {0};
+    size_t np = 0, nl = 0;
+    /* max_outputs 2, one reserved: merit takes M, the reserved slot is the
+     * only one left, and A (highest old_claim) is below the floor. */
+    assert(pplns_compute_payouts(REWARD, addrs, 4, ledger, 16, 3, &nl,
+                                 THRESHOLD, 2, 1, payouts, &np, NULL) == 0);
+    assert(np == 2);
+    assert_conserves(payouts, np, REWARD);
+    assert(payout_for(payouts, np, "M") > 0);
+    /* B is behind A in the deferral queue and IS payable, so the carry pass
+     * must reach it. `break` would leave the slot to the give-back pass, which
+     * ranks by claim and would hand it to C instead. */
+    assert(payout_for(payouts, np, "B") > 0);
+    assert(payout_for(payouts, np, "C") == 0);
+    assert(payout_for(payouts, np, "A") == 0);
+    printf("ok: the carry pass steps over a below-floor head of queue\n");
+}
+
+/* The deferral order must be total. qsort is not stable, so without an explicit
+ * tie-break two runs over the same ledger could pay different addresses --
+ * every address that has never been deferred sits at old_claim exactly 0.0, so
+ * ties are the common case, not a corner. */
+static void test_deferral_order_is_deterministic(void) {
+    pplns_payout_t first[16] = {0};
+    size_t nfirst = 0;
+    for (size_t trial = 0; trial < 8; trial++) {
+        /* Same addresses, presented in a different order each trial. */
+        pplns_addr_t addrs[6];
+        const char *nm[6] = { "a1","a2","a3","a4","a5","a6" };
+        const double d[6] = { 22.0, 21.0, 20.0, 19.0, 10.0, 8.0 };
+        for (size_t i = 0; i < 6; i++) {
+            size_t j = (i + trial) % 6;
+            snprintf(addrs[i].address, sizeof addrs[i].address, "%s", nm[j]);
+            addrs[i].total_difficulty = d[j];
+        }
+        pplns_claim_t ledger[16] = {0};
+        pplns_payout_t payouts[16] = {0};
+        size_t np = 0, nl = 0;
+        assert(pplns_compute_payouts(REWARD, addrs, 6, ledger, 16, 0, &nl,
+                                     THRESHOLD, 3, 2, payouts, &np, NULL) == 0);
+        assert_conserves(payouts, np, REWARD);
+        if (trial == 0) { memcpy(first, payouts, sizeof first); nfirst = np; continue; }
+        assert(np == nfirst);
+        for (size_t i = 0; i < np; i++)
+            assert(payout_for(payouts, np, first[i].address) == first[i].sats);
+    }
+    printf("ok: the deferral order does not depend on input order\n");
+}
+
+/* The property the give-back and the post-dust refill exist to guarantee,
+ * asserted over many shapes rather than one: turning the reservation on never
+ * pays fewer addresses than leaving it off. */
+static void test_rotation_never_pays_fewer_fuzz(void) {
+    unsigned st = 20260905u;
+    size_t trials = 0;
+    for (size_t t = 0; t < 20000; t++) {
+        st = st * 1103515245u + 12345u;
+        size_t n = 2 + (st >> 16) % 8;
+        size_t maxout = 1 + (st >> 8) % 6;
+        pplns_addr_t addrs[16];
+        pplns_claim_t base[32] = {0};
+        double carrysum = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            st = st * 1103515245u + 12345u;
+            snprintf(addrs[i].address, sizeof addrs[i].address, "z%02zu", i);
+            addrs[i].total_difficulty = (double)((st >> 12) % 1000) + 1.0;
+            snprintf(base[i].address, sizeof base[i].address, "z%02zu", i);
+            base[i].claim_fraction = ((double)((st >> 5) % 2000) - 1000.0) / 20000.0;
+            carrysum += base[i].claim_fraction;
+        }
+        base[0].claim_fraction -= carrysum;          /* force zero-sum */
+        size_t got[4];
+        int ok = 1;
+        for (size_t carry = 0; carry < 4 && carry < maxout; carry++) {
+            pplns_claim_t ledger[32] = {0};
+            pplns_payout_t payouts[16] = {0};
+            memcpy(ledger, base, sizeof base);
+            size_t np = 0, nl = 0;
+            if (pplns_compute_payouts(REWARD, addrs, n, ledger, 32, n, &nl,
+                                      THRESHOLD, maxout, carry,
+                                      payouts, &np, NULL) != 0) { ok = 0; break; }
+            assert_conserves(payouts, np, REWARD);
+            for (size_t i = 0; i < np; i++) assert(payouts[i].sats >= THRESHOLD);
+            /* Tolerance is the ledger's OWN prune scale, not an arbitrary
+             * epsilon: claims worth under one satoshi of the minting block are
+             * dropped, so the stored sum drifts by up to one such unit per
+             * pruned row. A tighter bound here fails on correct output. */
+            /* Tolerance is the ledger's OWN prune scale. A claim worth under
+             * one satoshi of the minting block is dropped rather than stored,
+             * so the sum drifts by up to one such unit per PRUNED row -- and
+             * the pruned rows are the ones no longer in `nl`. The working set
+             * is at most n window addresses plus n carried ones, which bounds
+             * the count. A tighter epsilon fails on correct output; the
+             * reviewer's first run hit exactly this. */
+            assert(fabs(sum_claims(ledger, nl)) <
+                   2.0 * (double)n / (double)REWARD + 1e-12);
+            got[carry] = np;
+        }
+        if (!ok) continue;
+        trials++;
+        for (size_t carry = 1; carry < 4 && carry < maxout; carry++) {
+            if (got[carry] < got[0]) {
+                fprintf(stderr, "ROTATION PAID FEWER: n=%zu maxout=%zu carry=%zu "
+                                "(%zu vs %zu)\n", n, maxout, carry, got[carry], got[0]);
+                abort();
+            }
+        }
+    }
+    printf("ok: rotation never pays fewer, over %zu random ledgers\n", trials);
+}
+
+/* ⛔ Covers the tie-break in cmp_old_claim_desc, which the first version of this
+ * suite did NOT reach: that test passed an EMPTY ledger, so every old_claim was
+ * exactly 0.0 and the carry pass broke at byold[0] before the sort order was
+ * ever consulted. Reverting the whole tie-break left the suite green.
+ *
+ * Ties are the common case rather than a corner -- two miners deferred by the
+ * same amount collide, and qsort is not stable, so without a total order the
+ * libc sort implementation decides who gets paid. */
+static void test_equal_carries_pay_the_same_address_either_way(void) {
+    const char *names[4] = { "M", "P", "Q", "N" };
+    const double win[4]  = { 60.0, 10.0, 10.0, 20.0 };
+    /* P and Q are owed exactly the same; N is repaying. Sums to zero. */
+    const double car[4]  = { 0.0, 0.10, 0.10, -0.20 };
+
+    char first_addr[128] = {0};
+    int64_t first_sats = 0;
+    for (size_t rot = 0; rot < 4; rot++) {
+        pplns_addr_t addrs[4];
+        pplns_claim_t ledger[16] = {0};
+        pplns_payout_t payouts[16] = {0};
+        size_t nl_in = 0;
+        for (size_t i = 0; i < 4; i++) {
+            size_t j = (i + rot) % 4;          /* same set, rotated order */
+            snprintf(addrs[i].address, sizeof addrs[i].address, "%s", names[j]);
+            addrs[i].total_difficulty = win[j];
+            if (car[j] != 0.0) {
+                snprintf(ledger[nl_in].address, sizeof ledger[nl_in].address, "%s", names[j]);
+                ledger[nl_in].claim_fraction = car[j];
+                nl_in++;
+            }
+        }
+        size_t np = 0, nl = 0;
+        assert(pplns_compute_payouts(REWARD, addrs, 4, ledger, 16, nl_in, &nl,
+                                     THRESHOLD, 2, 1, payouts, &np, NULL) == 0);
+        assert_conserves(payouts, np, REWARD);
+        assert(np == 2);
+        /* Precondition: the reserved slot really did go to one of the tied
+         * pair, so the tie-break is what is under test here. */
+        int64_t p = payout_for(payouts, np, "P"), q = payout_for(payouts, np, "Q");
+        assert((p > 0) != (q > 0));
+        const char *won = p > 0 ? "P" : "Q";
+        if (rot == 0) {
+            snprintf(first_addr, sizeof first_addr, "%s", won);
+            first_sats = p > 0 ? p : q;
+        } else {
+            assert(strcmp(won, first_addr) == 0);      /* same winner */
+            assert((p > 0 ? p : q) == first_sats);     /* same amount */
+        }
+    }
+    printf("ok: equal carries resolve to the same address whatever the input order\n");
+}
+
+/* ⛔ carry_slots is a size_t and the header documented no precondition on it.
+ * The clamp used to read `reserved + 1 > max_outputs`, which WRAPS at SIZE_MAX:
+ * the clamp does not fire, merit_cap wraps to max_outputs + 1, the merit loop
+ * emits one more address than the write loop can store, and that address --
+ * already counted in `distributed` and in the ledger -- is silently never paid.
+ * The block then mints less than the reward. Unreachable through config today;
+ * this is the guard against a future caller. */
+static void test_absurd_carry_slots_cannot_underflow(void) {
+    pplns_addr_t addrs[5];
+    for (size_t i = 0; i < 5; i++) {
+        snprintf(addrs[i].address, sizeof addrs[i].address, "u%zu", i);
+        addrs[i].total_difficulty = 100.0 - (double)i * 10.0;
+    }
+    const size_t absurd[] = { (size_t)-1, (size_t)-2, 3, 4, 64 };
+    for (size_t k = 0; k < sizeof absurd / sizeof *absurd; k++) {
+        pplns_claim_t ledger[16] = {0};
+        pplns_payout_t payouts[16] = {0};
+        size_t np = 0, nl = 0;
+        assert(pplns_compute_payouts(REWARD, addrs, 5, ledger, 16, 0, &nl,
+                                     THRESHOLD, 3, absurd[k],
+                                     payouts, &np, NULL) == 0);
+        assert(np >= 1 && np <= 3);            /* never past max_outputs */
+        assert_conserves(payouts, np, REWARD); /* the failure the wrap caused */
+        /* Merit keeps a slot however absurd the reservation. */
+        assert(payout_for(payouts, np, "u0") > 0);
+    }
+    printf("ok: an absurd carry_slots saturates instead of wrapping\n");
+}
+
+/* ⛔ carry_slots exactly equal to max_outputs is the boundary the clamp exists
+ * for, and no other test uses it: test_rotation_yields_the_last_slot_to_merit
+ * passes carry_slots far ABOVE max_outputs, so a clamp of `>` instead of `>=`
+ * survives it. Under that mutant merit_cap becomes 0 and the deferral queue
+ * takes every slot, contradicting the documented "merit always keeps one". */
+static void test_carry_slots_equal_to_max_outputs_keeps_merit(void) {
+    pplns_addr_t addrs[3] = { { "big", 800.0 }, { "mid", 150.0 }, { "small", 50.0 } };
+    pplns_claim_t ledger[16] = {0};
+    /* Both of the smaller two are owed; the whale is repaying. */
+    snprintf(ledger[0].address, sizeof ledger[0].address, "mid");   ledger[0].claim_fraction =  0.06;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "small"); ledger[1].claim_fraction =  0.04;
+    snprintf(ledger[2].address, sizeof ledger[2].address, "big");   ledger[2].claim_fraction = -0.10;
+
+    for (size_t max_out = 1; max_out <= 3; max_out++) {
+        pplns_claim_t l[16]; pplns_payout_t payouts[16] = {0};
+        memcpy(l, ledger, sizeof ledger);
+        size_t np = 0, nl = 0;
+        assert(pplns_compute_payouts(REWARD, addrs, 3, l, 16, 3, &nl,
+                                     THRESHOLD, max_out, /* carry == max */ max_out,
+                                     payouts, &np, NULL) == 0);
+        assert_conserves(payouts, np, REWARD);
+        assert(np <= max_out);
+        /* The largest claim keeps its slot: merit_cap is never 0. */
+        assert(payout_for(payouts, np, "big") > 0);
+    }
+    printf("ok: carry_slots == max_outputs still leaves merit a slot\n");
+}
+
+/* The refill loop only runs when the dust re-check actually drops something,
+ * which needs a floor that BINDS after renormalisation. The existing property
+ * test uses a floor of 1% of the reward and rarely gets there, so the multi-pass
+ * path -- including the per-pass `emit` reset that makes it correct -- was
+ * exercised by almost nothing.
+ *
+ * ⛔ The precondition is asserted: the run must contain trials where the
+ * reservation actually changed the outcome. If it never does, this test is
+ * measuring the single-pass path and proves nothing about the refill. */
+static void test_refill_holds_under_a_binding_floor(void) {
+    unsigned st = 990905u;
+    size_t trials = 0, differed = 0;
+    for (size_t t = 0; t < 40000; t++) {
+        st = st * 1103515245u + 12345u;
+        size_t n = 4 + (st >> 17) % 9;
+        size_t maxout = 3 + (st >> 9) % 4;
+        /* A floor worth ~2-8% of the reward. It has to BIND -- otherwise the
+         * dust re-check never fires and the refill path is never entered -- but
+         * not annihilate: at 5-30% almost nothing cleared it, every block fell
+         * back to the single-payout escape, and the reservation could not
+         * change anything. That is what made the first version of this test
+         * unsatisfiable. Several claimants must clear the floor for the
+         * selection to have a choice at all. */
+        int64_t floor_sats = REWARD / 50 + (int64_t)((st >> 3) % (REWARD / 12));
+        pplns_addr_t addrs[16];
+        pplns_claim_t base[32] = {0};
+        double carrysum = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            st = st * 1103515245u + 12345u;
+            snprintf(addrs[i].address, sizeof addrs[i].address, "b%02zu", i);
+            addrs[i].total_difficulty = (double)((st >> 11) % 500) + 1.0;
+            snprintf(base[i].address, sizeof base[i].address, "b%02zu", i);
+            base[i].claim_fraction = ((double)((st >> 4) % 2000) - 1000.0) / 8000.0;
+            carrysum += base[i].claim_fraction;
+        }
+        base[0].claim_fraction -= carrysum;
+        size_t got[4]; unsigned who[4]; int ok = 1;
+        for (size_t carry = 0; carry < 4 && carry < maxout; carry++) {
+            pplns_claim_t ledger[32] = {0};
+            pplns_payout_t payouts[16] = {0};
+            memcpy(ledger, base, sizeof base);
+            size_t np = 0, nl = 0;
+            if (pplns_compute_payouts(REWARD, addrs, n, ledger, 32, n, &nl,
+                                      THRESHOLD > floor_sats ? THRESHOLD : floor_sats,
+                                      maxout, carry, payouts, &np, NULL) != 0) { ok = 0; break; }
+            assert_conserves(payouts, np, REWARD);
+            assert(np <= maxout);
+            assert(fabs(sum_claims(ledger, nl)) < 2.0 * (double)n / (double)REWARD + 1e-12);
+            got[carry] = np;
+            /* Record WHO was paid, not just how many, as a bitmask over the
+             * address list. The reservation changes which addresses fill the
+             * slots far more often than it changes the count -- comparing
+             * counts alone reported "the reservation never did anything"
+             * across 40,000 ledgers and made this test's own precondition
+             * unsatisfiable. */
+            who[carry] = 0;
+            for (size_t i = 0; i < n; i++)
+                if (payout_for(payouts, np, addrs[i].address) > 0)
+                    who[carry] |= 1u << i;
+        }
+        if (!ok) continue;
+        trials++;
+        for (size_t carry = 1; carry < 4 && carry < maxout; carry++) {
+            if (who[carry] != who[0]) differed++;
+            if (got[carry] < got[0]) {
+                fprintf(stderr, "ROTATION PAID FEWER under a binding floor: "
+                        "n=%zu maxout=%zu carry=%zu (%zu vs %zu)\n",
+                        n, maxout, carry, got[carry], got[0]);
+                abort();
+            }
+        }
+    }
+    assert(trials > 1000);
+    assert(differed > 0);   /* precondition: the reservation path was reached */
+    printf("ok: refill conserves and never pays fewer under a binding floor "
+           "(%zu ledgers, reservation changed the outcome %zu times)\n", trials, differed);
+}
+
+/* The dust re-check must drop the SMALLEST offender, not the largest.
+ *
+ * When renormalisation pushes MORE THAN ONE emitted address under the floor,
+ * the loop has a choice about which to drop. Dropping the smallest keeps the
+ * larger claim -- the address with the better right to the slot. Dropping the
+ * largest instead still terminates, still conserves, and still emits the same
+ * NUMBER of payouts, so every other property test in this file stays green: it
+ * silently pays the wrong miner.
+ *
+ * Reduced from a differential fuzz against the mutant, which differs on 23 of
+ * 1,500,000 random ledgers -- rare, deterministic, and invisible to any
+ * assertion about counts. (⚠️ Review reported the mutant can also pay FEWER in
+ * ~8/10,000 of its own generator's shapes. This generator produced 0 such cases
+ * in 1.5M, so that stronger claim is NOT what this test pins down.)
+ *
+ * Here `top` is comfortably payable. `lesser` and `greater` both clear the
+ * floor on their pre-renormalisation cut and both fall under it afterwards, so
+ * exactly one must go: `lesser`, the smaller claim of the two. */
+static void test_dust_check_drops_the_smallest_offender(void) {
+    /* ⚠️ `greater` is placed BEFORE `lesser` in the array on purpose. The dust
+     * loop walks the working set in array order but must choose by CLAIM, so
+     * if array order and claim order agreed here, a mutant that simply drops
+     * the first offender it encounters would pass this test by coincidence. */
+    pplns_addr_t addrs[4] = {
+        { "repaying", 9.0 }, { "top", 278.0 }, { "greater", 158.0 }, { "lesser", 152.0 }
+    };
+    pplns_claim_t ledger[8] = {0};
+    snprintf(ledger[0].address, sizeof ledger[0].address, "repaying"); ledger[0].claim_fraction = -0.0715;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "top");      ledger[1].claim_fraction =  0.0297;
+    snprintf(ledger[2].address, sizeof ledger[2].address, "lesser");   ledger[2].claim_fraction =  0.0234;
+    snprintf(ledger[3].address, sizeof ledger[3].address, "greater");  ledger[3].claim_fraction =  0.0184;
+
+    const int64_t FLOOR = 27312906LL;      /* ~27% of the reward: it must BIND */
+    pplns_payout_t payouts[8] = {0};
+    size_t np = 0, nl = 0;
+    assert(pplns_compute_payouts(REWARD, addrs, 4, ledger, 8, 4, &nl,
+                                 FLOOR, /*max_outputs*/ 4, /*carry_slots*/ 1,
+                                 payouts, &np, NULL) == 0);
+    assert_conserves(payouts, np, REWARD);
+    /* Precondition: the dust check really did have to cut the set down --
+     * three addresses were emitted on merit and only two survive. */
+    assert(np == 2);
+    for (size_t i = 0; i < np; i++) assert(payouts[i].sats >= FLOOR);
+    assert(payout_for(payouts, np, "top") > 0);
+    /* The choice under test: the smaller of the two offenders is the one
+     * deferred, so the larger claim keeps the slot. */
+    assert(payout_for(payouts, np, "greater") > 0);
+    assert(payout_for(payouts, np, "lesser") == 0);
+    printf("ok: the dust check defers the smaller of two offenders\n");
+}
+
+/* A reserved slot belongs to someone actually OWED from a previous block.
+ *
+ * The carry pass walks the deferral queue in old_claim order and stops at the
+ * first address that is owed nothing -- `old_claim <= 0.0`, not `< 0.0`. The
+ * difference is exactly the addresses sitting at zero, which is every miner who
+ * has never been deferred, i.e. most of them. Relaxing it to `< 0.0` lets a
+ * zero-carry address take the RESERVED slot, jumping ahead of a higher claim
+ * that the give-back pass would otherwise have paid.
+ *
+ * Reduced from a differential fuzz against the mutant: 29,802 of 400,000 random
+ * ledgers behave differently, so this is a real behaviour, not a nicety.
+ *
+ * Here `owed` holds the only positive carry and is already paid on merit, so
+ * the queue is empty and the reserved slot must fall back to the largest
+ * remaining claim (`bigger`). Paying `smaller` instead means the reservation
+ * handed a slot to someone who was not waiting for it. */
+static void test_a_reserved_slot_requires_an_actual_debt(void) {
+    pplns_addr_t addrs[3] = { { "owed", 597.0 }, { "smaller", 432.0 }, { "bigger", 587.0 } };
+    pplns_claim_t ledger[8] = {0};
+    snprintf(ledger[0].address, sizeof ledger[0].address, "owed");   ledger[0].claim_fraction =  0.0194;
+    snprintf(ledger[1].address, sizeof ledger[1].address, "bigger"); ledger[1].claim_fraction = -0.0194;
+    /* "smaller" carries nothing at all -- it is owed exactly zero. */
+
+    pplns_payout_t payouts[8] = {0};
+    size_t np = 0, nl = 0;
+    assert(pplns_compute_payouts(REWARD, addrs, 3, ledger, 8, 2, &nl,
+                                 4863833LL, /*max_outputs*/ 2, /*carry_slots*/ 1,
+                                 payouts, &np, NULL) == 0);
+    assert(np == 2);
+    assert_conserves(payouts, np, REWARD);
+    /* Precondition: the only carry holder is paid on merit, so the deferral
+     * queue really is empty when the reserved slot is filled. */
+    assert(payout_for(payouts, np, "owed") > 0);
+    /* The reserved slot goes back to the largest claim, not to the address
+     * that happens to sit next in old_claim order at zero. */
+    assert(payout_for(payouts, np, "bigger") > 0);
+    assert(payout_for(payouts, np, "smaller") == 0);
+    printf("ok: a reserved slot is not handed to an address owed nothing\n");
 }
 
 int main(void) {
@@ -530,6 +1130,20 @@ int main(void) {
     test_residuals_are_per_address();
     test_refuses_a_ledger_that_is_not_zero_sum();
     test_rejects_bad_input();
+    test_rotation_reaches_more_of_the_tail();
+    test_rotation_never_pays_fewer();
+    test_rotation_respects_the_floor();
+    test_rotation_yields_the_last_slot_to_merit();
+    test_rotation_refills_a_slot_the_dust_check_empties();
+    test_carry_pass_skips_below_floor_without_stopping();
+    test_deferral_order_is_deterministic();
+    test_rotation_never_pays_fewer_fuzz();
+    test_equal_carries_pay_the_same_address_either_way();
+    test_absurd_carry_slots_cannot_underflow();
+    test_carry_slots_equal_to_max_outputs_keeps_merit();
+    test_refill_holds_under_a_binding_floor();
+    test_dust_check_drops_the_smallest_offender();
+    test_a_reserved_slot_requires_an_actual_debt();
     printf("test_pplns: all tests passed\n");
     return 0;
 }
