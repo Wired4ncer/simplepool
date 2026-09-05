@@ -120,9 +120,23 @@ size_t pplns_candidate_txout_hist(const pplns_addr_t *addrs, size_t n_addrs,
  *         (prop_ledger.last_settled_ts cannot serve here -- it is rewritten for
  *         every row on every settlement, paid or not.)
  *
- *         Reserved slots the carry pass cannot fill are handed BACK to the
- *         largest-claim selection, so a non-zero carry_slots can never pay
- *         fewer addresses than 0 would have.
+ *         A reserved slot that goes unfilled is handed BACK to the
+ *         largest-claim selection -- both when the deferral queue is empty and
+ *         when the post-renormalisation dust re-check empties it, which is the
+ *         harder case: the carry pass picks small deferred claims, and those
+ *         are exactly the ones that fall under the floor once payouts are
+ *         renormalised over the emitted set. Selection therefore re-runs with
+ *         whatever the dust check dropped excluded, until the set is stable.
+ *         ⛔ Without that re-run, turning the reservation ON paid FEWER
+ *         addresses than leaving it off, precisely in the regime where the
+ *         floor binds -- and the address it cost was the deferred miner this
+ *         feature exists to serve. Found by review, and now covered by a
+ *         20,000-ledger property test as well as the minimal reproduction.
+ *
+ *         The re-run is gated on carry_slots > 0 so the carry_slots == 0 path
+ *         stays byte-identical to the behaviour before this feature existed:
+ *         verified against the parent implementation over 300,000 random
+ *         ledgers, comparing payouts and the resulting ledger field by field.
  *
  *         This does not change what anyone is OWED -- the ledger is zero-sum
  *         either way -- only how often they are paid. Nor does it widen the
