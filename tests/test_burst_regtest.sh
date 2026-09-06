@@ -144,10 +144,11 @@ pick_port REGTEST_BITCOIND_ZMQ_PORT
 pick_port REGTEST_ENFORCER_RPC_PORT
 pick_port REGTEST_ENFORCER_GRPC_PORT
 pick_port POOL_PORT
+pick_port RENTAL_PORT
 export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
        REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT
 export ENFORCER_URL="http://127.0.0.1:$REGTEST_ENFORCER_GRPC_PORT"
-echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT enforcer=$REGTEST_ENFORCER_RPC_PORT pool=$POOL_PORT"
+echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT enforcer=$REGTEST_ENFORCER_RPC_PORT pool=$POOL_PORT rental=$RENTAL_PORT"
 echo "  blocks=$BURST_BLOCKS miners=$BURST_MINERS"
 
 stage "wipe burst data dir (fresh chain every run)"
@@ -184,6 +185,17 @@ operator_address = ${OPERATOR_ADDR}
 # through the whole burst. 100 keeps the operator output in the shape.
 fee_bps = 100
 coinbase_tag = /simplepool-burst/
+
+# ⛔ A SECOND COINBASE CAP, deliberately. The ring assertion at the end of this
+# file is the only test that checks PROP_PLAN_RING covers every solvable job,
+# and with no listener override it only ever exercised ONE plan per template --
+# the single case where the old sizing was adequate. Per-listener caps make a
+# template write one plan PER DISTINCT CAP, which is what exhausted the ring;
+# a burst run that does not configure two caps cannot see that.
+# 815 is the measured marketplace ceiling; 0 server-wide means uncapped
+# elsewhere, so this is exactly the deploy recipe, with n_caps = 2.
+prop_max_coinbase_bytes = 0
+listener = port=${RENTAL_PORT} max_coinbase_bytes=815 label=rental
 
 pool_mode = proportional
 # Production values, deliberately. The 600 s floor means every block in this

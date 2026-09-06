@@ -116,15 +116,45 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 /* One PPLNS settle plan: the coinbase payouts that went into a job, plus the
  * deferred-claim ledger that becomes authoritative if (and only if) that job's
  * block is accepted. Held until the job can no longer be solved. */
-/* One plan per job that can still be solved: everything stratum retains
- * (STRATUM_RECENT_JOBS) plus the current job, doubled for headroom.
+/* How many plans one template can produce: the server-wide budget plus one
+ * per listener that overrides it. config.c admits at most STRATUM_MAX_LISTENERS
+ * listeners, and build_job_from_template de-duplicates caps, so this is the
+ * hard ceiling. */
+#define PROP_PLAN_MAX_CAPS (STRATUM_MAX_LISTENERS + 1)
+
+/* Plans for every job that can still be solved: everything stratum retains
+ * (STRATUM_RECENT_JOBS) plus the current job, doubled for headroom — and
+ * MULTIPLIED BY the number of plans a single template can now write.
+ *
+ * ⛔ THE MULTIPLIER IS LOAD-BEARING, and was missing when per-listener caps
+ * landed. A template used to write ONE plan; with a per-listener byte cap it
+ * writes one PER DISTINCT CAP, and prop_plan_remember is a flat round-robin
+ * that counts each of them as a separate entry. At the two caps the deploy
+ * recipe recommends, a 34-slot ring covered 34/2 = 17 templates against the 17
+ * solvable jobs — exact parity, every byte of the headroom below spent without
+ * anyone choosing to spend it. At three caps it covered 11, and jobs still
+ * inside the retention window began losing their plans.
  *
  * ⚠️ It was a bare 8 against a retention ring of 8 + the current job — so the
- * OLDEST solvable job never had a plan, and a block found on it fell back to
- * paying its finder directly instead of the PPLNS window. Safe, in that no
- * invalid block or custody is possible either way, but wrong: the window's
- * miners lose a block they earned, and nothing logs it as a defect. */
-#define PROP_PLAN_RING     ((STRATUM_RECENT_JOBS + 1) * 2)
+ * OLDEST solvable job never had a plan. An earlier revision of this comment
+ * said such a block "fell back to paying its finder directly instead of the
+ * PPLNS window". THAT IS NOT WHAT HAPPENS and the claim is corrected here: the
+ * payout set lives on the JOB (stratum_job_set_payouts), not in this ring, and
+ * nothing removes it, so the coinbase still pays the window exactly as
+ * intended. What is lost is the SETTLEMENT — store_prop_settle_block is never
+ * called, so prop_ledger keeps its pre-block state: the miners that coinbase
+ * just paid keep their claims and are prioritised again, and the miners it
+ * deferred are never credited. No coin is misdirected; the fairness memory
+ * silently diverges from the chain, which is the harder failure to notice.
+ * The log line in on_block_found_cb carried the same wrong claim. */
+#define PROP_PLAN_RING     ((STRATUM_RECENT_JOBS + 1) * 2 * PROP_PLAN_MAX_CAPS)
+
+/* The property the ring exists for, asserted rather than left to a comment:
+ * even when every template writes the maximum number of plans, the ring must
+ * still hold plans for more templates than stratum keeps solvable jobs. */
+_Static_assert(PROP_PLAN_RING / PROP_PLAN_MAX_CAPS > STRATUM_RECENT_JOBS + 1,
+               "PROP_PLAN_RING cannot cover every solvable job once each "
+               "template writes PROP_PLAN_MAX_CAPS plans");
 #define PROP_PLAN_MAX_PAY  64
 
 typedef struct {
@@ -1331,10 +1361,22 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
             }
             prop_plan_clear(&settled);
         } else {
-            LOG_INFO("proportional: block %s came from job %s with no payout "
-                     "plan for coinbase cap %d — its coinbase paid the finder "
-                     "directly", block_hash ? block_hash : "?", job_id,
-                     coinbase_cap);
+            /* Two very different causes reach here and the line must not
+             * assert either one. Either no plan was ever built for this
+             * template (prop_build_plan fell back, and the coinbase really did
+             * pay the finder), or a plan was built and has since been evicted
+             * from the ring, in which case the coinbase paid the PPLNS window
+             * and only the settlement is missing. Saying "paid the finder"
+             * unconditionally, as this line used to, describes the first as if
+             * it were the second and hides a real ledger divergence. */
+            LOG_WARN("proportional: block %s came from job %s with no payout "
+                     "plan for coinbase cap %d — NOT settled. If a plan was "
+                     "built for this job, its coinbase paid the window and "
+                     "prop_ledger has silently diverged from the chain; check "
+                     "whether PROP_PLAN_RING (%d) still covers every solvable "
+                     "job at %d cap(s).",
+                     block_hash ? block_hash : "?", job_id, coinbase_cap,
+                     (int)PROP_PLAN_RING, (int)PROP_PLAN_MAX_CAPS);
         }
     }
     /* pool:blocks carries solved blocks. A candidate the node refused is not
@@ -1880,7 +1922,11 @@ int main(int argc, char **argv) {
     /* Server context (must outlive callbacks). Built before the first job
      * because pool_mode=proportional computes that job's payout set from the
      * store, and a first job without one would pay the finder alone. */
-    server_ctx_t sctx;
+    /* ⛔ static, NOT a stack local. The plan ring is PROP_PLAN_RING entries of
+     * ~8.8 kB each (payouts[64] at 136 B a piece) — a few hundred kB before
+     * per-listener caps, ~2.7 MB after. That is nothing for a server and a
+     * great deal for a thread stack. */
+    static server_ctx_t sctx;
     memset(&sctx, 0, sizeof sctx);
     pthread_mutex_init(&sctx.lock, NULL);
     sctx.btc    = &btc;
