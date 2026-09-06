@@ -278,6 +278,37 @@ static void test_listener_max_coinbase_bytes_bad_values(void) {
     }
 }
 
+/* The [400,…] floor is a PROPORTIONAL-port rule. On a solo listener the field
+ * gates nothing -- solo pays one address -- and means "the ceiling to watch",
+ * where a small value is legitimate: solo coinbases measured 316-496 B. And
+ * because `mode=` may appear AFTER `max_coinbase_bytes=` on the same line, the
+ * check cannot live beside the parse; both field orders must work. */
+static void test_listener_solo_cap_is_a_watch_threshold(void) {
+    const char *lines[] = {
+        "listener = port=3336 mode=solo max_coinbase_bytes=300",
+        "listener = port=3336 max_coinbase_bytes=300 mode=solo",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof lines[0]; i++) {
+        proxy_config_t cfg; char err[256] = {0};
+        char body[512];
+        snprintf(body, sizeof body,
+                 "operator_address = %s\nlisten_port = 3334\n%s\n",
+                 VALID_ADDR, lines[i]);
+        CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+        CHECK(cfg.listeners[0].solo == 1);
+        CHECK(cfg.listeners[0].has_max_coinbase_bytes == 1);
+        CHECK(cfg.listeners[0].max_coinbase_bytes == 300);
+    }
+    /* The same value on a PROPORTIONAL port is still refused. */
+    proxy_config_t cfg; char err[256] = {0};
+    char body[512];
+    snprintf(body, sizeof body,
+             "operator_address = %s\nlisten_port = 3334\n"
+             "listener = port=3337 max_coinbase_bytes=300\n", VALID_ADDR);
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "max_coinbase_bytes") != NULL);
+}
+
 /* An unknown mode is refused AT STARTUP rather than silently defaulting.
  * Silently treating "Solo" or "sole" as proportional would put a miner who
  * asked for solo into the shared payout window without anyone noticing. */
@@ -422,6 +453,7 @@ int main(void) {
     test_listener_mode_typo_is_refused();
     test_listener_max_coinbase_bytes();
     test_listener_max_coinbase_bytes_bad_values();
+    test_listener_solo_cap_is_a_watch_threshold();
     test_listeners_default_to_none();
     test_listener_colliding_with_listen_port_is_refused();
     test_listener_colliding_with_rental_port_is_refused();

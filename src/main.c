@@ -563,11 +563,24 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
      * marketplace preference into a lost block. */
     if (budget_bytes > 0 && fixed_bytes > 0) {
         size_t budget = (size_t)budget_bytes;
-        pthread_mutex_lock(&s->lock);
-        size_t hwm_slot = cap_idx < PROP_PLAN_MAX_CAPS ? cap_idx : 0;
-        int is_new_high = fixed_bytes > s->prop_fixed_bytes_hwm[hwm_slot];
-        if (is_new_high) s->prop_fixed_bytes_hwm[hwm_slot] = fixed_bytes;
-        pthread_mutex_unlock(&s->lock);
+        /* ⛔ Unreachable today -- n_caps is bounded by listener_count, itself
+         * capped at STRATUM_MAX_LISTENERS -- but folding an out-of-range index
+         * into slot 0 would silently merge a foreign cap's fixed-cost history
+         * into the server-wide one and make this alarm lie in both directions.
+         * If that bound ever moves, say so and skip rather than corrupt. */
+        int is_new_high = 0;
+        if (cap_idx >= PROP_PLAN_MAX_CAPS) {
+            LOG_ERROR("proportional: cap index %zu is past PROP_PLAN_MAX_CAPS "
+                      "(%d) — byte-pressure alarm skipped for this plan rather "
+                      "than folded into another cap's high-water mark. This is "
+                      "a bug in the cap list, not a configuration problem.",
+                      cap_idx, (int)PROP_PLAN_MAX_CAPS);
+        } else {
+            pthread_mutex_lock(&s->lock);
+            is_new_high = fixed_bytes > s->prop_fixed_bytes_hwm[cap_idx];
+            if (is_new_high) s->prop_fixed_bytes_hwm[cap_idx] = fixed_bytes;
+            pthread_mutex_unlock(&s->lock);
+        }
         if (is_new_high) {
             size_t left = (fixed_bytes < budget) ? budget - fixed_bytes : 0;
             /* ⚠️ A BEST CASE, and labelled as one. It divides by the SMALLEST

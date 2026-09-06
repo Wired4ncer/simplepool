@@ -2243,6 +2243,12 @@ static void test_proportional_per_listener_cap_sets(void) {
         CHECK(obs.found_calls == i + 1);
         CHECK(obs.last_block_cap == expect_cap[i]);
         CHECK(obs.last_block_solo == 0);
+        /* All three rendered a shared PPLNS set -- c[2]'s orphan cap fell back
+         * to the default one, which is still a payout set. main.c uses this to
+         * tell "the ring lost a plan" (ledger diverging) from "no plan was
+         * ever built" (benign); asserting only the cap would let the two swap
+         * places unnoticed. */
+        CHECK(obs.last_block_had_payouts == 1);
     }
     CHECK(obs.rejects == 0);
 
@@ -2278,6 +2284,8 @@ static void test_proportional_per_listener_cap_sets(void) {
         free(out);
         CHECK(obs.last_block_solo == 1);
         CHECK(obs.last_block_cap == STRATUM_COINBASE_CAP_DEFAULT);
+        /* Solo renders no payout set at all: its coinbase pays itself. */
+        CHECK(obs.last_block_had_payouts == 0);
     }
     stratum_conn_free_for_test(cs);
 
