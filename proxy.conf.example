@@ -68,6 +68,23 @@ vardiff_window_sec = 30       # how often to retarget
 # listener = port=3335 min_diff=65536 label=braiins
 # listener = port=3336 min_diff=500000 label=nicehash
 #
+# max_coinbase_bytes=N overrides prop_max_coinbase_bytes for ONE port. The
+# server-wide budget exists for a marketplace verificator that refuses a
+# coinbase past ~815 B; direct rigs never had that limit, so the public port
+# can carry the wider coinbase (more payout slots per block) while the rental
+# port keeps the cap. 0 = uncapped; unset = inherit the server-wide value.
+#
+# The default listener (listen_port) cannot take a `listener` line, so the
+# recipe is: lift the server-wide budget and cap the RENTAL port --
+#
+#   prop_max_coinbase_bytes = 0
+#   listener = port=3335 min_diff=500000 max_coinbase_bytes=815 label=rental
+#
+# Each distinct cap is one more PPLNS plan (one more window walk) per template.
+#
+# WARNING: an order pointed at an uncapped port authorizes, idles and delivers
+# nothing -- silently. Publish the capped port as THE rental port.
+#
 # IMPORTANT — min_diff is KEPT even when the chain is easier than it, and
 # that costs blocks. Share difficulty is otherwise capped at the network
 # difficulty, because a miner filters locally against the stratum target and

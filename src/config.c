@@ -191,6 +191,18 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
         else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
         else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "max_coinbase_bytes") == 0) {
+            char *end = NULL;
+            long n = strtol(fv, &end, 10);
+            if (!*fv || !end || *end || n < 0 || n > 100000) {
+                set_err(errbuf, errlen,
+                        "listener max_coinbase_bytes must be an integer >= 0 "
+                        "(0 = uncapped), got '%s'", fv);
+                return -1;
+            }
+            out->has_max_coinbase_bytes = 1;
+            out->max_coinbase_bytes     = (int)n;
+        }
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
         else if (strcmp(fk, "mode")         == 0) {
             /* Only the two that mean something here. "proportional" is spelled

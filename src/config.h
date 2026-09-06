@@ -277,6 +277,12 @@ typedef struct {
      * binds. That turns an unbounded external dependency into a bounded
      * internal one we control. */
     int prop_max_coinbase_bytes;
+    /* ...and a listener may override it: with this at 0 and `listener =
+     * port=3335 ... max_coinbase_bytes=815`, the rental port keeps the cap
+     * while every other port carries the wider coinbase. (The default
+     * listener takes no `listener` line, hence that way round.) Each distinct
+     * cap costs one extra PPLNS plan -- one more window walk -- per
+     * template. See stratum_listener_t. */
     /* Floor on how far back the window reaches, in seconds. The window is
      * whichever is LARGER: prop_window_k blocks of work, or this many seconds
      * of shares.

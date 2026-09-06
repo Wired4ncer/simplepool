@@ -129,6 +129,11 @@ static size_t compute_merkle_branches_for_idx0(const uint8_t (*txids_le)[32],
 
 typedef struct {
     char            job_id[32];
+    /* The listener coinbase cap this plan was sized for, or
+     * STRATUM_COINBASE_CAP_DEFAULT for the server-wide budget. A found block
+     * carries the cap its connection rendered with, and settles against the
+     * plan with the same job_id AND cap -- the two differ in who was paid. */
+    int             cap;
     uint32_t        height;
     int64_t         reward_after_fee;
     pplns_payout_t  payouts[PROP_PLAN_MAX_PAY];
@@ -255,6 +260,7 @@ static double template_net_diff(const bitcoind_template_t *t) {
  * the operating value. */
 static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
                                             const proxy_config_t *cfg,
+                                            int budget_bytes,
                                             int fee_output,
                                             const size_t *size_hist,
                                             size_t hist_len,
@@ -290,7 +296,7 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
      * operator's byte budget. The weight limit above is consensus and is very
      * loose here (measured floor ~7,000 WU spare); this one is marketplace
      * compatibility, and it is the tight one. See prop_max_coinbase_bytes. */
-    if (cfg->prop_max_coinbase_bytes > 0) {
+    if (budget_bytes > 0) {
         /* Our first payout replaces the template's own spendable output, so
          * its size is a credit. An unreadable template leaves this 0, which
          * credits nothing and costs at most one slot -- the safe direction. */
@@ -301,7 +307,7 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
                               strlen(t->coinbasetxn_hex) / 2, slot_bytes,
                               ss_growth, size_hist, hist_len,
                               fee_output ? fee_txout_bytes : 0,
-                              (size_t)cfg->prop_max_coinbase_bytes, ceiling,
+                              (size_t)budget_bytes, ceiling,
                               out_predicted_bytes, out_fixed_bytes);
         if (by_bytes < n) n = by_bytes;
     }
@@ -359,9 +365,11 @@ static size_t prop_candidate_txout_hist(const pplns_addr_t *addrs,
  * reward all mean "cannot split this block safely". Paying the finder directly
  * is always valid and never custodial, so the pool keeps mining. */
 static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
-                          const char *job_id, prop_plan_t *plan) {
+                          const char *job_id, int cap, int budget_bytes,
+                          prop_plan_t *plan) {
     if (!s || !s->cfg || !s->store || !t || !plan) return -1;
     memset(plan, 0, sizeof *plan);
+    plan->cap = cap;
 
     if (!t->coinbasetxn_hex || !t->coinbasetxn_hex[0]) {
         LOG_WARN("proportional: template has no coinbasetxn (needs the enforcer "
@@ -484,7 +492,8 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                                                   cand_hist, PPLNS_TXOUT_HIST_LEN);
     size_t fee_bytes = prop_fee_txout_bytes(s->cfg, fee_sats > 0);
     size_t predicted_bytes = 0, fixed_bytes = 0;
-    size_t max_out = prop_max_outputs_for_template(t, s->cfg, fee_sats > 0,
+    size_t max_out = prop_max_outputs_for_template(t, s->cfg, budget_bytes,
+                                                   fee_sats > 0,
                                                    candidates ? cand_hist : NULL,
                                                    PPLNS_TXOUT_HIST_LEN,
                                                    fee_bytes, &headroom_wu,
@@ -511,8 +520,8 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
      * Nothing here refuses a template or changes a payout; a coinbase past the
      * budget is a perfectly valid block, and suppressing it would convert a
      * marketplace preference into a lost block. */
-    if (s->cfg->prop_max_coinbase_bytes > 0 && fixed_bytes > 0) {
-        size_t budget = (size_t)s->cfg->prop_max_coinbase_bytes;
+    if (budget_bytes > 0 && fixed_bytes > 0) {
+        size_t budget = (size_t)budget_bytes;
         pthread_mutex_lock(&s->lock);
         int is_new_high = fixed_bytes > s->prop_fixed_bytes_hwm;
         if (is_new_high) s->prop_fixed_bytes_hwm = fixed_bytes;
@@ -600,14 +609,14 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
      * the line made about it was false. n_eligible is an upper bound on what an
      * uncapped run would have emitted, so the line says how many cleared the
      * floor -- it does not assert an exact number of payouts lost. */
-    if (s->cfg->prop_max_coinbase_bytes > 0 &&
+    if (budget_bytes > 0 &&
         n_payouts == max_out && n_eligible > n_payouts) {
         LOG_INFO("coinbase byte budget is costing payouts: cap %zu reached, "
                  "%zu of %zu distinct candidates cleared the payout floor — "
                  "sized on the %zu largest, fee output %zu B, budget %d B. "
                  "The rest carry forward.",
                  max_out, n_eligible, candidates, max_out, fee_bytes,
-                 s->cfg->prop_max_coinbase_bytes);
+                 budget_bytes);
     }
 
     /* Conservation guard. A coinbase must pay the reward exactly: short and the
@@ -693,12 +702,11 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                      "not an upper bound — mining it anyway.",
                      actual_bytes, predicted_bytes, n_payouts);
         }
-        if (s->cfg->prop_max_coinbase_bytes > 0 &&
-            actual_bytes > (size_t)s->cfg->prop_max_coinbase_bytes) {
+        if (budget_bytes > 0 && actual_bytes > (size_t)budget_bytes) {
             LOG_WARN("coinbase is %zu B, past the %d B budget — a marketplace "
                      "verificator may refuse orders against this pool. Mining "
                      "it: the budget is a commercial preference, the block is "
-                     "money.", actual_bytes, s->cfg->prop_max_coinbase_bytes);
+                     "money.", actual_bytes, budget_bytes);
         }
         free(probe.cb1); free(probe.cb2);
     }
@@ -715,13 +723,16 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     LOG_INFO("proportional: %zu payout outputs over %.2f window difficulty "
              "(want %.1f x network %.2f = %.2f, floor %d s, window spans %llu s), "
              "reward-after-fee %lld sats, %zu deferred claims, "
-             "cap %zu of %d (weight headroom %lld WU), rotation %d",
+             "cap %zu of %d (weight headroom %lld WU), rotation %d, "
+             "byte budget %d%s",
              n_payouts, actual_diff, s->cfg->prop_window_k, net_diff, want_diff,
              s->cfg->prop_window_min_sec,
              (unsigned long long)((now - start_ms) / 1000),
              (long long)reward_after_fee, n_ledger_out,
              max_out, s->cfg->prop_max_outputs, (long long)headroom_wu,
-             s->cfg->prop_carry_slots);
+             s->cfg->prop_carry_slots, budget_bytes,
+             cap == STRATUM_COINBASE_CAP_DEFAULT ? " (server-wide)"
+                                                 : " (listener override)");
     return 0;
 }
 
@@ -861,24 +872,55 @@ static stratum_job_t *build_job_from_template(server_ctx_t *sctx,
      * A failure here is never fatal — the job goes out without a payout set and
      * stratum.c renders per-miner coinbases instead, which is what solo does. */
     if (sctx && strcmp(cfg->pool_mode, "proportional") == 0) {
-        prop_plan_t plan;
-        int prc = prop_build_plan(sctx, t, job_id, &plan);
-        if (prc == 0) {
-            coinbase_payout_t cb[PROP_PLAN_MAX_PAY];
-            for (size_t i = 0; i < plan.n_payouts; i++) {
-                cb[i].address = plan.payouts[i].address;
-                cb[i].sats    = plan.payouts[i].sats;
+        /* One plan per DISTINCT coinbase cap: the server-wide budget first
+         * (cap DEFAULT), then each listener whose max_coinbase_bytes differs
+         * from it. A listener that restates the server value gets no plan of
+         * its own -- its connections fall back to the default set in
+         * stratum.c and report DEFAULT when they find a block, so the settle
+         * below finds the right plan without a lookup table. Each extra cap
+         * is one more window walk per template; two is the expected case. */
+        int caps[STRATUM_MAX_LISTENERS + 1];
+        int budgets[STRATUM_MAX_LISTENERS + 1];
+        size_t n_caps = 0;
+        caps[n_caps] = STRATUM_COINBASE_CAP_DEFAULT;
+        budgets[n_caps++] = cfg->prop_max_coinbase_bytes;
+        for (int i = 0; i < cfg->listener_count; i++) {
+            const stratum_listener_t *l = &cfg->listeners[i];
+            if (!l->has_max_coinbase_bytes || l->solo) continue;
+            if (l->max_coinbase_bytes == cfg->prop_max_coinbase_bytes) continue;
+            int dup = 0;
+            for (size_t k = 1; k < n_caps; k++)
+                if (caps[k] == l->max_coinbase_bytes) { dup = 1; break; }
+            if (dup) continue;
+            caps[n_caps] = l->max_coinbase_bytes;
+            budgets[n_caps++] = l->max_coinbase_bytes;
+        }
+        for (size_t k = 0; k < n_caps; k++) {
+            prop_plan_t plan;
+            int prc = prop_build_plan(sctx, t, job_id, caps[k], budgets[k], &plan);
+            if (prc == 0) {
+                coinbase_payout_t cb[PROP_PLAN_MAX_PAY];
+                for (size_t i = 0; i < plan.n_payouts; i++) {
+                    cb[i].address = plan.payouts[i].address;
+                    cb[i].sats    = plan.payouts[i].sats;
+                }
+                int arc = (caps[k] == STRATUM_COINBASE_CAP_DEFAULT)
+                        ? stratum_job_set_payouts(job, cb, plan.n_payouts)
+                        : stratum_job_add_payouts_for_cap(job, caps[k], cb,
+                                                          plan.n_payouts);
+                if (arc < 0) {
+                    LOG_WARN("proportional: attaching payouts (cap %d) to job "
+                             "%s failed; connections on that cap use the "
+                             "default set", caps[k], job_id);
+                    prop_plan_clear(&plan);
+                } else {
+                    prop_plan_remember(sctx, &plan);
+                }
+            } else if (prc < 0) {
+                LOG_WARN("proportional: plan build (cap %d) errored for job %s; "
+                         "connections on that cap use the default set",
+                         caps[k], job_id);
             }
-            if (stratum_job_set_payouts(job, cb, plan.n_payouts) < 0) {
-                LOG_WARN("proportional: attaching payouts to job %s failed; "
-                         "this template pays the finder directly", job_id);
-                prop_plan_clear(&plan);
-            } else {
-                prop_plan_remember(sctx, &plan);
-            }
-        } else if (prc < 0) {
-            LOG_WARN("proportional: plan build errored for job %s; "
-                     "this template pays the finder directly", job_id);
         }
     }
     return job;
@@ -1200,7 +1242,7 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
                               const char *block_hash,
                               int64_t reward_sats, int64_t fee_sats,
                               int accepted, const char *submit_error,
-                              int solo) {
+                              int solo, int coinbase_cap) {
     server_ctx_t *s = (server_ctx_t *)ctx;
     /* Accepted only makes it a candidate the chain has not rejected — it is
      * still 'pending' until something verifies the block is in the chain.
@@ -1255,9 +1297,16 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         memset(&settled, 0, sizeof settled);
         int found = 0;
         pthread_mutex_lock(&s->lock);
+        /* Same job AND same cap: the job may carry several plans, one per
+         * listener cap, and they paid different people. stratum.c reports the
+         * cap it actually rendered with (a cap with no set fell back to
+         * DEFAULT there), so an exact match is the only correct one. The
+         * sibling plans for this job are left to age out of the ring -- they
+         * describe coinbases nobody mined. */
         for (size_t i = 0; i < PROP_PLAN_RING; i++) {
             prop_plan_t *p = &s->prop_plans[i];
-            if (p->job_id[0] && strcmp(p->job_id, job_id) == 0) {
+            if (p->job_id[0] && strcmp(p->job_id, job_id) == 0 &&
+                p->cap == coinbase_cap) {
                 settled = *p;            /* takes the carry allocation */
                 memset(p, 0, sizeof *p); /* consumed: never settle it twice */
                 found = 1;
@@ -1282,9 +1331,10 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
             }
             prop_plan_clear(&settled);
         } else {
-            LOG_INFO("proportional: block %s came from job %s, which had no "
-                     "payout plan — its coinbase paid the finder directly",
-                     block_hash ? block_hash : "?", job_id);
+            LOG_INFO("proportional: block %s came from job %s with no payout "
+                     "plan for coinbase cap %d — its coinbase paid the finder "
+                     "directly", block_hash ? block_hash : "?", job_id,
+                     coinbase_cap);
         }
     }
     /* pool:blocks carries solved blocks. A candidate the node refused is not

@@ -48,6 +48,7 @@ typedef struct {
     int    last_solo;
     int    solo_shares;
     int    last_block_solo;
+    int    last_block_cap;
     /* Reject instrumentation. Asserting on these is what keeps the
      * classification honest: "a stale reject arrived" would pass on a build
      * that labelled every one of them the same way. */
@@ -111,10 +112,12 @@ static int on_block(void *ctx, const char *hex, char *errbuf, size_t errlen) {
 static void on_block_found(void *ctx, const char *w, const char *addr,
                            uint64_t ts, uint32_t height, const char *job_id,
                            const char *hash, int64_t reward, int64_t fee,
-                           int accepted, const char *submit_error, int solo) {
+                           int accepted, const char *submit_error, int solo,
+                           int coinbase_cap) {
     (void)w; (void)addr; (void)ts; (void)height; (void)job_id; (void)hash;
     (void)reward; (void)fee;
     obs_t *o = ctx;
+    o->last_block_cap = coinbase_cap;
     /* Recorded so a test can assert which SCHEME solved the block, not merely
      * that one was found. The settle gate in main.c reads exactly this flag. */
     o->last_block_solo = solo;
@@ -2127,6 +2130,123 @@ static void test_proportional_shared_coinbase(void) {
     for (int i = 0; i < 2; i++) stratum_conn_free_for_test(c[i]);
     stratum_server_free(s);
     printf("ok: proportional shares one coinbase across miners\n");
+}
+
+#define PROP_ADDR_C "bcrt1q2424242424242424242424242424242406xw5p"  /* 0x55*20 */
+
+/* A job may carry one payout set per listener coinbase cap. A connection
+ * renders the set for ITS listener's cap, falls back to the default set when
+ * the job has none for that cap, and -- the part the settle depends on --
+ * reports the cap it actually RENDERED with when it finds a block, not the
+ * one its listener asked for. Asserting only the render would pass on a build
+ * that settled every block against the default plan. */
+static void test_proportional_per_listener_cap_sets(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 3, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block,
+                          .on_block_found = on_block_found };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_mode, sizeof(cfg.pool_mode), "proportional");
+    stratum_server_t *s = NULL;
+    CHECK(stratum_server_start(&cfg, &s) == 0);
+    if (!s) return;
+
+    /* Default (capped) set pays two; the uncapped set pays three. Both sum to
+     * the full reward so the builder's conservation check passes. */
+    coinbase_payout_t capped[2] = {
+        { PROP_ADDR_A, 3000000000LL },
+        { PROP_ADDR_B, 2000000000LL },
+    };
+    coinbase_payout_t wide_v1[3] = {
+        { PROP_ADDR_A, 2000000000LL },
+        { PROP_ADDR_B, 2000000000LL },
+        { PROP_ADDR_C, 1000000000LL },
+    };
+    coinbase_payout_t wide[2] = {
+        { PROP_ADDR_A, 3000000000LL },
+        { PROP_ADDR_C, 2000000000LL },
+    };
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_prop_job("P1", net);
+    CHECK(job != NULL);
+    CHECK(stratum_job_set_payouts(job, capped, 2) == 0);
+    /* Adding the same cap twice REPLACES: the job must not carry a stale set
+     * beside the live one. */
+    CHECK(stratum_job_add_payouts_for_cap(job, 0, wide_v1, 3) == 0);
+    CHECK(stratum_job_add_payouts_for_cap(job, 0, wide, 2) == 0);
+    /* cap DEFAULT through the add API is the default set. */
+    CHECK(stratum_job_add_payouts_for_cap(job, STRATUM_COINBASE_CAP_DEFAULT,
+                                          capped, 2) == 0);
+    stratum_server_set_job(s, job, 1);
+
+    /* c[0]: default listener. c[1]: listener uncapped (a set exists).
+     * c[2]: listener capped at 700 -- no set for it, must fall back. */
+    stratum_listener_t uncapped = { .port = 3334, .has_max_coinbase_bytes = 1,
+                                    .max_coinbase_bytes = 0 };
+    stratum_listener_t orphan   = { .port = 3337, .has_max_coinbase_bytes = 1,
+                                    .max_coinbase_bytes = 700 };
+    char cb2[3][4096] = {{0}}, cb1[3][4096] = {{0}};
+    stratum_conn_t *c[3];
+    for (int i = 0; i < 3; i++) {
+        c[i] = stratum_conn_new_for_test(s);
+        if (i == 1) stratum_conn_apply_listener_for_test(c[i], &uncapped);
+        if (i == 2) stratum_conn_apply_listener_for_test(c[i], &orphan);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}", &out, &olen);
+        free(out); out = NULL; olen = 0;
+        char auth[256];
+        snprintf(auth, sizeof auth,
+            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",
+            PROP_ADDR_B);
+        stratum_handle_message(s, c[i], auth, &out, &olen);
+        CHECK(out != NULL);
+        CHECK(notify_coinbase(out, cb1[i], sizeof cb1[i],
+                              cb2[i], sizeof cb2[i]) == 0);
+        free(out);
+    }
+    CHECK(stratum_conn_coinbase_cap_for_test(c[0]) == STRATUM_COINBASE_CAP_DEFAULT);
+    CHECK(stratum_conn_coinbase_cap_for_test(c[1]) == 0);
+    CHECK(stratum_conn_coinbase_cap_for_test(c[2]) == 700);
+
+    /* Default listener: the capped set, A + B, no C. */
+    CHECK(strstr(cb2[0], "3333333333333333333333333333333333333333") != NULL);
+    CHECK(strstr(cb2[0], "4444444444444444444444444444444444444444") != NULL);
+    CHECK(strstr(cb2[0], "5555555555555555555555555555555555555555") == NULL);
+    /* Uncapped listener: the REPLACED wide set, A + C, and no B -- so the
+     * stale first set is gone, not merely shadowed. */
+    CHECK(strstr(cb2[1], "3333333333333333333333333333333333333333") != NULL);
+    CHECK(strstr(cb2[1], "5555555555555555555555555555555555555555") != NULL);
+    CHECK(strstr(cb2[1], "4444444444444444444444444444444444444444") == NULL);
+    CHECK(strcmp(cb2[0], cb2[1]) != 0);
+    /* A cap with no set renders the default set, byte for byte. */
+    CHECK(strcmp(cb2[0], cb2[2]) == 0);
+
+    /* Every share is a block here. The callback must carry the cap that was
+     * RENDERED: 0 for the uncapped port, DEFAULT for the default port AND for
+     * the orphan cap that fell back -- its listener said 700, its coinbase
+     * did not. */
+    const int expect_cap[3] = { STRATUM_COINBASE_CAP_DEFAULT, 0,
+                                STRATUM_COINBASE_CAP_DEFAULT };
+    for (int i = 0; i < 3; i++) {
+        char *out = NULL; size_t olen = 0;
+        char sub[256];
+        snprintf(sub, sizeof sub,
+            "{\"id\":3,\"method\":\"mining.submit\","
+            "\"params\":[\"w%d\",\"P1\",\"" TEST_EN2 "\",\"60000000\",\"0000000%d\"]}",
+            i, i + 1);
+        CHECK(stratum_handle_message(s, c[i], sub, &out, &olen) == 0);
+        free(out);
+        CHECK(obs.found_calls == i + 1);
+        CHECK(obs.last_block_cap == expect_cap[i]);
+        CHECK(obs.last_block_solo == 0);
+    }
+    CHECK(obs.rejects == 0);
+
+    for (int i = 0; i < 3; i++) stratum_conn_free_for_test(c[i]);
+    stratum_server_free(s);
+    printf("ok: proportional renders and reports per-listener cap sets\n");
 }
 
 /* With no payout set attached — no PPLNS window yet — proportional mode must
@@ -4254,6 +4374,7 @@ int main(void) {
     test_authorize_without_hint_uses_initial();
     test_proportional_shared_coinbase();
     test_proportional_falls_back_without_window();
+    test_proportional_per_listener_cap_sets();
     test_extranonce1_is_one_sequence_per_server();
     test_listener_policy_reaches_the_connection();
     test_listener_floor_beats_the_server_wide_floor();
