@@ -184,6 +184,14 @@ struct stratum_job {
      * address strings are owned by the job. */
     coinbase_payout_t *payouts;
     size_t             n_payouts;
+    /* Alternative payout sets, one per listener coinbase cap that differs
+     * from the server-wide budget. See stratum_job_add_payouts_for_cap. */
+    struct {
+        int                cap;
+        coinbase_payout_t *payouts;
+        size_t             n_payouts;
+    } payout_sets[STRATUM_MAX_LISTENERS];
+    size_t n_payout_sets;
 
     uint64_t created_ms;    /* for retention ring */
 
@@ -287,6 +295,11 @@ static void job_destroy(stratum_job_t *j) {
         for (size_t i = 0; i < j->n_payouts; ++i) free((char *)j->payouts[i].address);
         free(j->payouts);
     }
+    for (size_t k = 0; k < j->n_payout_sets; ++k) {
+        for (size_t i = 0; i < j->payout_sets[k].n_payouts; ++i)
+            free((char *)j->payout_sets[k].payouts[i].address);
+        free(j->payout_sets[k].payouts);
+    }
     free(j);
 }
 
@@ -341,6 +354,65 @@ int stratum_job_set_payouts(stratum_job_t *j,
     return 0;
 }
 
+int stratum_job_add_payouts_for_cap(stratum_job_t *j, int cap,
+                                    const coinbase_payout_t *payouts,
+                                    size_t n_payouts)
+{
+    if (!j || !payouts || n_payouts == 0) return -1;
+    if (cap == STRATUM_COINBASE_CAP_DEFAULT)
+        return stratum_job_set_payouts(j, payouts, n_payouts);
+    size_t slot = j->n_payout_sets;
+    for (size_t k = 0; k < j->n_payout_sets; ++k)
+        if (j->payout_sets[k].cap == cap) { slot = k; break; }
+    if (slot >= STRATUM_MAX_LISTENERS) return -1;
+
+    coinbase_payout_t *copy = calloc(n_payouts, sizeof(*copy));
+    if (!copy) return -1;
+    for (size_t i = 0; i < n_payouts; ++i) {
+        copy[i].address = strdup(payouts[i].address ? payouts[i].address : "");
+        if (!copy[i].address) {
+            for (size_t k = 0; k < i; ++k) free((char *)copy[k].address);
+            free(copy);
+            return -1;
+        }
+        copy[i].sats = payouts[i].sats;
+    }
+    if (slot < j->n_payout_sets) {
+        for (size_t i = 0; i < j->payout_sets[slot].n_payouts; ++i)
+            free((char *)j->payout_sets[slot].payouts[i].address);
+        free(j->payout_sets[slot].payouts);
+    } else {
+        j->n_payout_sets++;
+    }
+    j->payout_sets[slot].cap       = cap;
+    j->payout_sets[slot].payouts   = copy;
+    j->payout_sets[slot].n_payouts = n_payouts;
+    return 0;
+}
+
+/* The payout set a connection renders: its listener's cap if the job carries
+ * a set for it, else the default. ⛔ The block-found callback reports the cap
+ * the SAME way (a cap with no set falls back to DEFAULT there too), so the
+ * plan main.c settles is the one that was mined. Change both or neither. */
+static void job_payouts_for_cap(const stratum_job_t *job, int cap,
+                                const coinbase_payout_t **out, size_t *n,
+                                int *cap_used)
+{
+    if (cap != STRATUM_COINBASE_CAP_DEFAULT) {
+        for (size_t k = 0; k < job->n_payout_sets; ++k) {
+            if (job->payout_sets[k].cap == cap && job->payout_sets[k].n_payouts) {
+                *out = job->payout_sets[k].payouts;
+                *n   = job->payout_sets[k].n_payouts;
+                *cap_used = cap;
+                return;
+            }
+        }
+    }
+    *out = job->payouts;
+    *n   = job->n_payouts;
+    *cap_used = STRATUM_COINBASE_CAP_DEFAULT;
+}
+
 /* ============================================================ server ==== */
 
 struct stratum_server {
@@ -388,6 +460,21 @@ struct stratum_server {
      * the process now. It was hoisted into a shared object only because two
      * servers each seeding from the clock handed out overlapping values. */
     atomic_uint extranonce1_seq;
+    /* Largest coinbase, in bytes, rendered so far on a connection whose
+     * listener declares max_coinbase_bytes but whose coinbase is NOT sized by
+     * the payout budget -- solo, PPS, and the proportional fallback. Warning
+     * only on a new high keeps one line per growth step instead of one per
+     * template, matching the byte-pressure alarm in main.c. Re-arms at
+     * startup, so the journal always records where the pool stands.
+     *
+     * ⚠️ ONE high-water for the whole server. With two such listeners at
+     * DIFFERENT ceilings, a render that trips the higher one first can mask a
+     * later, smaller render that trips the lower one. Accepted: the pool has
+     * one solo port, and an alarm that under-reports a hypothetical second is
+     * better than per-listener state threaded through the test accessors.
+     * Revisit if a second capped non-PPLNS listener ever exists. */
+    atomic_int  cb_ceiling_hwm;
+    atomic_int  cb_ceiling_warnings;
 
     /* Share dedupe, keyed on the resulting block-header hash. The
      * per-connection ring in stratum_conn cannot catch a duplicate that
@@ -484,6 +571,10 @@ struct stratum_conn {
      * config reload cannot move a live connection between payout schemes
      * mid-session. */
     int      pol_solo;
+    /* The listener's coinbase byte cap, or STRATUM_COINBASE_CAP_DEFAULT when
+     * it sets none. Selects which of the job's payout sets this connection
+     * renders, and travels with a found block so the matching plan settles. */
+    int      pol_coinbase_cap;
 
     int      subscribed;
     int      authorized;
@@ -971,6 +1062,12 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc;
+    /* Which PPLNS payout set this connection carries: its listener's cap if
+     * the job has one for it, else the job's default. Resolved up front so the
+     * branch below reads like the solo/PPS ones. */
+    const coinbase_payout_t *prop_payouts = NULL; size_t prop_n = 0; int prop_cap = 0;
+    if (s->prop_enabled && !c->pol_solo)
+        job_payouts_for_cap(job, c->pol_coinbase_cap, &prop_payouts, &prop_n, &prop_cap);
     if (s->cfg.pps_enabled) {
         /* PPS-classic: every miner's coinbase is identical, paying the
          * pool's BTC wallet for the net-of-fee reward and the operator
@@ -992,9 +1089,8 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                                       job->en1_size, job->en2_size,
                                       &parts, NULL, NULL, err, sizeof err);
         }
-    } else if (s->prop_enabled && !c->pol_solo &&
-               job->payouts && job->n_payouts > 0 &&
-               job->coinbasetxn_hex) {
+    } else if (s->prop_enabled && !c->pol_solo && job->coinbasetxn_hex &&
+               prop_payouts && prop_n > 0) {
         /* pool_mode=proportional: one coinbase per template, shared by every
          * connection, paying the PPLNS window's shareholders directly. Sessions
          * differ only by extranonce1, so this render is identical for all of
@@ -1005,7 +1101,7 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
          * reward; the builder re-checks and refuses rather than emitting a
          * coinbase that pays the wrong total. */
         rc = coinbase_build_from_template_multi(job->coinbasetxn_hex,
-                                          job->payouts, job->n_payouts,
+                                          prop_payouts, prop_n,
                                           s->cfg.operator_address, s->cfg.fee_bps,
                                           s->cfg.coinbase_tag,
                                           job->en1_size, job->en2_size,
@@ -1045,6 +1141,49 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                  c->worker_name, err);
         return -1;
     }
+    /* MARKETPLACE CEILING on a coinbase nothing trims.
+     *
+     * A PPLNS coinbase is sized to the byte budget: main.c picks how many
+     * payout outputs fit and alarms when the budget costs someone a payout.
+     * The renders that reach here with a cap on their listener have no such
+     * dial -- solo pays exactly one address, so its coinbase is the template
+     * plus two outputs and NOTHING can make it smaller. It is ~500 B today
+     * against an 815 B ceiling, purely because the template is small.
+     *
+     * ⛔ That is the whole reason this exists. When drivechain OP_RETURNs grow
+     * past the ceiling there is no failure to see: a marketplace order handed
+     * an over-size job authorizes, sits idle and delivers nothing, and the
+     * pool logs nothing because from its side the block is perfectly valid.
+     * The alarm is the only thing between that and a port that quietly stops
+     * earning. It never refuses a template -- an over-size coinbase is still
+     * money, and suppressing it would turn a commercial preference into a lost
+     * block, the same rule the byte budget itself carries. */
+    if (c->pol_coinbase_cap > 0 && prop_n == 0) {
+        size_t cb_bytes = parts.cb1_len + job->en1_size + job->en2_size +
+                          parts.cb2_len;
+        int prev = atomic_load(&s->cb_ceiling_hwm);
+        int is_new_high = 0;
+        while ((int)cb_bytes > prev) {
+            if (atomic_compare_exchange_weak(&s->cb_ceiling_hwm, &prev,
+                                             (int)cb_bytes)) {
+                is_new_high = 1;
+                break;
+            }
+        }
+        if (is_new_high && (int)cb_bytes > c->pol_coinbase_cap) {
+            atomic_fetch_add(&s->cb_ceiling_warnings, 1);
+            LOG_WARN("coinbase byte ceiling: port %d rendered %zu B against its "
+                     "%d B max_coinbase_bytes, %zu B over. This port's coinbase "
+                     "pays ONE address, so no payout budget trims it and it "
+                     "will only grow with the template's drivechain "
+                     "OP_RETURNs. A marketplace order here may now be handed "
+                     "work its verificator refuses -- which looks like an idle "
+                     "order, not an error. Mining it regardless.",
+                     c->pol_port, cb_bytes, c->pol_coinbase_cap,
+                     cb_bytes - (size_t)c->pol_coinbase_cap);
+        }
+    }
+
     free(c->cb1); free(c->cb2);
     c->cb1 = parts.cb1; c->cb1_len = parts.cb1_len;
     c->cb2 = parts.cb2; c->cb2_len = parts.cb2_len;
@@ -2969,11 +3108,26 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
             if (fee_sats < 546) fee_sats = 0; /* matches coinbase dust rule */
         }
         int64_t reward_sats = job->value_sats - fee_sats;
+        /* Report the cap this connection RENDERED with, not merely the one its
+         * listener asked for -- a cap with no payout set fell back to the
+         * default set, and the settle must follow it there.
+         *
+         * A SOLO connection rendered no payout set at all (its coinbase pays
+         * itself), so it reports DEFAULT. main.c gates settling on !solo and
+         * would ignore the value either way; stating it here keeps the field's
+         * meaning true rather than true-by-accident, because a solo listener
+         * CAN carry max_coinbase_bytes and reporting it would read as "this
+         * block settled the 815 B plan". */
+        const coinbase_payout_t *fp = NULL; size_t fn = 0;
+        int found_cap = STRATUM_COINBASE_CAP_DEFAULT;
+        if (s->prop_enabled && !c->pol_solo)
+            job_payouts_for_cap(job, c->pol_coinbase_cap, &fp, &fn, &found_cap);
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,
                               c->payout_address, ts_now, job->height,
                               job->job_id, block_hash_hex,
                               reward_sats, fee_sats,
-                              block_accepted, submit_err, c->pol_solo);
+                              block_accepted, submit_err, c->pol_solo,
+                              found_cap, fn > 0);
     }
     return emit_response(buf, len, id, cJSON_CreateTrue(), NULL);
 }
@@ -3099,6 +3253,7 @@ int stratum_handle_message(stratum_server_t *s, stratum_conn_t *c,
 
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s) {
     stratum_conn_t *c = calloc(1, sizeof(*c));
+    if (c) c->pol_coinbase_cap = STRATUM_COINBASE_CAP_DEFAULT;
     if (!c) return NULL;
     c->server = s;
     c->fd = -1;
@@ -3600,6 +3755,9 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
     c->pol_port = pol->port;
     c->pol_solo = pol->solo;
+    c->pol_coinbase_cap = pol->has_max_coinbase_bytes
+                        ? pol->max_coinbase_bytes
+                        : STRATUM_COINBASE_CAP_DEFAULT;
     snprintf(c->pol_label, sizeof c->pol_label, "%s", pol->label);
     /* Before authorize the connection has no assigned difficulty yet, so
      * seeding it here keeps a subscribe-only conn reporting its port's value
@@ -3610,6 +3768,14 @@ static void conn_apply_listener(stratum_conn_t *c,
 void stratum_conn_apply_listener_for_test(stratum_conn_t *c,
                                           const stratum_listener_t *pol) {
     conn_apply_listener(c, pol);
+}
+
+int stratum_conn_coinbase_cap_for_test(const stratum_conn_t *c) {
+    return c ? c->pol_coinbase_cap : STRATUM_COINBASE_CAP_DEFAULT;
+}
+
+int stratum_cb_ceiling_warnings_for_test(const stratum_server_t *s) {
+    return s ? atomic_load(&s->cb_ceiling_warnings) : 0;
 }
 
 static void *listener_thread(void *arg) {
@@ -3718,6 +3884,8 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     s->start_ms = now_ms();
 
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
+    atomic_init(&s->cb_ceiling_hwm, 0);
+    atomic_init(&s->cb_ceiling_warnings, 0);
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
     pthread_mutex_init(&s->auth_fail_lock, NULL);
 

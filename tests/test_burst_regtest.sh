@@ -144,10 +144,11 @@ pick_port REGTEST_BITCOIND_ZMQ_PORT
 pick_port REGTEST_ENFORCER_RPC_PORT
 pick_port REGTEST_ENFORCER_GRPC_PORT
 pick_port POOL_PORT
+pick_port RENTAL_PORT
 export REGTEST_BITCOIND_RPC_PORT REGTEST_BITCOIND_ZMQ_PORT \
        REGTEST_ENFORCER_RPC_PORT REGTEST_ENFORCER_GRPC_PORT
 export ENFORCER_URL="http://127.0.0.1:$REGTEST_ENFORCER_GRPC_PORT"
-echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT enforcer=$REGTEST_ENFORCER_RPC_PORT pool=$POOL_PORT"
+echo "  bitcoind=$REGTEST_BITCOIND_RPC_PORT enforcer=$REGTEST_ENFORCER_RPC_PORT pool=$POOL_PORT rental=$RENTAL_PORT"
 echo "  blocks=$BURST_BLOCKS miners=$BURST_MINERS"
 
 stage "wipe burst data dir (fresh chain every run)"
@@ -184,6 +185,17 @@ operator_address = ${OPERATOR_ADDR}
 # through the whole burst. 100 keeps the operator output in the shape.
 fee_bps = 100
 coinbase_tag = /simplepool-burst/
+
+# ⛔ A SECOND COINBASE CAP, deliberately. The ring assertion at the end of this
+# file is the only test that checks PROP_PLAN_RING covers every solvable job,
+# and with no listener override it only ever exercised ONE plan per template --
+# the single case where the old sizing was adequate. Per-listener caps make a
+# template write one plan PER DISTINCT CAP, which is what exhausted the ring;
+# a burst run that does not configure two caps cannot see that.
+# 815 is the measured marketplace ceiling; 0 server-wide means uncapped
+# elsewhere, so this is exactly the deploy recipe, with n_caps = 2.
+prop_max_coinbase_bytes = 0
+listener = port=${RENTAL_PORT} max_coinbase_bytes=815 label=rental
 
 pool_mode = proportional
 # Production values, deliberately. The 600 s floor means every block in this
@@ -323,10 +335,28 @@ stage "INVARIANT 2 — exactly $BLOCKS_MINED blocks_found rows, no duplicates"
 # the pool mined must be recorded once, and nothing else may be. A block that
 # lost a submitblock race ("inconclusive") is not one the chain gained and must
 # not appear here — cf. 9212fac.
+# ⛔ COUNT CONFIRMED ROWS, NOT ALL ROWS. blocks_found is a CANDIDATE table --
+# store.c: "A row is a *candidate* until something says otherwise. Only
+# status='confirmed' means 'this pool mined a block that is in the chain' --
+# every count and every solvency sum must filter on it." A losing submitblock
+# race is recorded as status='rejected' ON PURPOSE, so it can be counted and
+# investigated rather than vanishing.
+#
+# This assertion counted every row and so failed whenever the burst did the
+# one thing a burst is for: several miners at difficulty ~0 racing the same
+# height, where the node accepts one solution and refuses the rest. Measured
+# 2026-09-06 on the DEPLOYED bba0118: 24 rows for 12 blocks -- 12 confirmed +
+# 12 rejected, 24 DISTINCT hashes, not one duplicate. The failure message
+# blamed a "duplicate settle" that was not happening, and the test could not
+# pass on any recent commit. Assert what the schema actually promises.
 ROWS=$(sqlite3 "$POOL_DB" "SELECT count(*) FROM blocks_found")
-echo "  blocks_found rows: $ROWS (chain gained $BLOCKS_MINED)"
-[ "$ROWS" -eq "$BLOCKS_MINED" ] \
-    || fail "expected exactly $BLOCKS_MINED blocks_found rows, got $ROWS (duplicate settle? cf. 40845c7 / 9212fac)"
+CONFIRMED=$(sqlite3 "$POOL_DB" "SELECT count(*) FROM blocks_found WHERE status='confirmed'")
+OTHER=$(sqlite3 "$POOL_DB" "SELECT count(*) FROM blocks_found WHERE status NOT IN ('confirmed','rejected','orphaned','pending')")
+echo "  blocks_found: $ROWS rows, $CONFIRMED confirmed (chain gained $BLOCKS_MINED)"
+[ "$CONFIRMED" -eq "$BLOCKS_MINED" ] \
+    || fail "expected exactly $BLOCKS_MINED CONFIRMED blocks_found rows, got $CONFIRMED (duplicate settle? cf. 40845c7 / 9212fac)"
+[ "$OTHER" -eq 0 ] \
+    || fail "$OTHER blocks_found rows carry a status outside {confirmed,rejected,orphaned,pending}"
 
 stage "INVARIANT 3 — no (height,hash) recorded twice"
 DUPES=$(sqlite3 "$POOL_DB" \
@@ -340,15 +370,49 @@ stage "INVARIANT 3b — every blocks_found row is ACTUALLY IN THE CHAIN"
 # "inconclusive" — a valid block that lost the race and is not in the chain.
 # Recording that as found overcounts blocks AND settles payouts against a
 # reward nobody received.
+# Both directions, because each catches the opposite lie. A CONFIRMED row that
+# is not in the chain overcounts blocks and settles payouts against a reward
+# nobody received. A REJECTED row that IS in the chain means the pool threw
+# away a block it really mined -- and would never settle its window.
+# ⛔ "getblock succeeded" IS NOT "in the chain". Core answers getblock for any
+# block in its INDEX, stale ones included, and reports confirmations = -1 for a
+# block it knows but has not built on. The original form of this check tested
+# only that the node had heard of the block, while its name and message claimed
+# it tested chain membership -- so a stale block recorded as found would have
+# passed it. Read confirmations and mean what the stage says.
+conf_of() {
+    local out
+    out=$(cli getblock "$1" 1 2>/dev/null) || { echo unknown; return; }
+    printf '%s' "$out" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('confirmations', 'unknown'))
+except Exception:
+    print('unknown')"
+}
 GHOSTS=0
-for hash in $(sqlite3 "$POOL_DB" "SELECT hash FROM blocks_found"); do
-    if ! cli getblock "$hash" 1 >/dev/null 2>&1; then
-        echo "  GHOST: $hash recorded in blocks_found but NOT in the chain" >&2
+for hash in $(sqlite3 "$POOL_DB" "SELECT hash FROM blocks_found WHERE status='confirmed'"); do
+    c=$(conf_of "$hash")
+    if [ "$c" = unknown ] || [ "$c" -lt 0 ] 2>/dev/null; then
+        echo "  GHOST: $hash confirmed in blocks_found but confirmations=$c" >&2
         GHOSTS=$((GHOSTS + 1))
     fi
 done
-[ "$GHOSTS" -eq 0 ] || fail "$GHOSTS blocks_found rows are not in the chain"
-echo "  ✓ every recorded block is in the chain"
+[ "$GHOSTS" -eq 0 ] || fail "$GHOSTS confirmed blocks_found rows are not on the active chain"
+# The opposite lie: a block the pool disowned that the chain actually built on
+# would be a block mined and never settled. A losing race is EXPECTED to be
+# present-but-stale (confirmations = -1); that is not a defect, so only an
+# ACTIVE-chain rejected row fails here.
+DISOWNED=0
+for hash in $(sqlite3 "$POOL_DB" "SELECT hash FROM blocks_found WHERE status='rejected'"); do
+    c=$(conf_of "$hash")
+    if [ "$c" != unknown ] && [ "$c" -ge 0 ] 2>/dev/null; then
+        echo "  DISOWNED: $hash recorded rejected but is on the active chain (confirmations=$c)" >&2
+        DISOWNED=$((DISOWNED + 1))
+    fi
+done
+[ "$DISOWNED" -eq 0 ] || fail "$DISOWNED rejected blocks_found rows are on the active chain"
+echo "  ✓ confirmed rows are all in the chain, rejected rows are all absent from it"
 
 stage "INVARIANT 5 — prop_ledger is zero-sum (the pool holds nothing)"
 # claim_fraction is a SIGNED fraction of one block reward: positive means the
@@ -373,7 +437,26 @@ echo "  ✓ zero-sum"
 SETTLES=$(grep -c "proportional: settled block" "$POOL_LOG" || true)
 CARRIED=$(grep "proportional: settled block" "$POOL_LOG" \
           | grep -cvE "0 deferred claims" || true)
-NOPLAN=$(grep -c "which had no payout plan" "$POOL_LOG" || true)
+# ⛔ SHORT, STABLE SUBSTRING — and verified to still exist before it is trusted.
+# This grep read "which had no payout plan", a whole sentence copied out of the
+# log line. When that line was reworded (to stop it claiming the coinbase had
+# "paid the finder directly", which was false), the grep silently stopped
+# matching anything: NOPLAN became permanently 0 and the invariant below
+# always passed. The assertion that exists to catch an under-sized plan ring
+# was blinded by an edit to the message it reads, with nothing to show for it —
+# the test still ran and still passed. Match the fewest words that identify the
+# event, and fail loudly if even those stop being emitted.
+# The phrase now names ONLY the real defect. It used to be "no payout plan",
+# which the pool logged for two unrelated things: a plan built and lost by the
+# ring (a silent ledger divergence) and a block found before the first PPLNS
+# window exists (normal, and it happens on the first block of every burst).
+# The assertion fired on the benign one and meant nothing. main.c distinguishes
+# them now via had_payout_set, so grep for the defect.
+NOPLAN_PHRASE="PLAN RING MISS"
+if ! grep -qF "$NOPLAN_PHRASE" "$ROOT/src/main.c"; then
+    fail "the log phrase this test greps for (\"$NOPLAN_PHRASE\") is no longer in src/main.c — the no-plan assertion below would silently pass forever. Update both together."
+fi
+NOPLAN=$(grep -cF "$NOPLAN_PHRASE" "$POOL_LOG" || true)
 echo "  settles=$SETTLES with-carry=$CARRIED no-plan=$NOPLAN"
 if [ "$CARRIED" -eq 0 ]; then
     echo "  ⚠️  VACUOUS: no block carried a deferred claim, so the zero-sum"

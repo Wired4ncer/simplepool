@@ -132,9 +132,36 @@ typedef struct {
      * payout schemes. A port is unambiguous, and the miner opts in by pointing
      * their machine somewhere different. */
     int    solo;
+    /* PER-PORT COINBASE BYTE BUDGET. Set by `listener = port=3334
+     * max_coinbase_bytes=0`. The server-wide prop_max_coinbase_bytes exists
+     * for ONE client -- a marketplace's job verificator refuses a coinbase
+     * past ~815 B -- yet it prices every connection as if it were that client,
+     * and a direct rig on the public port loses the same payout slots for a
+     * limit it never had. This lets the rental port keep its cap while the
+     * others carry the wider coinbase.
+     *
+     * has_max_coinbase_bytes=0 (the default, and the zero-initialised default
+     * listener) means INHERIT the server-wide value. With it set, 0 means
+     * uncapped and N means N bytes. The flag exists because 0 is a meaningful
+     * value: a zeroed struct must inherit, never silently uncap.
+     *
+     * ⚠️ Nothing stops a renter pointing an order at an uncapped port, and a
+     * NiceHash order handed an over-size job authorizes, sits idle and delivers
+     * nothing -- silently. Document the capped port as THE rental port.
+     *
+     * ON A SOLO LISTENER this cannot gate anything -- a solo coinbase pays one
+     * address and has no payout set to size -- so it means exactly "the
+     * marketplace ceiling to WATCH on this port": the render warns when it is
+     * exceeded. Solo serves marketplaces too, and is ~500 B of 815 B today. */
+    int    has_max_coinbase_bytes;
+    int    max_coinbase_bytes;
 } stratum_listener_t;
 
 #define STRATUM_MAX_LISTENERS 8
+
+/* The `coinbase_cap` a connection reports when its listener sets none: use
+ * the job's default payout set / the server-wide budget. */
+#define STRATUM_COINBASE_CAP_DEFAULT (-1)
 
 /* Create a job from template fields. The coinbase is *not* baked into the
  * job — each connection renders its own coinbase paying its miner address
@@ -179,6 +206,17 @@ stratum_job_t *stratum_job_ref(stratum_job_t *j);
 int stratum_job_set_payouts(stratum_job_t *j,
                             const coinbase_payout_t *payouts,
                             size_t n_payouts);
+
+/* A second (third, ...) payout set for the same job, used by connections whose
+ * listener carries max_coinbase_bytes=`cap`. A connection whose listener sets
+ * no cap, or whose cap has no set attached, renders the default set from
+ * stratum_job_set_payouts -- and on_block_found reports the cap it rendered
+ * with, so main.c settles the plan that was actually mined. Replaces an
+ * existing set for the same cap. -1 when the job is full or on allocation
+ * failure. */
+int stratum_job_add_payouts_for_cap(stratum_job_t *j, int cap,
+                                    const coinbase_payout_t *payouts,
+                                    size_t n_payouts);
 
 /* Observer hooks filled in by main.c (typically routed to the sqlite store). */
 /* `solo` is 1 when the share arrived on a solo listener. It travels with the
@@ -290,7 +328,15 @@ typedef void (*block_found_fn)(void *ctx,
                                const char *block_hash,
                                int64_t reward_sats, int64_t fee_sats,
                                int accepted, const char *submit_error,
-                               int solo);
+                               int solo, int coinbase_cap,
+                               /* 1 when the coinbase this block was built from
+                                * carried a PPLNS payout set. Without it the
+                                * settle side cannot tell "no plan was ever
+                                * built, the coinbase paid the finder" from
+                                * "a plan was built and the ring lost it",
+                                * which are a normal startup condition and a
+                                * silent ledger divergence respectively. */
+                               int had_payout_set);
 
 typedef struct {
     char   bind_addr[64];
@@ -475,6 +521,11 @@ double      stratum_conn_pinned_diff_for_test(const stratum_conn_t *c);
  * path does when a miner arrives on that port. Exposed so per-port policy can
  * be tested without binding a fixed port, which in CI is a race with whatever
  * else is on the box. */
+int         stratum_conn_coinbase_cap_for_test(const stratum_conn_t *c);
+/* How many times a coinbase that no payout budget sizes (solo, PPS, the
+ * proportional fallback) has exceeded its listener's max_coinbase_bytes at a
+ * NEW high-water. */
+int         stratum_cb_ceiling_warnings_for_test(const stratum_server_t *s);
 void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
                                                  const stratum_listener_t *pol);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);

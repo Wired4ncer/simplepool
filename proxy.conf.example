@@ -68,6 +68,41 @@ vardiff_window_sec = 30       # how often to retarget
 # listener = port=3335 min_diff=65536 label=braiins
 # listener = port=3336 min_diff=500000 label=nicehash
 #
+# max_coinbase_bytes=N overrides prop_max_coinbase_bytes for ONE port. The
+# server-wide budget exists for a marketplace verificator that refuses a
+# coinbase past ~815 B; direct rigs never had that limit, so the public port
+# can carry the wider coinbase (more payout slots per block) while the rental
+# port keeps the cap. 0 = uncapped; unset = inherit the server-wide value.
+#
+# The default listener (listen_port) cannot take a `listener` line, so the
+# recipe is: lift the server-wide budget and cap the RENTAL port --
+#
+#   prop_max_coinbase_bytes = 0
+#   listener = port=3335 min_diff=500000 max_coinbase_bytes=815 label=rental
+#
+# Each distinct cap is one more PPLNS plan (one more window walk) per template.
+#
+# ⚠️ REQUIRES the `listener` form. A rental port configured the legacy way,
+# with rental_listen_port/rental_min_diff, is synthesised into a listener at
+# startup with no cap slot, and there is no rental_max_coinbase_bytes key --
+# so it always inherits the server-wide budget. Adding a `listener` line for
+# that same port while rental_listen_port still names it is refused at startup
+# ("use one or the other, not both"). Migrate the port to a `listener` line
+# first; that changes no difficulty behaviour, and the shim exists precisely
+# so it does not have to be done in a hurry.
+#
+# WARNING: an order pointed at an uncapped port authorizes, idles and delivers
+# nothing -- silently. Publish the capped port as THE rental port.
+#
+# ON A SOLO PORT the key cannot gate anything -- a solo coinbase pays ONE
+# address, so there is no payout set to size and nothing can make it smaller.
+# There it means "the marketplace ceiling to WATCH": the pool warns, once per
+# new high, when a rendered solo coinbase passes it. Solo serves marketplaces
+# too, and its coinbase grows with the template's drivechain OP_RETURNs with
+# no dial to turn -- so set it on the solo port as well:
+#
+# listener = port=3336 mode=solo initial_diff=65536 max_coinbase_bytes=815
+#
 # IMPORTANT — min_diff is KEPT even when the chain is easier than it, and
 # that costs blocks. Share difficulty is otherwise capped at the network
 # difficulty, because a miner filters locally against the stratum target and

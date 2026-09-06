@@ -191,6 +191,20 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "min_diff")     == 0) min_diff = atof(fv);
         else if (strcmp(fk, "initial_diff") == 0) initial = atof(fv);
         else if (strcmp(fk, "max_diff")     == 0) out->vardiff_max = atof(fv);
+        else if (strcmp(fk, "max_coinbase_bytes") == 0) {
+            char *end = NULL;
+            long n = strtol(fv, &end, 10);
+            /* Shape only here. The FLOOR is applied after the loop, because
+             * it depends on mode= and the fields may appear in any order. */
+            if (!*fv || !end || *end || n < 0 || n > 100000) {
+                set_err(errbuf, errlen,
+                        "listener max_coinbase_bytes must be an integer in "
+                        "[0, 100000], got '%s'", fv);
+                return -1;
+            }
+            out->has_max_coinbase_bytes = 1;
+            out->max_coinbase_bytes     = (int)n;
+        }
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
         else if (strcmp(fk, "mode")         == 0) {
             /* Only the two that mean something here. "proportional" is spelled
@@ -225,6 +239,43 @@ static int parse_listener(const char *v, stratum_listener_t *out,
             return -1;
         }
     }
+    /* ⛔ THE FLOOR IS FOR PROPORTIONAL PORTS ONLY, and this is why it is here
+     * rather than beside the parse: `mode=` may appear after
+     * `max_coinbase_bytes=` on the same line, so solo-ness is not known until
+     * every token has been read.
+     *
+     * On a proportional port the value is a SIZING BUDGET fed to the same
+     * parameter as the server-wide prop_max_coinbase_bytes, and one too small
+     * to hold the template's coinbase plus a payout cannot be satisfied by
+     * dropping outputs -- the sizing degrades to "pay one miner" instead of
+     * failing, so `max_coinbase_bytes=50` would quietly disable PPLNS on that
+     * port for good. Hence the same [400, 100000] rule both fields carry.
+     *
+     * On a SOLO port it gates nothing -- a solo coinbase pays one address and
+     * has no payout set to size -- and means "the marketplace ceiling to WATCH
+     * on this port" (stratum_listener_t). A small value there is a legitimate
+     * watch threshold, not a mistake: solo coinbases measured 316-496 B on
+     * alphanet 2026-09-06, so 300 is a perfectly sensible thing to watch for.
+     * Applying the proportional floor to it rejected valid configs.
+     *
+     * ⚠️ AND THE FLOOR IS A SANITY BOUND, NOT A GUARANTEE. The cost a budget
+     * must cover before any miner is paid is a property of the TEMPLATE -- it
+     * grows with the drivechain OP_RETURNs the chain puts there, measured
+     * 93 -> 212 B in a week on alphanet -- so no constant can promise that a
+     * given budget still fits two payouts tomorrow. 400 rejects the typo; it
+     * does not certify the number. What reports the real thing is the
+     * byte-pressure alarm, per cap, at runtime. Leave margin. */
+    if (out->has_max_coinbase_bytes && !out->solo &&
+        out->max_coinbase_bytes != 0 && out->max_coinbase_bytes < 400) {
+        set_err(errbuf, errlen,
+                "listener port %d: max_coinbase_bytes must be 0 (uncapped) or "
+                "in [400, 100000] on a proportional port, got %d. (On a "
+                "mode=solo listener it is only a ceiling to watch and any "
+                "value is allowed.)",
+                out->port, out->max_coinbase_bytes);
+        return -1;
+    }
+
     out->vardiff_min  = min_diff;
     /* Recorded separately from vardiff_min so the server can tell "this port
      * was explicitly asked for a floor" from "this port inherited the
