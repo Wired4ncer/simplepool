@@ -85,6 +85,15 @@ vardiff_window_sec = 30       # how often to retarget
 # WARNING: an order pointed at an uncapped port authorizes, idles and delivers
 # nothing -- silently. Publish the capped port as THE rental port.
 #
+# ON A SOLO PORT the key cannot gate anything -- a solo coinbase pays ONE
+# address, so there is no payout set to size and nothing can make it smaller.
+# There it means "the marketplace ceiling to WATCH": the pool warns, once per
+# new high, when a rendered solo coinbase passes it. Solo serves marketplaces
+# too, and its coinbase grows with the template's drivechain OP_RETURNs with
+# no dial to turn -- so set it on the solo port as well:
+#
+# listener = port=3336 mode=solo initial_diff=65536 max_coinbase_bytes=815
+#
 # IMPORTANT — min_diff is KEPT even when the chain is easier than it, and
 # that costs blocks. Share difficulty is otherwise capped at the network
 # difficulty, because a miner filters locally against the stratum target and

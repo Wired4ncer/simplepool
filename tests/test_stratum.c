@@ -2284,6 +2284,103 @@ static void test_proportional_per_listener_cap_sets(void) {
     printf("ok: proportional renders and reports per-listener cap sets\n");
 }
 
+/* Drive one connection to a rendered coinbase and return the server's
+ * ceiling-warning count. */
+static int render_under_listener(const stratum_listener_t *pol,
+                                 const char *addr, int *out_warnings)
+{
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 4, .initial_diff = 1.0,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    snprintf(cfg.pool_mode, sizeof(cfg.pool_mode), "proportional");
+    stratum_server_t *s = NULL;
+    if (stratum_server_start(&cfg, &s) != 0 || !s) return -1;
+
+    coinbase_payout_t payouts[2] = {
+        { PROP_ADDR_A, 3000000000LL },
+        { PROP_ADDR_B, 2000000000LL },
+    };
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_job_t *job = make_prop_job("P1", net);
+    if (!job) { stratum_server_free(s); return -1; }
+    stratum_job_set_payouts(job, payouts, 2);
+    stratum_server_set_job(s, job, 1);
+
+    /* Two connections on the SAME listener: the second renders an identical
+     * coinbase, so the high-water must swallow it. An alarm that fired per
+     * template would bury the growth it exists to show. */
+    for (int i = 0; i < 2; i++) {
+        stratum_conn_t *c = stratum_conn_new_for_test(s);
+        stratum_conn_apply_listener_for_test(c, pol);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c,
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}", &out, &olen);
+        free(out); out = NULL; olen = 0;
+        char auth[256];
+        snprintf(auth, sizeof auth,
+            "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"x\"]}",
+            addr);
+        stratum_handle_message(s, c, auth, &out, &olen);
+        CHECK(out != NULL);
+        free(out);
+        stratum_conn_free_for_test(c);
+    }
+    *out_warnings = stratum_cb_ceiling_warnings_for_test(s);
+    stratum_server_free(s);
+    return 0;
+}
+
+/* A coinbase that no payout budget sizes -- solo, above all -- must warn when
+ * it passes its listener's max_coinbase_bytes.
+ *
+ * The solo port serves marketplaces as well as hobbyists, and its coinbase
+ * pays ONE address: nothing trims it, so it grows with the template's
+ * drivechain OP_RETURNs until a verificator refuses the job. That failure is
+ * SILENT at the pool -- the order authorizes and idles -- so the warning is
+ * the only signal. A separate server per case because the high-water is
+ * server-wide and would otherwise mask the second render. */
+static void test_coinbase_ceiling_warns_when_nothing_trims_it(void) {
+    int warnings = -1;
+
+    /* Solo, ceiling of 1 B: every coinbase is over it. */
+    stratum_listener_t solo_tight = { .port = 3336, .solo = 1,
+                                      .has_max_coinbase_bytes = 1,
+                                      .max_coinbase_bytes = 1 };
+    CHECK(render_under_listener(&solo_tight, PROP_ADDR_A, &warnings) == 0);
+    CHECK(warnings == 1);   /* once, not once per render */
+
+    /* Solo, a ceiling nothing reaches: silence. Asserting only the tight case
+     * would pass on a build that warned unconditionally. */
+    stratum_listener_t solo_loose = { .port = 3336, .solo = 1,
+                                      .has_max_coinbase_bytes = 1,
+                                      .max_coinbase_bytes = 100000 };
+    warnings = -1;
+    CHECK(render_under_listener(&solo_loose, PROP_ADDR_A, &warnings) == 0);
+    CHECK(warnings == 0);
+
+    /* A PPLNS connection is NOT this alarm's business even at a 1 B ceiling:
+     * its coinbase IS sized by the payout budget, and main.c already reports
+     * when that budget costs someone a payout. Two alarms for one condition
+     * would double-count the growth. */
+    stratum_listener_t prop_tight = { .port = 3334, .solo = 0,
+                                      .has_max_coinbase_bytes = 1,
+                                      .max_coinbase_bytes = 1 };
+    warnings = -1;
+    CHECK(render_under_listener(&prop_tight, PROP_ADDR_A, &warnings) == 0);
+    CHECK(warnings == 0);
+
+    /* No cap declared -- the default listener -- is silent whatever it
+     * renders. */
+    stratum_listener_t solo_uncapped = { .port = 3336, .solo = 1 };
+    warnings = -1;
+    CHECK(render_under_listener(&solo_uncapped, PROP_ADDR_A, &warnings) == 0);
+    CHECK(warnings == 0);
+
+    printf("ok: an unsized coinbase warns once when it passes its ceiling\n");
+}
+
 /* With no payout set attached — no PPLNS window yet — proportional mode must
  * fall back to paying the connection's own address rather than dropping the
  * job. Each miner then gets a DIFFERENT coinbase, as in solo. */
@@ -4410,6 +4507,7 @@ int main(void) {
     test_proportional_shared_coinbase();
     test_proportional_falls_back_without_window();
     test_proportional_per_listener_cap_sets();
+    test_coinbase_ceiling_warns_when_nothing_trims_it();
     test_extranonce1_is_one_sequence_per_server();
     test_listener_policy_reaches_the_connection();
     test_listener_floor_beats_the_server_wide_floor();

@@ -147,7 +147,12 @@ typedef struct {
      *
      * ⚠️ Nothing stops a renter pointing an order at an uncapped port, and a
      * NiceHash order handed an over-size job authorizes, sits idle and delivers
-     * nothing -- silently. Document the capped port as THE rental port. */
+     * nothing -- silently. Document the capped port as THE rental port.
+     *
+     * ON A SOLO LISTENER this cannot gate anything -- a solo coinbase pays one
+     * address and has no payout set to size -- so it means exactly "the
+     * marketplace ceiling to WATCH on this port": the render warns when it is
+     * exceeded. Solo serves marketplaces too, and is ~500 B of 815 B today. */
     int    has_max_coinbase_bytes;
     int    max_coinbase_bytes;
 } stratum_listener_t;
@@ -509,6 +514,10 @@ double      stratum_conn_pinned_diff_for_test(const stratum_conn_t *c);
  * be tested without binding a fixed port, which in CI is a race with whatever
  * else is on the box. */
 int         stratum_conn_coinbase_cap_for_test(const stratum_conn_t *c);
+/* How many times a coinbase that no payout budget sizes (solo, PPS, the
+ * proportional fallback) has exceeded its listener's max_coinbase_bytes at a
+ * NEW high-water. */
+int         stratum_cb_ceiling_warnings_for_test(const stratum_server_t *s);
 void        stratum_conn_apply_listener_for_test(stratum_conn_t *c,
                                                  const stratum_listener_t *pol);
 const char *stratum_conn_worker_name_for_test(const stratum_conn_t *c);

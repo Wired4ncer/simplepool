@@ -460,6 +460,21 @@ struct stratum_server {
      * the process now. It was hoisted into a shared object only because two
      * servers each seeding from the clock handed out overlapping values. */
     atomic_uint extranonce1_seq;
+    /* Largest coinbase, in bytes, rendered so far on a connection whose
+     * listener declares max_coinbase_bytes but whose coinbase is NOT sized by
+     * the payout budget -- solo, PPS, and the proportional fallback. Warning
+     * only on a new high keeps one line per growth step instead of one per
+     * template, matching the byte-pressure alarm in main.c. Re-arms at
+     * startup, so the journal always records where the pool stands.
+     *
+     * ⚠️ ONE high-water for the whole server. With two such listeners at
+     * DIFFERENT ceilings, a render that trips the higher one first can mask a
+     * later, smaller render that trips the lower one. Accepted: the pool has
+     * one solo port, and an alarm that under-reports a hypothetical second is
+     * better than per-listener state threaded through the test accessors.
+     * Revisit if a second capped non-PPLNS listener ever exists. */
+    atomic_int  cb_ceiling_hwm;
+    atomic_int  cb_ceiling_warnings;
 
     /* Share dedupe, keyed on the resulting block-header hash. The
      * per-connection ring in stratum_conn cannot catch a duplicate that
@@ -1126,6 +1141,49 @@ static int conn_render_coinbase(stratum_server_t *s, stratum_conn_t *c,
                  c->worker_name, err);
         return -1;
     }
+    /* MARKETPLACE CEILING on a coinbase nothing trims.
+     *
+     * A PPLNS coinbase is sized to the byte budget: main.c picks how many
+     * payout outputs fit and alarms when the budget costs someone a payout.
+     * The renders that reach here with a cap on their listener have no such
+     * dial -- solo pays exactly one address, so its coinbase is the template
+     * plus two outputs and NOTHING can make it smaller. It is ~500 B today
+     * against an 815 B ceiling, purely because the template is small.
+     *
+     * ⛔ That is the whole reason this exists. When drivechain OP_RETURNs grow
+     * past the ceiling there is no failure to see: a marketplace order handed
+     * an over-size job authorizes, sits idle and delivers nothing, and the
+     * pool logs nothing because from its side the block is perfectly valid.
+     * The alarm is the only thing between that and a port that quietly stops
+     * earning. It never refuses a template -- an over-size coinbase is still
+     * money, and suppressing it would turn a commercial preference into a lost
+     * block, the same rule the byte budget itself carries. */
+    if (c->pol_coinbase_cap > 0 && prop_n == 0) {
+        size_t cb_bytes = parts.cb1_len + job->en1_size + job->en2_size +
+                          parts.cb2_len;
+        int prev = atomic_load(&s->cb_ceiling_hwm);
+        int is_new_high = 0;
+        while ((int)cb_bytes > prev) {
+            if (atomic_compare_exchange_weak(&s->cb_ceiling_hwm, &prev,
+                                             (int)cb_bytes)) {
+                is_new_high = 1;
+                break;
+            }
+        }
+        if (is_new_high && (int)cb_bytes > c->pol_coinbase_cap) {
+            atomic_fetch_add(&s->cb_ceiling_warnings, 1);
+            LOG_WARN("coinbase byte ceiling: port %d rendered %zu B against its "
+                     "%d B max_coinbase_bytes, %zu B over. This port's coinbase "
+                     "pays ONE address, so no payout budget trims it and it "
+                     "will only grow with the template's drivechain "
+                     "OP_RETURNs. A marketplace order here may now be handed "
+                     "work its verificator refuses -- which looks like an idle "
+                     "order, not an error. Mining it regardless.",
+                     c->pol_port, cb_bytes, c->pol_coinbase_cap,
+                     cb_bytes - (size_t)c->pol_coinbase_cap);
+        }
+    }
+
     free(c->cb1); free(c->cb2);
     c->cb1 = parts.cb1; c->cb1_len = parts.cb1_len;
     c->cb2 = parts.cb2; c->cb2_len = parts.cb2_len;
@@ -3716,6 +3774,10 @@ int stratum_conn_coinbase_cap_for_test(const stratum_conn_t *c) {
     return c ? c->pol_coinbase_cap : STRATUM_COINBASE_CAP_DEFAULT;
 }
 
+int stratum_cb_ceiling_warnings_for_test(const stratum_server_t *s) {
+    return s ? atomic_load(&s->cb_ceiling_warnings) : 0;
+}
+
 static void *listener_thread(void *arg) {
     struct stratum_listener_slot *ls = arg;
     stratum_server_t *s = ls->srv;
@@ -3822,6 +3884,8 @@ int stratum_server_start(const stratum_cfg_t *cfg, stratum_server_t **out) {
     s->start_ms = now_ms();
 
     atomic_init(&s->extranonce1_seq, (unsigned)now_ms());
+    atomic_init(&s->cb_ceiling_hwm, 0);
+    atomic_init(&s->cb_ceiling_warnings, 0);
     pthread_mutex_init(&s->share_dedupe_lock, NULL);
     pthread_mutex_init(&s->auth_fail_lock, NULL);
 
