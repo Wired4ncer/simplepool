@@ -385,7 +385,20 @@ echo "  ✓ zero-sum"
 SETTLES=$(grep -c "proportional: settled block" "$POOL_LOG" || true)
 CARRIED=$(grep "proportional: settled block" "$POOL_LOG" \
           | grep -cvE "0 deferred claims" || true)
-NOPLAN=$(grep -c "which had no payout plan" "$POOL_LOG" || true)
+# ⛔ SHORT, STABLE SUBSTRING — and verified to still exist before it is trusted.
+# This grep read "which had no payout plan", a whole sentence copied out of the
+# log line. When that line was reworded (to stop it claiming the coinbase had
+# "paid the finder directly", which was false), the grep silently stopped
+# matching anything: NOPLAN became permanently 0 and the invariant below
+# always passed. The assertion that exists to catch an under-sized plan ring
+# was blinded by an edit to the message it reads, with nothing to show for it —
+# the test still ran and still passed. Match the fewest words that identify the
+# event, and fail loudly if even those stop being emitted.
+NOPLAN_PHRASE="no payout plan"
+if ! grep -qF "$NOPLAN_PHRASE" "$ROOT/src/main.c"; then
+    fail "the log phrase this test greps for (\"$NOPLAN_PHRASE\") is no longer in src/main.c — the no-plan assertion below would silently pass forever. Update both together."
+fi
+NOPLAN=$(grep -cF "$NOPLAN_PHRASE" "$POOL_LOG" || true)
 echo "  settles=$SETTLES with-carry=$CARRIED no-plan=$NOPLAN"
 if [ "$CARRIED" -eq 0 ]; then
     echo "  ⚠️  VACUOUS: no block carried a deferred claim, so the zero-sum"

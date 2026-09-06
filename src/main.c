@@ -1369,8 +1369,17 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
              * and only the settlement is missing. Saying "paid the finder"
              * unconditionally, as this line used to, describes the first as if
              * it were the second and hides a real ledger divergence. */
-            LOG_WARN("proportional: block %s came from job %s with no payout "
-                     "plan for coinbase cap %d — NOT settled. If a plan was "
+            /* ⛔ Keep the words no-payout-plan together in ONE literal below.
+             * test_burst_regtest.sh greps the log for that phrase to detect an
+             * under-sized plan ring, and guards itself by first checking the
+             * phrase is still present HERE. Split across two literals it is in
+             * the log but not in the source and the guard fails the run; and
+             * this comment deliberately hyphenates it so the literal below is
+             * the ONLY thing the guard can match -- otherwise a reworded log
+             * line with an untouched comment would satisfy the guard and blind
+             * the assertion, which is the exact failure this pair prevents. */
+            LOG_WARN("proportional: block %s came from job %s with "
+                     "no payout plan for coinbase cap %d — NOT settled. If a plan was "
                      "built for this job, its coinbase paid the window and "
                      "prop_ledger has silently diverged from the chain; check "
                      "whether PROP_PLAN_RING (%d) still covers every solvable "
