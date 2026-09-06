@@ -3052,10 +3052,18 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
         int64_t reward_sats = job->value_sats - fee_sats;
         /* Report the cap this connection RENDERED with, not merely the one its
          * listener asked for -- a cap with no payout set fell back to the
-         * default set, and the settle must follow it there. */
+         * default set, and the settle must follow it there.
+         *
+         * A SOLO connection rendered no payout set at all (its coinbase pays
+         * itself), so it reports DEFAULT. main.c gates settling on !solo and
+         * would ignore the value either way; stating it here keeps the field's
+         * meaning true rather than true-by-accident, because a solo listener
+         * CAN carry max_coinbase_bytes and reporting it would read as "this
+         * block settled the 815 B plan". */
         const coinbase_payout_t *fp = NULL; size_t fn = 0;
         int found_cap = STRATUM_COINBASE_CAP_DEFAULT;
-        job_payouts_for_cap(job, c->pol_coinbase_cap, &fp, &fn, &found_cap);
+        if (s->prop_enabled && !c->pol_solo)
+            job_payouts_for_cap(job, c->pol_coinbase_cap, &fp, &fn, &found_cap);
         s->cfg.on_block_found(s->cfg.ctx, c->worker_name,
                               c->payout_address, ts_now, job->height,
                               job->job_id, block_hash_hex,

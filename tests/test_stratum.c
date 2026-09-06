@@ -2244,6 +2244,41 @@ static void test_proportional_per_listener_cap_sets(void) {
     }
     CHECK(obs.rejects == 0);
 
+    /* A SOLO listener that also carries a cap: its coinbase pays itself, so it
+     * rendered no payout set and must report DEFAULT. Reporting 815 here would
+     * read as "this block settled the 815 B plan" -- for a block that settles
+     * no plan at all. */
+    stratum_listener_t solo_capped = { .port = 3336, .solo = 1,
+                                       .has_max_coinbase_bytes = 1,
+                                       .max_coinbase_bytes = 815 };
+    stratum_conn_t *cs = stratum_conn_new_for_test(s);
+    stratum_conn_apply_listener_for_test(cs, &solo_capped);
+    {
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, cs,
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}", &out, &olen);
+        free(out); out = NULL; olen = 0;
+        stratum_handle_message(s, cs,
+            "{\"id\":2,\"method\":\"mining.authorize\","
+             "\"params\":[\"" PROP_ADDR_C "\",\"x\"]}", &out, &olen);
+        char scb1[4096] = {0}, scb2[4096] = {0};
+        CHECK(out && notify_coinbase(out, scb1, sizeof scb1,
+                                     scb2, sizeof scb2) == 0);
+        free(out); out = NULL; olen = 0;
+        /* Solo pays ITSELF: C is there, and neither PPLNS set's A is. */
+        CHECK(strstr(scb2, "5555555555555555555555555555555555555555") != NULL);
+        CHECK(strstr(scb2, "3333333333333333333333333333333333333333") == NULL);
+        CHECK(stratum_conn_coinbase_cap_for_test(cs) == 815);
+        CHECK(stratum_handle_message(s, cs,
+            "{\"id\":3,\"method\":\"mining.submit\","
+            "\"params\":[\"ws\",\"P1\",\"" TEST_EN2 "\",\"60000000\",\"00000009\"]}",
+            &out, &olen) == 0);
+        free(out);
+        CHECK(obs.last_block_solo == 1);
+        CHECK(obs.last_block_cap == STRATUM_COINBASE_CAP_DEFAULT);
+    }
+    stratum_conn_free_for_test(cs);
+
     for (int i = 0; i < 3; i++) stratum_conn_free_for_test(c[i]);
     stratum_server_free(s);
     printf("ok: proportional renders and reports per-listener cap sets\n");
