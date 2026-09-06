@@ -328,7 +328,15 @@ typedef void (*block_found_fn)(void *ctx,
                                const char *block_hash,
                                int64_t reward_sats, int64_t fee_sats,
                                int accepted, const char *submit_error,
-                               int solo, int coinbase_cap);
+                               int solo, int coinbase_cap,
+                               /* 1 when the coinbase this block was built from
+                                * carried a PPLNS payout set. Without it the
+                                * settle side cannot tell "no plan was ever
+                                * built, the coinbase paid the finder" from
+                                * "a plan was built and the ring lost it",
+                                * which are a normal startup condition and a
+                                * silent ledger divergence respectively. */
+                               int had_payout_set);
 
 typedef struct {
     char   bind_addr[64];

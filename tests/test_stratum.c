@@ -49,6 +49,7 @@ typedef struct {
     int    solo_shares;
     int    last_block_solo;
     int    last_block_cap;
+    int    last_block_had_payouts;
     /* Reject instrumentation. Asserting on these is what keeps the
      * classification honest: "a stale reject arrived" would pass on a build
      * that labelled every one of them the same way. */
@@ -113,11 +114,12 @@ static void on_block_found(void *ctx, const char *w, const char *addr,
                            uint64_t ts, uint32_t height, const char *job_id,
                            const char *hash, int64_t reward, int64_t fee,
                            int accepted, const char *submit_error, int solo,
-                           int coinbase_cap) {
+                           int coinbase_cap, int had_payout_set) {
     (void)w; (void)addr; (void)ts; (void)height; (void)job_id; (void)hash;
     (void)reward; (void)fee;
     obs_t *o = ctx;
     o->last_block_cap = coinbase_cap;
+    o->last_block_had_payouts = had_payout_set;
     /* Recorded so a test can assert which SCHEME solved the block, not merely
      * that one was found. The settle gate in main.c reads exactly this flag. */
     o->last_block_solo = solo;

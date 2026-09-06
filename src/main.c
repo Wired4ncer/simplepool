@@ -1284,7 +1284,7 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
                               const char *block_hash,
                               int64_t reward_sats, int64_t fee_sats,
                               int accepted, const char *submit_error,
-                              int solo, int coinbase_cap) {
+                              int solo, int coinbase_cap, int had_payout_set) {
     server_ctx_t *s = (server_ctx_t *)ctx;
     /* Accepted only makes it a candidate the chain has not rejected — it is
      * still 'pending' until something verifies the block is in the chain.
@@ -1373,31 +1373,41 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
             }
             prop_plan_clear(&settled);
         } else {
-            /* Two very different causes reach here and the line must not
-             * assert either one. Either no plan was ever built for this
-             * template (prop_build_plan fell back, and the coinbase really did
-             * pay the finder), or a plan was built and has since been evicted
-             * from the ring, in which case the coinbase paid the PPLNS window
-             * and only the settlement is missing. Saying "paid the finder"
-             * unconditionally, as this line used to, describes the first as if
-             * it were the second and hides a real ledger divergence. */
-            /* ⛔ Keep the words no-payout-plan together in ONE literal below.
-             * test_burst_regtest.sh greps the log for that phrase to detect an
-             * under-sized plan ring, and guards itself by first checking the
-             * phrase is still present HERE. Split across two literals it is in
-             * the log but not in the source and the guard fails the run; and
-             * this comment deliberately hyphenates it so the literal below is
-             * the ONLY thing the guard can match -- otherwise a reworded log
-             * line with an untouched comment would satisfy the guard and blind
-             * the assertion, which is the exact failure this pair prevents. */
-            LOG_WARN("proportional: block %s came from job %s with "
-                     "no payout plan for coinbase cap %d — NOT settled. If a plan was "
-                     "built for this job, its coinbase paid the window and "
-                     "prop_ledger has silently diverged from the chain; check "
-                     "whether PROP_PLAN_RING (%d) still covers every solvable "
-                     "job at %d cap(s).",
-                     block_hash ? block_hash : "?", job_id, coinbase_cap,
-                     (int)PROP_PLAN_RING, (int)PROP_PLAN_MAX_CAPS);
+            /* Two very different causes reach here, and had_payout_set is
+             * what separates them: the coinbase either carried a PPLNS payout
+             * set or it did not, and stratum knows which because it rendered
+             * it. Without that flag one line had to describe both, which made
+             * a normal startup condition indistinguishable from a silent
+             * ledger divergence -- in the log, and to the regtest assertion
+             * that exists to catch the latter. It fired on the first block of
+             * every burst and meant nothing.
+             *
+             * ⛔ Keep the words plan-ring-miss together in ONE literal below.
+             * test_burst_regtest.sh greps the log for that phrase and guards
+             * itself by checking it is still present HERE; split across two
+             * literals it is in the log but not the source and the guard fails
+             * the run. This comment hyphenates it so the literal is the ONLY
+             * thing the guard can match -- a reworded line with an untouched
+             * comment would otherwise satisfy the guard and blind the
+             * assertion, which is exactly what happened once already. */
+            if (had_payout_set) {
+                LOG_ERROR("proportional: PLAN RING MISS on block %s from job %s "
+                          "at coinbase cap %d — its coinbase PAID THE WINDOW but "
+                          "no plan was found to settle it, so prop_ledger has "
+                          "diverged from the chain: the addresses that coinbase "
+                          "paid keep their claims and will be paid first again, "
+                          "and the ones it deferred were never credited. "
+                          "PROP_PLAN_RING is %d at %d cap(s) and is not covering "
+                          "every solvable job.",
+                          block_hash ? block_hash : "?", job_id, coinbase_cap,
+                          (int)PROP_PLAN_RING, (int)PROP_PLAN_MAX_CAPS);
+            } else {
+                LOG_INFO("proportional: block %s from job %s carried no payout "
+                         "set (cap %d) — its coinbase paid the finder directly "
+                         "and there is nothing to settle. Expected until the "
+                         "first PPLNS window fills.",
+                         block_hash ? block_hash : "?", job_id, coinbase_cap);
+            }
         }
     }
     /* pool:blocks carries solved blocks. A candidate the node refused is not
