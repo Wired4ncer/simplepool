@@ -204,10 +204,21 @@ typedef struct {
      * still accept a submit for — see PROP_PLAN_RING. */
     prop_plan_t     prop_plans[PROP_PLAN_RING];
     size_t          prop_plan_next;
-    /* Highest coinbase fixed cost seen against the byte budget, in bytes.
-     * Guarded by `lock`. 0 until the first proportional template. See the
-     * byte-pressure alarm in prop_build_plan. */
-    size_t          prop_fixed_bytes_hwm;
+    /* Highest coinbase fixed cost seen against each byte budget, in bytes,
+     * indexed by the plan's slot in the cap list. Guarded by `lock`. 0 until
+     * the first proportional template. See the byte-pressure alarm in
+     * prop_build_plan.
+     *
+     * ⛔ ONE PER CAP, not one per server. fixed_bytes is a property of the
+     * TEMPLATE and is identical across the plans built for one template, so a
+     * single high-water let whichever cap happened to be evaluated first claim
+     * the alarm and silenced every other capped listener at that growth level
+     * — permanently, since the fixed cost only trends up. The alarm's
+     * escalation is what made that matter: it fires on max_out, which IS
+     * budget-specific, so a listener whose budget had collapsed to paying two
+     * miners could stay silent because a roomier listener reported the same
+     * fixed cost first. */
+    size_t          prop_fixed_bytes_hwm[PROP_PLAN_MAX_CAPS];
 
     /* Live PPS rate, refreshed whenever a new template arrives. Read on the
      * share path, so it is an atomic double rather than taking `lock` —
@@ -396,7 +407,7 @@ static size_t prop_candidate_txout_hist(const pplns_addr_t *addrs,
  * is always valid and never custodial, so the pool keeps mining. */
 static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
                           const char *job_id, int cap, int budget_bytes,
-                          prop_plan_t *plan) {
+                          size_t cap_idx, prop_plan_t *plan) {
     if (!s || !s->cfg || !s->store || !t || !plan) return -1;
     memset(plan, 0, sizeof *plan);
     plan->cap = cap;
@@ -553,8 +564,9 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
     if (budget_bytes > 0 && fixed_bytes > 0) {
         size_t budget = (size_t)budget_bytes;
         pthread_mutex_lock(&s->lock);
-        int is_new_high = fixed_bytes > s->prop_fixed_bytes_hwm;
-        if (is_new_high) s->prop_fixed_bytes_hwm = fixed_bytes;
+        size_t hwm_slot = cap_idx < PROP_PLAN_MAX_CAPS ? cap_idx : 0;
+        int is_new_high = fixed_bytes > s->prop_fixed_bytes_hwm[hwm_slot];
+        if (is_new_high) s->prop_fixed_bytes_hwm[hwm_slot] = fixed_bytes;
         pthread_mutex_unlock(&s->lock);
         if (is_new_high) {
             size_t left = (fixed_bytes < budget) ? budget - fixed_bytes : 0;
@@ -927,7 +939,7 @@ static stratum_job_t *build_job_from_template(server_ctx_t *sctx,
         }
         for (size_t k = 0; k < n_caps; k++) {
             prop_plan_t plan;
-            int prc = prop_build_plan(sctx, t, job_id, caps[k], budgets[k], &plan);
+            int prc = prop_build_plan(sctx, t, job_id, caps[k], budgets[k], k, &plan);
             if (prc == 0) {
                 coinbase_payout_t cb[PROP_PLAN_MAX_PAY];
                 for (size_t i = 0; i < plan.n_payouts; i++) {
@@ -1825,6 +1837,32 @@ int main(int argc, char **argv) {
         }
     }
 
+
+    /* Which port ends up with which coinbase budget, stated once at startup.
+     * Nothing else says it: the dashboard's identity JSON carries difficulty
+     * policy but not this, and the per-template plan lines only appear once
+     * work starts. After a deploy that changes these, this is the line that
+     * confirms the config was read the way the operator meant it — and an
+     * inherited budget looks identical to a set one everywhere else. */
+    {
+        LOG_INFO("coinbase budget: port %d (default) %d B%s",
+                 cfg.listen_port, cfg.prop_max_coinbase_bytes,
+                 cfg.prop_max_coinbase_bytes == 0 ? " (uncapped)" : "");
+        for (int i = 0; i < cfg.listener_count; ++i) {
+            const stratum_listener_t *l = &cfg.listeners[i];
+            int eff = l->has_max_coinbase_bytes ? l->max_coinbase_bytes
+                                                : cfg.prop_max_coinbase_bytes;
+            LOG_INFO("coinbase budget: port %d%s%s %d B%s%s",
+                     l->port,
+                     l->label[0] ? " " : "", l->label,
+                     eff,
+                     eff == 0 ? " (uncapped)" : "",
+                     l->has_max_coinbase_bytes
+                         ? (l->solo ? " [set: a ceiling to WATCH, solo pays one address]"
+                                    : " [set on this listener]")
+                         : " [inherited]");
+        }
+    }
 
     /* Pool identity into the DB, before anything else can read the table.
      * The dashboard shows this to miners; see store.h for why it lives in

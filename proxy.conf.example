@@ -82,6 +82,15 @@ vardiff_window_sec = 30       # how often to retarget
 #
 # Each distinct cap is one more PPLNS plan (one more window walk) per template.
 #
+# ⚠️ REQUIRES the `listener` form. A rental port configured the legacy way,
+# with rental_listen_port/rental_min_diff, is synthesised into a listener at
+# startup with no cap slot, and there is no rental_max_coinbase_bytes key --
+# so it always inherits the server-wide budget. Adding a `listener` line for
+# that same port while rental_listen_port still names it is refused at startup
+# ("use one or the other, not both"). Migrate the port to a `listener` line
+# first; that changes no difficulty behaviour, and the shim exists precisely
+# so it does not have to be done in a hurry.
+#
 # WARNING: an order pointed at an uncapped port authorizes, idles and delivers
 # nothing -- silently. Publish the capped port as THE rental port.
 #

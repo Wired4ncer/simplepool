@@ -260,7 +260,11 @@ static void test_listener_max_coinbase_bytes(void) {
 /* A negative or non-numeric cap is refused at startup. atoi() would have read
  * "-1" as -1 and "abc" as 0 -- the second silently uncapping a rental port. */
 static void test_listener_max_coinbase_bytes_bad_values(void) {
-    const char *bad[] = { "-1", "abc", "815x", "" };
+    /* 50 and 399 are the ones that matter: they parse, they are positive, and
+     * without the floor they load fine and silently mean "pay one miner
+     * forever" on that port -- the server-wide field has rejected exactly this
+     * since it was added, and the per-listener twin did not. */
+    const char *bad[] = { "-1", "abc", "815x", "", "50", "399" };
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         proxy_config_t cfg; char err[256] = {0};
         char body[512];

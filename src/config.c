@@ -194,10 +194,19 @@ static int parse_listener(const char *v, stratum_listener_t *out,
         else if (strcmp(fk, "max_coinbase_bytes") == 0) {
             char *end = NULL;
             long n = strtol(fv, &end, 10);
-            if (!*fv || !end || *end || n < 0 || n > 100000) {
+            /* ⛔ SAME FLOOR AS THE SERVER-WIDE prop_max_coinbase_bytes, and for
+             * the same reason: both feed the identical budget_bytes parameter,
+             * and a budget too small to hold the template's own coinbase plus
+             * one payout cannot be satisfied by dropping outputs. The sizing
+             * code degrades to "pay one miner" rather than failing, so a typo
+             * like 50 would quietly disable PPLNS on that port for good, with
+             * nothing but a LOG_INFO to notice. Validating one of the two and
+             * not the other left exactly that hole. */
+            if (!*fv || !end || *end || n < 0 || n > 100000 ||
+                (n != 0 && n < 400)) {
                 set_err(errbuf, errlen,
-                        "listener max_coinbase_bytes must be an integer >= 0 "
-                        "(0 = uncapped), got '%s'", fv);
+                        "listener max_coinbase_bytes must be 0 (uncapped) or in "
+                        "[400, 100000], got '%s'", fv);
                 return -1;
             }
             out->has_max_coinbase_bytes = 1;
