@@ -1781,6 +1781,7 @@ int main(int argc, char **argv) {
         if (bitcoind_ping(&btc, err, sizeof err) < 0) {
             fprintf(stderr, "bitcoind ping failed: %s\n", err);
             bitcoind_client_free(&btc);
+            bitcoind_client_free(&btc_lp);
             return 3;
         }
         LOG_INFO("bitcoind ping ok");
@@ -1979,9 +1980,22 @@ int main(int argc, char **argv) {
         bcast = NULL;
     }
 
-    /* Initial template + job. */
+    /* Initial template + job.
+     *
+     * On the LONG-POLL client, not the 10 s general-purpose one. This is a
+     * full getblocktemplate against the enforcer, and a live template is
+     * multi-megabyte: once the mempool fills it takes longer than 10 s to
+     * come back, the call fails with `curl: Timeout was reached`, and the
+     * pool exits 5 before it ever binds. A supervisor then relaunches into
+     * the same wall, so the pool flaps instead of starting. The tip watcher
+     * already fetches every subsequent template on btc_lp for exactly this
+     * reason; the first one is not different in kind, only in timing.
+     *
+     * Safe to borrow the client here: the tip watcher that owns btc_lp is
+     * started further down, from the server context built below, so nothing
+     * else can be using this handle yet. */
     bitcoind_template_t *tmpl = NULL;
-    if (bitcoind_get_block_template(&btc, &tmpl, err, sizeof err) < 0) {
+    if (bitcoind_get_block_template(&btc_lp, &tmpl, err, sizeof err) < 0) {
         fprintf(stderr, "initial GBT failed: %s\n", err);
         store_close(store);
         bitcoind_client_free(&btc);
