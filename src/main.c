@@ -185,6 +185,15 @@ typedef struct {
      * seconds while holding the client's connection lock — on the shared
      * client that would stall submitblock, so the watcher gets its own. */
     bitcoind_client_t *btc_lp;
+    /* Dedicated client for submitblock, for both of the reasons btc_lp
+     * exists, at higher stakes. Contention: the shared client also serves the
+     * watcher's getblockhash fallback, and a block submission queued behind
+     * one is a block we may lose. Budget: 10 s is right for a cheap query and
+     * wrong for pushing a multi-megabyte block to a busy node -- on 2026-08-26
+     * a found block timed out at 10 s and went to a competitor. A submission
+     * is the single most valuable call this process makes and there is no
+     * prize for giving up early, so it gets its own generous budget. */
+    bitcoind_client_t *btc_submit;
     store_t           *store;
     broadcast_t       *bcast;
     stratum_server_t  *srv;
@@ -252,6 +261,14 @@ typedef struct {
 /* How long to accumulate share difficulty before turning it into a rate.
  * Long enough to be stable, short enough that a pool starting up is measured
  * within a minute. */
+/* submitblock's own timeout. The general-purpose client uses 10 s, which is
+ * right for a cheap query and wrong for pushing a multi-megabyte block to a
+ * node that is busy -- and "busy" is exactly the state a node is in when a
+ * block has just been found network-wide. A submission we abandon is a block
+ * we may lose; one that takes 45 s and lands is a block we keep. There is no
+ * prize for giving up early, so the budget is generous rather than tight. */
+#define SUBMIT_BLOCK_TIMEOUT_MS 60000L
+
 #define HASHRATE_WINDOW_MS 60000
 
 /* A block this deep stops being re-checked. */
@@ -1277,11 +1294,11 @@ static void on_reject_cb(void *ctx, const char *worker_name,
 static int on_block_cb(void *ctx, const char *block_hex,
                        char *errbuf, size_t errlen) {
     server_ctx_t *s = (server_ctx_t *)ctx;
-    if (!s || !s->btc) {
+    if (!s || !s->btc_submit) {
         snprintf(errbuf, errlen, "no bitcoind client");
         return -1;
     }
-    int rc = bitcoind_submit_block(s->btc, block_hex, errbuf, errlen);
+    int rc = bitcoind_submit_block(s->btc_submit, block_hex, errbuf, errlen);
     if (rc == 0) {
         LOG_INFO("submitted block to bitcoind successfully");
     } else {
@@ -1773,6 +1790,17 @@ int main(int argc, char **argv) {
         bitcoind_client_free(&btc_lp);
         return 3;
     }
+    /* Third client, for submitblock only (see server_ctx_t.btc_submit). */
+    bitcoind_client_t btc_submit = {0};
+    bitcoind_cfg_t bcfg_submit = bcfg;
+    bcfg_submit.timeout_ms = SUBMIT_BLOCK_TIMEOUT_MS;
+    if (bitcoind_client_init(&btc_submit, &bcfg_submit) < 0) {
+        fprintf(stderr, "bitcoind_client_init (submit) failed\n");
+        bitcoind_client_free(&btc);
+        bitcoind_client_free(&btc_lp);
+        bitcoind_client_free(&btc_submit);
+        return 3;
+    }
     /* The ping is a getblockchaininfo sanity check. Some block-template
      * backends that accept unauthenticated JSON-RPC don't implement it, so
      * skip the ping when no credentials are configured — the initial
@@ -1782,6 +1810,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "bitcoind ping failed: %s\n", err);
             bitcoind_client_free(&btc);
             bitcoind_client_free(&btc_lp);
+            bitcoind_client_free(&btc_submit);
             return 3;
         }
         LOG_INFO("bitcoind ping ok");
@@ -1801,6 +1830,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "store_open failed for %s\n", cfg.db_path);
         bitcoind_client_free(&btc);
         bitcoind_client_free(&btc_lp);
+        bitcoind_client_free(&btc_submit);
         return 4;
     }
 
@@ -2000,6 +2030,7 @@ int main(int argc, char **argv) {
         store_close(store);
         bitcoind_client_free(&btc);
         bitcoind_client_free(&btc_lp);
+        bitcoind_client_free(&btc_submit);
         return 5;
     }
 
@@ -2015,6 +2046,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&sctx.lock, NULL);
     sctx.btc    = &btc;
     sctx.btc_lp = &btc_lp;
+    sctx.btc_submit = &btc_submit;
     sctx.store  = store;
     sctx.bcast = bcast;
     sctx.cfg   = &cfg;
@@ -2029,6 +2061,7 @@ int main(int argc, char **argv) {
         store_close(store);
         bitcoind_client_free(&btc);
         bitcoind_client_free(&btc_lp);
+        bitcoind_client_free(&btc_submit);
         return 6;
     }
 
@@ -2157,6 +2190,7 @@ int main(int argc, char **argv) {
             store_close(store);
             bitcoind_client_free(&btc);
             bitcoind_client_free(&btc_lp);
+            bitcoind_client_free(&btc_submit);
             return 2;
         }
         if (cfg.rental_min_diff <= 0.0) {
@@ -2166,6 +2200,7 @@ int main(int argc, char **argv) {
             store_close(store);
             bitcoind_client_free(&btc);
             bitcoind_client_free(&btc_lp);
+            bitcoind_client_free(&btc_submit);
             return 2;
         }
     }
@@ -2178,6 +2213,7 @@ int main(int argc, char **argv) {
         store_close(store);
         bitcoind_client_free(&btc);
         bitcoind_client_free(&btc_lp);
+        bitcoind_client_free(&btc_submit);
         return 7;
     }
     sctx.srv = srv;
@@ -2224,6 +2260,7 @@ int main(int argc, char **argv) {
         if (bcast) broadcast_close(bcast);
         bitcoind_client_free(&btc);
         bitcoind_client_free(&btc_lp);
+        bitcoind_client_free(&btc_submit);
         return 8;
     }
 
@@ -2275,6 +2312,7 @@ int main(int argc, char **argv) {
 
     bitcoind_client_free(&btc);
     bitcoind_client_free(&btc_lp);
+    bitcoind_client_free(&btc_submit);
     pthread_mutex_destroy(&sctx.lock);
 
     LOG_INFO("simplepool exited cleanly");
