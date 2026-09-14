@@ -1391,17 +1391,23 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
             /* The plan's payee list goes to block_payees in the same
              * transaction as the ledger delta -- the durable per-block record
              * that survives the coinbase no longer carrying it (Option B).
-             * The fee row is the operator output stratum rendered; fee_sats
-             * is what it carried, from the same coinbase. No block_hash means
-             * the node gave us none: settle the ledger, record nothing, and
-             * say so -- an unnamed block cannot be keyed. */
+             * The fee row is the operator output. fee_sats is recomputed by
+             * stratum from the template's value the same way the builder
+             * sized that output (review 2026-09-14: not read back from the
+             * rendered bytes, but equal by construction, and the payout
+             * index tags the fee from the same figure). ⛔ A fee of 0 means
+             * the builder emitted NO fee output (fee_bps 0, or under dust),
+             * so no row: a phantom zero-sat 'fee' row would make the
+             * plan-vs-coinbase check report every block as differing.
+             * No block_hash means the node gave us none: settle the ledger,
+             * record nothing, and say so -- an unnamed block cannot be keyed. */
             store_block_payees_t payees = {
                 .height      = height,
                 .block_hash  = block_hash,
                 .job_id      = job_id,
                 .payouts     = settled.payouts,
                 .n_payouts   = settled.n_payouts,
-                .fee_address = s->cfg->operator_address,
+                .fee_address = fee_sats > 0 ? s->cfg->operator_address : NULL,
                 .fee_sats    = fee_sats,
             };
             const store_block_payees_t *pp =

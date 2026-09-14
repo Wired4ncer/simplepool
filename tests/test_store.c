@@ -1934,7 +1934,9 @@ static void test_block_hash_index_after_dedupe(void) {
  *   2. a block settles once: a second settle of the same hash is refused
  *      AND leaves the first block's rows and the ledger untouched (drop the PK)
  *   3. a settle with NULL payees still applies the ledger and writes no rows
- *   4. an UPGRADED database gets the table (drop the migration entry) */
+ *   4. an UPGRADED database gets the table (drop the SCHEMA_SQL entry -- there
+ *      is deliberately no MIGRATIONS entry; CREATE IF NOT EXISTS runs on
+ *      every open, upgraded files included) */
 static void test_block_payees_are_recorded_with_the_settle(void) {
     store_cfg_t cfg = {0};
     snprintf(cfg.path, sizeof(cfg.path), "%s", fresh_db_path());
@@ -2003,6 +2005,16 @@ static void test_block_payees_are_recorded_with_the_settle(void) {
     assert(nl == 0);              /* +0.25 - 0.25 cancelled and was pruned */
     free(led);
 
+    /* a fee of zero means the coinbase carried NO fee output: no 'fee' row,
+     * even though an operator address is configured */
+    const char *hash3 = "00000000000000000000000000000000000000000000000000000000f00dfeed";
+    store_block_payees_t nofee = bp; nofee.block_hash = hash3; nofee.fee_sats = 0;
+    assert(store_prop_settle_block(s, 1700000002500ULL, NULL, 0, NULL, 0, &nofee) == 0);
+    assert(store_block_payees_get(s, hash3, &rows, &n) == 0);
+    assert(n == 3);
+    for (size_t i = 0; i < n; i++) assert(strcmp(rows[i].kind, "payout") == 0);
+    free(rows); rows = NULL;
+
     /* a plan with no block hash is refused before any write */
     store_block_payees_t nohash = bp; nohash.block_hash = "";
     assert(store_prop_settle_block(s, 1700000003000ULL, NULL, 0, out, 1, &nohash) < 0);
@@ -2014,7 +2026,8 @@ static void test_block_payees_are_recorded_with_the_settle(void) {
 static void test_block_payees_table_arrives_by_migration(void) {
     const char *path = fresh_db_path();
     /* A database from before block_payees existed: prop_ledger present,
-     * block_payees absent. Only the MIGRATIONS array can add it. */
+     * block_payees absent. store_open's SCHEMA_SQL (CREATE IF NOT EXISTS)
+     * is what adds it on an existing file; this test opens exactly that. */
     sqlite3 *db = NULL;
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     assert(sqlite3_exec(db,

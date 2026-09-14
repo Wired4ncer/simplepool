@@ -345,29 +345,6 @@ int store_prop_compute_window(store_t *s, double window_difficulty,
 int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
                             pplns_addr_t **out, size_t *n);
 
-/* Apply the result of a found block to prop_ledger, as a DELTA.
- *
- * ledger_in is the ledger the payout plan was computed from; ledger_out is the
- * ledger pplns_compute_payouts() produced from it. What lands in the table is
- * (current + ledger_out - ledger_in), per address, computed inside the same
- * transaction that writes it.
- *
- * ⚠️ It takes both halves, and not just the post-block state, because the plan
- * is built when the TEMPLATE is fetched and settled when a block is found —
- * different threads, an unbounded gap apart, with no ordering between one
- * block's settle and the next template's read of the ledger. Writing
- * ledger_out wholesale therefore published a snapshot that could already be
- * stale, and a second block settling from an overlapping snapshot silently
- * dropped the first block's claims. The delta is immune to that: two plans
- * built from the same snapshot compose instead of overwriting, and since both
- * halves are zero-sum the delta is too, so the stored ledger stays zero-sum.
- *
- * An address in the table that appears in neither half is left alone — that is
- * the whole point. An address whose result lands on zero is removed.
- *
- * ⛔ Does NOT touch blocks_found. store_record_block() is the sole writer of
- * that table and is called for every block; a second insert here duplicated
- * every pooled block (see store.c). Returns 0 ok, negative on error. */
 /* The settled payout plan of ONE found block, as written to block_payees.
  *
  * Why this exists (Option B, 2026-09-14): today the only durable record of
@@ -400,6 +377,29 @@ typedef struct {
     int64_t               fee_sats;
 } store_block_payees_t;
 
+/* Apply the result of a found block to prop_ledger, as a DELTA.
+ *
+ * ledger_in is the ledger the payout plan was computed from; ledger_out is the
+ * ledger pplns_compute_payouts() produced from it. What lands in the table is
+ * (current + ledger_out - ledger_in), per address, computed inside the same
+ * transaction that writes it.
+ *
+ * ⚠️ It takes both halves, and not just the post-block state, because the plan
+ * is built when the TEMPLATE is fetched and settled when a block is found —
+ * different threads, an unbounded gap apart, with no ordering between one
+ * block's settle and the next template's read of the ledger. Writing
+ * ledger_out wholesale therefore published a snapshot that could already be
+ * stale, and a second block settling from an overlapping snapshot silently
+ * dropped the first block's claims. The delta is immune to that: two plans
+ * built from the same snapshot compose instead of overwriting, and since both
+ * halves are zero-sum the delta is too, so the stored ledger stays zero-sum.
+ *
+ * An address in the table that appears in neither half is left alone — that is
+ * the whole point. An address whose result lands on zero is removed.
+ *
+ * ⛔ Does NOT touch blocks_found. store_record_block() is the sole writer of
+ * that table and is called for every block; a second insert here duplicated
+ * every pooled block (see store.c). Returns 0 ok, negative on error. */
 /* payees may be NULL: then only the ledger delta is applied (tests, and any
  * caller that has no plan to record). When non-NULL, block_hash must be
  * non-empty and the rows land in the SAME transaction as the ledger -- a
@@ -413,12 +413,14 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
 /* Read back one block's payee rows in seq order. *out (caller frees) and *n.
  * Returns 0 ok (n may be 0), negative on error. Used by tests and by the
  * settlement daemon's shadow comparison. */
+/* destination is bounded at 64 bytes: a value longer than that is truncated
+ * silently by the reader, so any future sidechain identifier must fit. */
 typedef struct {
     int      seq;
     char     address[128];
     int64_t  sats;
     char     kind[16];
-    char     destination[32];
+    char     destination[64];
 } store_block_payee_row_t;
 int store_block_payees_get(store_t *s, const char *block_hash,
                            store_block_payee_row_t **out, size_t *n);

@@ -2284,7 +2284,9 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
                 sats = payees->payouts[i].sats;
                 kind = "payout";
             } else {
+                /* No address, or nothing to pay: no fee output existed. */
                 if (!payees->fee_address || !payees->fee_address[0]) break;
+                if (payees->fee_sats <= 0) break;
                 addr = payees->fee_address;
                 sats = payees->fee_sats;
                 kind = "fee";
