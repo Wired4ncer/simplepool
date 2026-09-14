@@ -373,7 +373,7 @@ typedef struct {
     const char           *job_id;         /* may be NULL */
     const pplns_payout_t *payouts;        /* kind = 'payout', in plan order */
     size_t                n_payouts;
-    const char           *fee_address;    /* kind = 'fee'; NULL or "" = no fee row */
+    const char           *fee_address;    /* kind = 'fee'; NULL, "" or fee_sats <= 0 = no fee row */
     int64_t               fee_sats;
 } store_block_payees_t;
 
@@ -410,9 +410,6 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
                             const pplns_claim_t *ledger_out, size_t n_ledger_out,
                             const store_block_payees_t *payees);
 
-/* Read back one block's payee rows in seq order. *out (caller frees) and *n.
- * Returns 0 ok (n may be 0), negative on error. Used by tests and by the
- * settlement daemon's shadow comparison. */
 /* destination is bounded at 64 bytes: a value longer than that is truncated
  * silently by the reader, so any future sidechain identifier must fit. */
 typedef struct {
@@ -422,6 +419,9 @@ typedef struct {
     char     kind[16];
     char     destination[64];
 } store_block_payee_row_t;
+/* Read back one block's payee rows in seq order. *out (caller frees) and *n.
+ * Returns 0 ok (n may be 0), negative on error. Used by tests and by the
+ * settlement daemon's shadow comparison. */
 int store_block_payees_get(store_t *s, const char *block_hash,
                            store_block_payee_row_t **out, size_t *n);
 
