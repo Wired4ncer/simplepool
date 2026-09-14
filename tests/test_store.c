@@ -1306,7 +1306,7 @@ static void test_settle_mutates_a_nonempty_ledger(void) {
         { .address = "bcrt1qaaa", .claim_fraction = -0.30 },
         { .address = "bcrt1qbbb", .claim_fraction =  0.30 },
     };
-    assert(store_prop_settle_block(s, 1000, NULL, 0, seed, 2) == 0);
+    assert(store_prop_settle_block(s, 1000, NULL, 0, seed, 2, NULL) == 0);
 
     pplns_claim_t *before = NULL; size_t n_before = 0;
     assert(store_prop_get_ledger(s, &before, &n_before) == 0);
@@ -1319,7 +1319,7 @@ static void test_settle_mutates_a_nonempty_ledger(void) {
         { .address = "bcrt1qaaa", .claim_fraction =  0.40 },
         { .address = "bcrt1qbbb", .claim_fraction = -0.40 },
     };
-    assert(store_prop_settle_block(s, 2000, seed, 2, next, 2) == 0);
+    assert(store_prop_settle_block(s, 2000, seed, 2, next, 2, NULL) == 0);
 
     pplns_claim_t *after = NULL; size_t n_after = 0;
     assert(store_prop_get_ledger(s, &after, &n_after) == 0);
@@ -1356,7 +1356,7 @@ static void test_prop_ledger_read_is_not_torn(void) {
         snprintf(seed[i + 1].address, sizeof seed[i + 1].address, "small_%04d", i);
         seed[i + 1].claim_fraction = 0.5 / (double)LEDGER_ROWS;
     }
-    assert(store_prop_settle_block(s, 1000, NULL, 0, seed, LEDGER_ROWS + 1) == 0);
+    assert(store_prop_settle_block(s, 1000, NULL, 0, seed, LEDGER_ROWS + 1, NULL) == 0);
 
     ledger_reader_arg_t arg = { .s = s, .stop = 0, .reads = 0,
                                 .full_reads = 0, .worst_abs_sum = 0.0 };
@@ -1367,7 +1367,7 @@ static void test_prop_ledger_read_is_not_torn(void) {
      * identical, so ANY non-zero sum a reader sees is a torn read and nothing
      * else — the data is never actually changing. */
     for (int i = 0; i < 25; i++) {
-        assert(store_prop_settle_block(s, 2000 + i, NULL, 0, NULL, 0) == 0);
+        assert(store_prop_settle_block(s, 2000 + i, NULL, 0, NULL, 0, NULL) == 0);
         /* Yield between settles. Without this the settles hold tx_mu almost
          * continuously and the reader starves, which would make the fixture
          * guards fail for the wrong reason — the point is a reader running
@@ -1414,8 +1414,8 @@ static void test_proportional_settles_compose(void) {
      * different pair — so nothing about it justifies discarding block 1. */
     pplns_claim_t out2[] = { { "c", -0.40 }, { "d", +0.40 } };
 
-    assert(store_prop_settle_block(s, 1000, snapshot, n_snapshot, out1, 2) == 0);
-    assert(store_prop_settle_block(s, 2000, snapshot, n_snapshot, out2, 2) == 0);
+    assert(store_prop_settle_block(s, 1000, snapshot, n_snapshot, out1, 2, NULL) == 0);
+    assert(store_prop_settle_block(s, 2000, snapshot, n_snapshot, out2, 2, NULL) == 0);
 
     pplns_claim_t *stored = NULL; size_t n_stored = 0;
     assert(store_prop_get_ledger(s, &stored, &n_stored) == 0);
@@ -1445,7 +1445,7 @@ static void test_proportional_settles_compose(void) {
      * "b" what it was owed, backing out the claim block 1 created. */
     pplns_claim_t in3[]  = { { "a", -0.25 }, { "b", +0.25 } };
     pplns_claim_t out3[] = { { "a", 0.0 },   { "b", 0.0 } };
-    assert(store_prop_settle_block(s, 3000, in3, 2, out3, 2) == 0);
+    assert(store_prop_settle_block(s, 3000, in3, 2, out3, 2, NULL) == 0);
     assert(store_prop_get_ledger(s, &stored, &n_stored) == 0);
     for (size_t i = 0; i < n_stored; i++)
         assert(strcmp(stored[i].address, "a") != 0 &&
@@ -1622,7 +1622,7 @@ static void test_proportional(void) {
                               STORE_BLOCK_PENDING, NULL) == 0);
 
     rc = store_prop_settle_block(s, base_ts + 200, NULL, 0,
-                                 ledger_buf, n_ledger_out);
+                                 ledger_buf, n_ledger_out, NULL);
     assert(rc == 0);
     store_flush(s);
 
@@ -1671,7 +1671,7 @@ static void test_proportional(void) {
                                300000LL, 12, 0, payouts, &n_payouts, NULL);
     assert(rc == 0);
     rc = store_prop_settle_block(s, base_ts + 300, snapshot, n_snapshot,
-                                 ledger_buf, n_second);
+                                 ledger_buf, n_second, NULL);
     assert(rc == 0);
     free(stored);
     stored = NULL;
@@ -1924,6 +1924,127 @@ static void test_block_hash_index_after_dedupe(void) {
     printf("  ok test_block_hash_index_after_dedupe\n");
 }
 
+
+/* ---- block_payees (Option B step 2.1, 2026-09-14) -------------------------
+ *
+ * The settled plan of a found block must be written down, per block, in the
+ * SAME transaction as the ledger delta. Four things are asserted, each with
+ * the revert that must break it named:
+ *   1. rows land, in plan order, payouts then the fee row   (delete the insert)
+ *   2. a block settles once: a second settle of the same hash is refused
+ *      AND leaves the first block's rows and the ledger untouched (drop the PK)
+ *   3. a settle with NULL payees still applies the ledger and writes no rows
+ *   4. an UPGRADED database gets the table (drop the migration entry) */
+static void test_block_payees_are_recorded_with_the_settle(void) {
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", fresh_db_path());
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    pplns_payout_t pay[3] = {
+        { "bcrt1qminer_a", 200000000LL },
+        { "bcrt1qminer_b", 100000000LL },
+        { "bcrt1qminer_c",  12643656LL },
+    };
+    pplns_claim_t out[1] = { { "bcrt1qminer_d", 0.25 } };
+    const char *hash = "00000000000000000000000000000000000000000000000000000000deadbeef";
+    store_block_payees_t bp = {
+        .height = 997150, .block_hash = hash, .job_id = "job-42",
+        .payouts = pay, .n_payouts = 3,
+        .fee_address = "bcrt1qoperator", .fee_sats = 781609LL,
+    };
+    assert(store_prop_settle_block(s, 1700000000000ULL, NULL, 0, out, 1, &bp) == 0);
+
+    /* 1. rows, in order, with the fee last */
+    store_block_payee_row_t *rows = NULL; size_t n = 0;
+    assert(store_block_payees_get(s, hash, &rows, &n) == 0);
+    assert(n == 4);
+    for (size_t i = 0; i < 3; i++) {
+        assert(rows[i].seq == (int)i);
+        assert(strcmp(rows[i].address, pay[i].address) == 0);
+        assert(rows[i].sats == pay[i].sats);
+        assert(strcmp(rows[i].kind, "payout") == 0);
+        assert(strcmp(rows[i].destination, "mainchain") == 0);
+    }
+    assert(rows[3].seq == 3);
+    assert(strcmp(rows[3].address, "bcrt1qoperator") == 0);
+    assert(rows[3].sats == 781609LL);
+    assert(strcmp(rows[3].kind, "fee") == 0);
+    free(rows); rows = NULL;
+    /* the ledger delta landed in the same transaction */
+    pplns_claim_t *led = NULL; size_t nl = 0;
+    assert(store_prop_get_ledger(s, &led, &nl) == 0);
+    assert(nl == 1 && strcmp(led[0].address, "bcrt1qminer_d") == 0);
+    assert(fabs(led[0].claim_fraction - 0.25) < 1e-12);
+    free(led); led = NULL;
+
+    /* 2. the same block cannot settle twice -- and the refusal is atomic:
+     *    the ledger must NOT have moved (the delta below would have added
+     *    another 0.25) and the rows must be the first settle's. */
+    pplns_claim_t again[1] = { { "bcrt1qminer_d", 0.25 } };
+    assert(store_prop_settle_block(s, 1700000001000ULL, NULL, 0, again, 1, &bp) < 0);
+    assert(store_prop_get_ledger(s, &led, &nl) == 0);
+    assert(nl == 1 && fabs(led[0].claim_fraction - 0.25) < 1e-12);
+    free(led); led = NULL;
+    assert(store_block_payees_get(s, hash, &rows, &n) == 0);
+    assert(n == 4);
+    free(rows); rows = NULL;
+
+    /* 3. no plan to record: ledger only, no rows */
+    const char *hash2 = "00000000000000000000000000000000000000000000000000000000cafef00d";
+    pplns_claim_t out2[1] = { { "bcrt1qminer_d", -0.25 } };
+    assert(store_prop_settle_block(s, 1700000002000ULL, NULL, 0, out2, 1, NULL) == 0);
+    assert(store_block_payees_get(s, hash2, &rows, &n) == 0);
+    assert(n == 0);
+    free(rows); rows = NULL;
+    assert(store_prop_get_ledger(s, &led, &nl) == 0);
+    assert(nl == 0);              /* +0.25 - 0.25 cancelled and was pruned */
+    free(led);
+
+    /* a plan with no block hash is refused before any write */
+    store_block_payees_t nohash = bp; nohash.block_hash = "";
+    assert(store_prop_settle_block(s, 1700000003000ULL, NULL, 0, out, 1, &nohash) < 0);
+
+    store_close(s);
+    printf("  ok test_block_payees_are_recorded_with_the_settle\n");
+}
+
+static void test_block_payees_table_arrives_by_migration(void) {
+    const char *path = fresh_db_path();
+    /* A database from before block_payees existed: prop_ledger present,
+     * block_payees absent. Only the MIGRATIONS array can add it. */
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TABLE prop_ledger ("
+        "  address TEXT PRIMARY KEY, claim_fraction REAL NOT NULL DEFAULT 0,"
+        "  last_settled_ts INTEGER);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 100;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    pplns_payout_t pay[1] = { { "bcrt1qminer_a", 312643656LL } };
+    store_block_payees_t bp = {
+        .height = 1, .block_hash = "aa", .payouts = pay, .n_payouts = 1,
+        .fee_address = NULL, .fee_sats = 0,          /* no fee row */
+    };
+    assert(store_prop_settle_block(s, 1000, NULL, 0, NULL, 0, &bp) == 0);
+    store_block_payee_row_t *rows = NULL; size_t n = 0;
+    assert(store_block_payees_get(s, "aa", &rows, &n) == 0);
+    assert(n == 1 && strcmp(rows[0].kind, "payout") == 0);
+    free(rows);
+    store_close(s);
+    printf("  ok test_block_payees_table_arrives_by_migration\n");
+}
+
 int main(void) {
     log_init(2 /* WARN */);
     printf("running test_store...\n");
@@ -1952,6 +2073,8 @@ int main(void) {
     test_proportional_settles_compose();
     test_proportional_window_floor();
     test_proportional_window_when_every_share_is_a_block();
+    test_block_payees_are_recorded_with_the_settle();
+    test_block_payees_table_arrives_by_migration();
     cleanup_dbs();
     printf("all tests passed\n");
     return 0;

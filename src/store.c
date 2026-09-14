@@ -321,6 +321,23 @@ static const char *SCHEMA_SQL_PARTS[] = {
     "  last_settled_ts INTEGER"
     ");"
     "CREATE INDEX IF NOT EXISTS prop_ledger_ts_idx ON prop_ledger(last_settled_ts);"
+    /* The settled payout plan per found block -- see store_block_payees_t in
+     * store.h for why. One row per coinbase output the plan called for, in
+     * plan order; kind 'payout' rows sum to the reward after fee, the single
+     * 'fee' row is the operator output. Written in the settle transaction. */
+    "CREATE TABLE IF NOT EXISTS block_payees ("
+    "  height       INTEGER NOT NULL,"
+    "  block_hash   TEXT    NOT NULL,"
+    "  seq          INTEGER NOT NULL,"
+    "  address      TEXT    NOT NULL,"
+    "  sats         INTEGER NOT NULL,"
+    "  kind         TEXT    NOT NULL,"
+    "  destination  TEXT    NOT NULL DEFAULT 'mainchain',"
+    "  job_id       TEXT,"
+    "  ts           INTEGER NOT NULL,"
+    "  PRIMARY KEY (block_hash, seq)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS block_payees_height_idx ON block_payees(height);"
 };
 
 /* Forward-compat: ALTER existing DBs to add columns that didn't exist in
@@ -383,6 +400,12 @@ static const char *MIGRATIONS_SQL[] = {
     "  last_settled_ts INTEGER"
     ")",
     "CREATE INDEX IF NOT EXISTS prop_ledger_ts_idx ON prop_ledger(last_settled_ts)",
+    /* block_payees (2026-09-14) has NO entry here on purpose: it is a NEW
+     * table, and SCHEMA_SQL's CREATE TABLE IF NOT EXISTS runs on every open,
+     * upgraded databases included. A copy here was dead code -- a mutation
+     * test that deleted it changed nothing. Only ALTERs of existing tables
+     * need this array. test_block_payees_table_arrives_by_migration proves
+     * the upgrade path against the schema entry. */
     /* Pool identity. An upgraded DB has these NULL until the proxy restarts
      * and writes them, which is why the dashboard renders "unknown" rather
      * than guessing — a banner that asserts the wrong network is worse than
@@ -2124,9 +2147,17 @@ static int ledger_acc(pplns_claim_t *w, size_t cap, size_t *n,
 
 int store_prop_settle_block(store_t *s, uint64_t ts_ms,
                             const pplns_claim_t *ledger_in, size_t n_ledger_in,
-                            const pplns_claim_t *ledger_out, size_t n_ledger_out) {
+                            const pplns_claim_t *ledger_out, size_t n_ledger_out,
+                            const store_block_payees_t *payees) {
     if (!s) return -1;
     if ((n_ledger_in && !ledger_in) || (n_ledger_out && !ledger_out)) return -1;
+    if (payees) {
+        /* Refuse up front, outside the transaction: a plan with no block
+         * identity cannot be recorded, and recording it under "" would make
+         * every such block collide on the primary key later. */
+        if (!payees->block_hash || !payees->block_hash[0]) return -1;
+        if (payees->n_payouts && !payees->payouts) return -1;
+    }
 
     sqlite3_stmt *st = NULL;
     int rc;
@@ -2236,6 +2267,51 @@ int store_prop_settle_block(store_t *s, uint64_t ts_ms,
         if (rc != SQLITE_DONE) goto fail;
     }
 
+    /* The settled plan, row by row, inside the same transaction as the ledger
+     * delta above -- see store_block_payees_t. A failed insert fails the
+     * settle, so the ledger and the payee list can never disagree about
+     * whether this block was recorded. */
+    if (payees) {
+        static const char *Q_PAYEE =
+            "INSERT INTO block_payees"
+            "  (height, block_hash, seq, address, sats, kind, destination, job_id, ts)"
+            "  VALUES (?, ?, ?, ?, ?, ?, 'mainchain', ?, ?)";
+        int seq = 0;
+        for (size_t i = 0; i <= payees->n_payouts; i++) {
+            const char *addr; int64_t sats; const char *kind;
+            if (i < payees->n_payouts) {
+                addr = payees->payouts[i].address;
+                sats = payees->payouts[i].sats;
+                kind = "payout";
+            } else {
+                if (!payees->fee_address || !payees->fee_address[0]) break;
+                addr = payees->fee_address;
+                sats = payees->fee_sats;
+                kind = "fee";
+            }
+            if (sqlite3_prepare_v2(s->db, Q_PAYEE, -1, &st, NULL) != SQLITE_OK) goto fail;
+            sqlite3_bind_int64(st, 1, (sqlite3_int64)payees->height);
+            sqlite3_bind_text (st, 2, payees->block_hash, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int  (st, 3, seq++);
+            sqlite3_bind_text (st, 4, addr, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 5, (sqlite3_int64)sats);
+            sqlite3_bind_text (st, 6, kind, -1, SQLITE_STATIC);
+            if (payees->job_id && payees->job_id[0])
+                sqlite3_bind_text(st, 7, payees->job_id, -1, SQLITE_TRANSIENT);
+            else
+                sqlite3_bind_null(st, 7);
+            sqlite3_bind_int64(st, 8, (sqlite3_int64)(ts_ms / 1000));
+            rc = sqlite3_step(st);
+            sqlite3_finalize(st);
+            st = NULL;
+            if (rc != SQLITE_DONE) {
+                LOG_ERROR("store: settle could not record payee %d of block %s: %s",
+                          seq - 1, payees->block_hash, sqlite3_errmsg(s->db));
+                goto fail;
+            }
+        }
+    }
+
     /* ⛔ This function does NOT write blocks_found. on_block_found_cb() calls
      * store_record_block() for EVERY block, pooled or solo, and that row is the
      * complete one — finder_id, finder_address, reward_sats, fee_sats. A second
@@ -2265,6 +2341,53 @@ fail:
     pthread_mutex_unlock(&s->tx_mu);
     free(merged);
     return -1;
+}
+
+int store_block_payees_get(store_t *s, const char *block_hash,
+                           store_block_payee_row_t **out, size_t *n) {
+    if (!s || !block_hash || !out || !n) return -1;
+    *out = NULL; *n = 0;
+    static const char *Q =
+        "SELECT seq, address, sats, kind, destination FROM block_payees"
+        "  WHERE block_hash = ? ORDER BY seq";
+    sqlite3_stmt *st = NULL;
+    store_block_payee_row_t *rows = NULL;
+    size_t cnt = 0, cap = 0;
+    int rc;
+    /* Same lock the settle path holds while it writes, so a reader never
+     * sees a block's list half-written (the lesson of the 2026-08-25 torn
+     * ledger reads, applied here before it can repeat). */
+    pthread_mutex_lock(&s->tx_mu);
+    if (sqlite3_prepare_v2(s->db, Q, -1, &st, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&s->tx_mu);
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, block_hash, -1, SQLITE_TRANSIENT);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (cnt >= cap) {
+            size_t ncap = cap ? cap * 2 : 16;
+            store_block_payee_row_t *nb =
+                (store_block_payee_row_t *)realloc(rows, ncap * sizeof(*nb));
+            if (!nb) { rc = SQLITE_NOMEM; break; }
+            rows = nb; cap = ncap;
+        }
+        store_block_payee_row_t *r = &rows[cnt];
+        memset(r, 0, sizeof *r);
+        r->seq  = sqlite3_column_int(st, 0);
+        const char *a = (const char *)sqlite3_column_text(st, 1);
+        const char *k = (const char *)sqlite3_column_text(st, 3);
+        const char *d = (const char *)sqlite3_column_text(st, 4);
+        snprintf(r->address,     sizeof r->address,     "%s", a ? a : "");
+        r->sats = sqlite3_column_int64(st, 2);
+        snprintf(r->kind,        sizeof r->kind,        "%s", k ? k : "");
+        snprintf(r->destination, sizeof r->destination, "%s", d ? d : "");
+        cnt++;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&s->tx_mu);
+    if (rc != SQLITE_DONE) { free(rows); return -1; }
+    *out = rows; *n = cnt;
+    return 0;
 }
 
 void store_get_stats(store_t *s, store_stats_t *out) {

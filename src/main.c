@@ -1388,18 +1388,41 @@ static void on_block_found_cb(void *ctx, const char *worker_name,
         pthread_mutex_unlock(&s->lock);
 
         if (found) {
+            /* The plan's payee list goes to block_payees in the same
+             * transaction as the ledger delta -- the durable per-block record
+             * that survives the coinbase no longer carrying it (Option B).
+             * The fee row is the operator output stratum rendered; fee_sats
+             * is what it carried, from the same coinbase. No block_hash means
+             * the node gave us none: settle the ledger, record nothing, and
+             * say so -- an unnamed block cannot be keyed. */
+            store_block_payees_t payees = {
+                .height      = height,
+                .block_hash  = block_hash,
+                .job_id      = job_id,
+                .payouts     = settled.payouts,
+                .n_payouts   = settled.n_payouts,
+                .fee_address = s->cfg->operator_address,
+                .fee_sats    = fee_sats,
+            };
+            const store_block_payees_t *pp =
+                (block_hash && block_hash[0]) ? &payees : NULL;
+            if (!pp)
+                LOG_WARN("proportional: block at height %u (job %s) has no hash; "
+                         "its %zu payees are NOT recorded in block_payees",
+                         height, job_id, settled.n_payouts);
             if (store_prop_settle_block(s->store, ts_ms,
                                         settled.ledger_in, settled.n_ledger_in,
-                                        settled.ledger, settled.n_ledger) < 0) {
+                                        settled.ledger, settled.n_ledger, pp) < 0) {
                 LOG_ERROR("proportional: settling block %s (job %s) failed — "
                           "%zu payouts and %zu deferred claims are NOT recorded",
                           block_hash ? block_hash : "?", job_id,
                           settled.n_payouts, settled.n_ledger);
             } else {
                 LOG_INFO("proportional: settled block %s — %zu coinbase payouts, "
-                         "%zu deferred claims",
+                         "%zu deferred claims%s",
                          block_hash ? block_hash : "?",
-                         settled.n_payouts, settled.n_ledger);
+                         settled.n_payouts, settled.n_ledger,
+                         pp ? ", payees recorded" : "");
             }
             prop_plan_clear(&settled);
         } else {

@@ -368,8 +368,59 @@ int store_prop_window_addrs(store_t *s, uint64_t start_ms, uint64_t end_ms,
  * ⛔ Does NOT touch blocks_found. store_record_block() is the sole writer of
  * that table and is called for every block; a second insert here duplicated
  * every pooled block (see store.c). Returns 0 ok, negative on error. */
+/* The settled payout plan of ONE found block, as written to block_payees.
+ *
+ * Why this exists (Option B, 2026-09-14): today the only durable record of
+ * "who was paid what for block N" is the coinbase transaction on chain; the
+ * plan itself lives in the in-memory ring and is consumed at settlement. When
+ * the coinbase stops carrying per-miner outputs (custodial settlement, the
+ * pool wallet is paid and a daemon pays miners later), that record vanishes
+ * and prop_ledger alone cannot reconstruct it -- the ledger is a rolling
+ * RESIDUAL of deferred claims, not the per-block list. So the pool writes the
+ * settled plan down, per block, in the same transaction as the ledger delta.
+ *
+ * It is written in EVERY mode that settles a plan, including today's, where
+ * the coinbase still pays miners directly. That gives a free self-check: for
+ * every block from now on, these rows must equal the outputs the coinbase
+ * actually carried (the payout index decodes those). If they ever differ the
+ * plan-vs-render path has a bug, and it is found while the chain is still
+ * the receipt. Solo blocks are NOT written: blocks_found (finder_address,
+ * reward_sats) already describes them completely.
+ *
+ * `destination` is fixed to 'mainchain' by the writer for now; the column
+ * exists from the first migration so that a sidechain destination later is a
+ * new value, not a backfill of rows whose intent nobody recorded. */
+typedef struct {
+    uint32_t              height;
+    const char           *block_hash;     /* required, non-empty */
+    const char           *job_id;         /* may be NULL */
+    const pplns_payout_t *payouts;        /* kind = 'payout', in plan order */
+    size_t                n_payouts;
+    const char           *fee_address;    /* kind = 'fee'; NULL or "" = no fee row */
+    int64_t               fee_sats;
+} store_block_payees_t;
+
+/* payees may be NULL: then only the ledger delta is applied (tests, and any
+ * caller that has no plan to record). When non-NULL, block_hash must be
+ * non-empty and the rows land in the SAME transaction as the ledger -- a
+ * failed commit leaves neither. Rows for a block_hash already present are
+ * an error (SQLITE_CONSTRAINT), because a block settles exactly once. */
 int store_prop_settle_block(store_t *s, uint64_t ts_ms,
                             const pplns_claim_t *ledger_in, size_t n_ledger_in,
-                            const pplns_claim_t *ledger_out, size_t n_ledger_out);
+                            const pplns_claim_t *ledger_out, size_t n_ledger_out,
+                            const store_block_payees_t *payees);
+
+/* Read back one block's payee rows in seq order. *out (caller frees) and *n.
+ * Returns 0 ok (n may be 0), negative on error. Used by tests and by the
+ * settlement daemon's shadow comparison. */
+typedef struct {
+    int      seq;
+    char     address[128];
+    int64_t  sats;
+    char     kind[16];
+    char     destination[32];
+} store_block_payee_row_t;
+int store_block_payees_get(store_t *s, const char *block_hash,
+                           store_block_payee_row_t **out, size_t *n);
 
 #endif /* SIMPLEPOOL_STORE_H */
