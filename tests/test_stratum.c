@@ -3216,6 +3216,59 @@ static void test_clean_jobs_only_on_a_new_block(void) {
     stratum_conn_free_for_test(c);
 }
 
+/* A listener with clean_jobs=never sends clean=false on a NEW BLOCK too, and
+ * only to its own connections: a public-port miner in the same broadcast
+ * still gets the flag. Read back off real sockets, like the test above, and
+ * with the public conn as the control — a build that dropped the flag for
+ * everyone would pass a rental-only assertion. */
+static void test_clean_jobs_never_is_per_listener(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 2, .initial_diff = 1.0,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32]; memset(net, 0xff, 32);
+    stratum_server_set_job(s, make_test_job("J0", net), 1);
+
+    stratum_listener_t rental = { .port = 3335, .never_clean_jobs = 1 };
+    int fds[2][2];
+    stratum_conn_t *c[2];
+    for (int i = 0; i < 2; ++i) {
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds[i]) == 0);
+        c[i] = stratum_conn_new_for_test(s);
+        if (i == 1) stratum_conn_apply_listener_for_test(c[i], &rental);
+        char *out = NULL; size_t olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+            &out, &olen); free(out); out = NULL; olen = 0;
+        stratum_handle_message(s, c[i],
+            "{\"id\":2,\"method\":\"mining.authorize\","
+             "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+            &out, &olen); free(out);
+        CHECK(stratum_conn_authorized_for_test(c[i]) == 1);
+        CHECK(stratum_conn_subscribed_for_test(c[i]) == 1);
+        stratum_conn_register_for_test(s, c[i], fds[i][0]);
+        (void)read_notify_clean_flag(fds[i][1]);
+    }
+
+    /* A new block: the public port is told to flush, the rental port is not. */
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    CHECK(read_notify_clean_flag(fds[0][1]) == 1);
+    CHECK(read_notify_clean_flag(fds[1][1]) == 0);
+
+    /* A same-tip refresh is false for both — the option never turns the flag ON. */
+    stratum_server_set_job(s, make_test_job("J2", net), 0);
+    CHECK(read_notify_clean_flag(fds[0][1]) == 0);
+    CHECK(read_notify_clean_flag(fds[1][1]) == 0);
+
+    for (int i = 0; i < 2; ++i) { close(fds[i][0]); close(fds[i][1]); }
+    stratum_server_free(s);
+    for (int i = 0; i < 2; ++i) stratum_conn_free_for_test(c[i]);
+}
+
 /* A submit that is refused before it can become a share still counts as a
  * reject on the miner's own dashboard, so it has to be recorded here too —
  * otherwise a miner refused on every submit is indistinguishable from one
@@ -4544,6 +4597,7 @@ int main(void) {
     test_unknown_job_record_falls_back_to_grace();
     test_rerecording_a_job_does_not_consume_ring_slots();
     test_clean_jobs_only_on_a_new_block();
+    test_clean_jobs_never_is_per_listener();
     test_unauthorized_submit_is_recorded_as_a_reject();
     test_job_id_classification_is_three_way();
     test_stale_reject_carries_a_job_age();

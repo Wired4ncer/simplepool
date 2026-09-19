@@ -156,7 +156,8 @@ static void copy_str(char *dst, size_t cap, const char *src) {
     snprintf(dst, cap, "%s", src);
 }
 
-/* Parse one `listener = port=3335 min_diff=65536 label=braiins` line into
+/* Parse one `listener = port=3335 min_diff=65536 label=braiins clean_jobs=never`
+ * line into
  * `out`. Fields are separated by whitespace or commas and may appear in any
  * order; `port` is the only required one, and anything left unset falls back
  * to the server-wide default at accept time.
@@ -206,6 +207,20 @@ static int parse_listener(const char *v, stratum_listener_t *out,
             out->max_coinbase_bytes     = (int)n;
         }
         else if (strcmp(fk, "label")        == 0) copy_str(out->label, sizeof out->label, fv);
+        else if (strcmp(fk, "clean_jobs")   == 0) {
+            /* `tip` is the default spelled out; `never` is the marketplace
+             * accommodation described on stratum_listener_t.never_clean_jobs.
+             * Anything else is refused at startup rather than read as one of
+             * them: a typo here would silently decide who pays for stale
+             * shares. */
+            if      (strcmp(fv, "tip")   == 0) out->never_clean_jobs = 0;
+            else if (strcmp(fv, "never") == 0) out->never_clean_jobs = 1;
+            else {
+                set_err(errbuf, errlen,
+                        "listener clean_jobs must be 'tip' or 'never', got '%s'", fv);
+                return -1;
+            }
+        }
         else if (strcmp(fk, "mode")         == 0) {
             /* Only the two that mean something here. "proportional" is spelled
              * out rather than treated as the absence of mode=solo so an

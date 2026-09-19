@@ -575,6 +575,10 @@ struct stratum_conn {
      * it sets none. Selects which of the job's payout sets this connection
      * renders, and travels with a found block so the matching plan settles. */
     int      pol_coinbase_cap;
+    /* 1 when this connection's listener says clean_jobs=never: the broadcast
+     * sends its notifies with clean_jobs=false even on a tip change. See
+     * stratum_listener_t.never_clean_jobs for who asked and what it costs. */
+    int      pol_never_clean_jobs;
 
     int      subscribed;
     int      authorized;
@@ -3755,6 +3759,7 @@ static void conn_apply_listener(stratum_conn_t *c,
     if (pol->vardiff_max  > 0.0) c->pol_vardiff_max  = pol->vardiff_max;
     c->pol_port = pol->port;
     c->pol_solo = pol->solo;
+    c->pol_never_clean_jobs = pol->never_clean_jobs;
     c->pol_coinbase_cap = pol->has_max_coinbase_bytes
                         ? pol->max_coinbase_bytes
                         : STRATUM_COINBASE_CAP_DEFAULT;
@@ -3962,14 +3967,22 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
      * miners' in-flight shares then come back stale on ITS side — invisible
      * in our reject counters, which is exactly why a pool doing this looks
      * healthy from here while the marketplace measures a reject storm and
-     * drops the upstream. */
+     * drops the upstream.
+     *
+     * And on a chain with 14-second blocks the TRUE flag has the same effect,
+     * because nearly every job IS a tip change (2026-09-19). A listener can
+     * therefore opt out with clean_jobs=never: its connections get every
+     * broadcast with clean=false and the pool credits the stale shares that
+     * follow. Decided per connection from the policy copied at accept, so a
+     * config change never moves a live connection. */
     pthread_mutex_lock(&s->conns_lock);
     for (stratum_conn_t *c = s->conns_head; c; c = c->next) {
         if (!c->subscribed || c->fd < 0 || !c->authorized) continue;
         char *out = NULL; size_t olen = 0;
         pthread_mutex_lock(&c->state_lock);
         vardiff_check_idle(s, c, &out, &olen);
-        send_current_notify(s, c, &out, &olen, clean);
+        send_current_notify(s, c, &out, &olen,
+                            c->pol_never_clean_jobs ? 0 : clean);
         pthread_mutex_unlock(&c->state_lock);
         if (out) {
             pthread_mutex_lock(&c->write_lock);

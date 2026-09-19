@@ -51,6 +51,15 @@ vardiff_window_sec = 30       # how often to retarget
 #   initial_diff   starting difficulty, if it should differ from min_diff
 #   max_diff       vardiff ceiling for this port
 #   label          shown in the log and on the dashboard; [A-Za-z0-9_-]
+#   clean_jobs     tip (default) | never. `never` sends every broadcast with
+#                  clean_jobs=false on this port, even on a new block. For a
+#                  marketplace whose proxy flushes its fleet on the flag and
+#                  bills the flushed shares to us as rejects — on a chain with
+#                  blocks every few seconds the honest flag looks like a reject
+#                  storm and their automatic kill drops the pool. The cost of
+#                  `never` is ours: in-flight shares from before the tip change
+#                  reach us and are CREDITED though they cannot win a block.
+#                  Keep the public and solo ports at the default.
 #
 # Why a second port at all: one difficulty cannot serve both a home ASIC and
 # rented hashrate. Rented hashrate does not arrive as many small miners — a
@@ -65,7 +74,7 @@ vardiff_window_sec = 30       # how often to retarget
 # cancelled. The miner has to arrive at the right difficulty, which is what a
 # dedicated port is for.
 #
-# listener = port=3335 min_diff=65536 label=braiins
+# listener = port=3335 min_diff=65536 label=braiins clean_jobs=never
 # listener = port=3336 min_diff=500000 label=nicehash
 #
 # max_coinbase_bytes=N overrides prop_max_coinbase_bytes for ONE port. The

@@ -196,6 +196,51 @@ static void test_listener_line_parses(void) {
 /* mode=solo marks the listener, and — the part that actually matters — a
  * listener WITHOUT it stays proportional. Asserting only the solo port would
  * pass on a build that set solo=1 unconditionally. */
+/* clean_jobs=never marks the listener; a listener without it stays at the
+ * default, and a misspelling is refused rather than read as either. Asserting
+ * only the opted-in port would pass on a build that set the flag everywhere —
+ * and "everywhere" is exactly the failure this option exists to avoid: the
+ * public and solo ports must keep telling miners the truth. */
+static void test_listener_clean_jobs_never(void) {
+    proxy_config_t cfg; char err[256] = {0};
+    char body[640];
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3335 min_diff=500000 label=braiins clean_jobs=never\n"
+             "listener = port=3336 mode=solo clean_jobs=tip\n", VALID_ADDR);
+    int rc = load_text(body, &cfg, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(cfg.listener_count == 2);
+    CHECK(cfg.listeners[0].port == 3335);
+    CHECK(cfg.listeners[0].never_clean_jobs == 1);
+    /* `tip` spelled out is the default, not a third state. */
+    CHECK(cfg.listeners[1].port == 3336);
+    CHECK(cfg.listeners[1].never_clean_jobs == 0);
+    /* It does not disturb the fields it shares a line with. */
+    CHECK(cfg.listeners[0].min_diff == 500000.0);
+    CHECK(strcmp(cfg.listeners[0].label, "braiins") == 0);
+    CHECK(cfg.listeners[1].solo == 1);
+
+    /* Absent means default. */
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3335 min_diff=500000\n", VALID_ADDR);
+    memset(&cfg, 0xa5, sizeof cfg);   /* a zeroed struct would hide a missing init */
+    CHECK(load_text(body, &cfg, err, sizeof err) == 0);
+    CHECK(cfg.listeners[0].never_clean_jobs == 0);
+
+    /* A typo is a startup error, never a silent choice of who pays. */
+    snprintf(body, sizeof body,
+             "operator_address = %s\n"
+             "listen_port = 3334\n"
+             "listener = port=3335 clean_jobs=nevr\n", VALID_ADDR);
+    err[0] = '\0';
+    CHECK(load_text(body, &cfg, err, sizeof err) != 0);
+    CHECK(strstr(err, "clean_jobs") != NULL);
+}
+
 static void test_listener_mode_solo(void) {
     proxy_config_t cfg; char err[256] = {0};
     char body[640];
@@ -449,6 +494,7 @@ int main(void) {
     test_listen_backlog_parses();
     test_listener_line_parses();
     test_listener_mode_solo();
+    test_listener_clean_jobs_never();
     test_listener_mode_proportional_explicit();
     test_listener_mode_typo_is_refused();
     test_listener_max_coinbase_bytes();

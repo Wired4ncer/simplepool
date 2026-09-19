@@ -155,6 +155,29 @@ typedef struct {
      * exceeded. Solo serves marketplaces too, and is ~500 B of 815 B today. */
     int    has_max_coinbase_bytes;
     int    max_coinbase_bytes;
+    /* NEVER SET clean_jobs ON THIS PORT. Set by `listener = port=3335
+     * clean_jobs=never`. Default 0 (= `clean_jobs=tip`): the flag goes out on
+     * every real tip change, which is the correct stratum answer -- work
+     * against the old tip can only produce an orphan.
+     *
+     * Why a port would want the wrong answer (2026-09-19): a hashrate
+     * marketplace's proxy flushes its whole fleet on the flag and counts the
+     * flushed in-flight shares as OUR rejects. At betanet's 14-second blocks
+     * nearly every job is a genuine tip change, so the correct flag reads as
+     * a reject storm on their side and their automatic kill drops the pool
+     * (Braiins, 08-24 and again 09-19). Their stated alternative is that we
+     * stop setting it and carry the cost: with the flag off, their miners'
+     * in-flight shares reach us instead of dying in the proxy, and we CREDIT
+     * them although they can never win a block (retired jobs stay solvable
+     * for RECENT_JOB_TTL_MS, previous tip or not -- see stratum.c). That cost
+     * belongs on the rental port only; the public and solo ports keep telling
+     * miners the truth.
+     *
+     * ⚠️ Only the broadcast path honours this. The notify sent right after
+     * authorize keeps clean=1: a fresh connection has no work to flush and
+     * every miner expects its first job clean. Copied to the connection at
+     * accept time like every other pol_ field. */
+    int    never_clean_jobs;
 } stratum_listener_t;
 
 #define STRATUM_MAX_LISTENERS 8

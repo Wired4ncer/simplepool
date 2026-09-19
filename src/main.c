@@ -2254,10 +2254,13 @@ int main(int argc, char **argv) {
          * the server actually bound, whichever config spelling produced it. */
         for (int i = 0; i < cfg.listener_count; ++i) {
             LOG_INFO("stratum listening on %s:%d [%s] at difficulty %.0f "
-                     "(vardiff floor; the network difficulty still clamps it down)",
+                     "(vardiff floor; the network difficulty still clamps it down)%s",
                      cfg.listen_addr, cfg.listeners[i].port,
                      cfg.listeners[i].label[0] ? cfg.listeners[i].label : "-",
-                     cfg.listeners[i].min_diff);
+                     cfg.listeners[i].min_diff,
+                     cfg.listeners[i].never_clean_jobs
+                       ? ", clean_jobs=never (stale shares after a tip change are credited)"
+                       : "");
         }
     }
 
