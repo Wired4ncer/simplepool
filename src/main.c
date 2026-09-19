@@ -381,6 +381,10 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
  * and the reason is logged once per template. */
 static void prop_evict_for_payouts(const proxy_config_t *cfg, bitcoind_template_t *t) {
     if (!cfg->prop_evict_txs || !t || !t->coinbasetxn_hex || t->weight_limit <= 0) return;
+    /* Only a proportional coinbase carries the payout set this makes room
+     * for; in solo mode the coinbase pays one miner and eviction would only
+     * throw away tail fees. */
+    if (strcmp(cfg->pool_mode, "proportional") != 0) return;
     size_t ceiling = (size_t)cfg->prop_max_outputs;
     if (ceiling > PROP_PLAN_MAX_PAY) ceiling = PROP_PLAN_MAX_PAY;
     if (ceiling < 1) ceiling = 1;
@@ -398,7 +402,7 @@ static void prop_evict_for_payouts(const proxy_config_t *cfg, bitcoind_template_
         LOG_WARN("evict: refused for template at height %d — %s (falling back to shrinking the payout set)",
                  t->height, err);
     } else if (n > 0) {
-        LOG_INFO("evict: dropped %d tail tx(s), %lld WU, %lld sats of fees, so %zu payout outputs fit (height %d, %zu txs kept)",
+        LOG_INFO("evict: dropped %d tail tx(s), %lld WU, %lld sats of fees, so %zu payout outputs fit by weight (a listener's byte cap may still bind) (height %d, %zu txs kept)",
                  n, (long long)wu, (long long)fee, ceiling, t->height, t->tx_count);
     }
 }
@@ -1657,8 +1661,12 @@ static void *tip_watcher(void *arg) {
             strcmp(t->prev_hash_hex, s->last_prev_hash) != 0) {
             need_rebuild = 1;
             new_tip      = 1;
-        } else if (now_ms() - s->last_built_ms > 30000) {
-            /* Periodic refresh for new ntime + included txs. */
+        } else if (now_ms() - s->last_built_ms > (uint64_t)s->cfg->bitcoind_poll_interval_ms) {
+            /* Periodic refresh for new ntime + included txs. Was a literal
+             * 30000 until 2026-09-19: lowering bitcoind_poll_interval_ms then
+             * only fetched the template more often and threw it away — the
+             * review of 3708a1a caught it. Now the configured interval IS
+             * the refresh cadence, as the config comment always claimed. */
             need_rebuild = 1;
         }
         pthread_mutex_unlock(&s->lock);

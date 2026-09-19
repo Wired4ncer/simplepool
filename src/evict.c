@@ -111,6 +111,72 @@ static int commitment_from_spk_hex(const char *spk_hex, uint8_t out[32]) {
     return 0;
 }
 
+/* Walk a template coinbase once. Finds the byte offset of the single
+ * spendable output's VALUE and of the witness-commitment output's
+ * scriptPubKey (the 38-byte 6a24aa21a9ed<32> one). Either may be absent
+ * (offset 0, count reported). Returns 0 ok, -1 malformed. */
+static int cb_locate(const uint8_t *tx, size_t len,
+                     size_t *value_off, int *spendable,
+                     size_t *wc_spk_off, int *wc_count,
+                     char *errbuf, size_t errlen) {
+    *value_off = 0; *spendable = 0; *wc_spk_off = 0; *wc_count = 0;
+    size_t off = 4;                                   /* version */
+    if (off + 2 <= len && tx[off] == 0x00 && tx[off + 1] != 0x00) off += 2; /* segwit marker+flag */
+    uint64_t vin = 0, vout = 0;
+    if (rd_varint(tx, len, &off, &vin) < 0 || vin != 1) { set_err(errbuf, errlen, "coinbase vin != 1"); return -1; }
+    off += 36;                                        /* prevout */
+    uint64_t sl = 0;
+    if (rd_varint(tx, len, &off, &sl) < 0 || off + sl + 4 > len) { set_err(errbuf, errlen, "truncated scriptsig"); return -1; }
+    off += sl + 4;                                    /* scriptsig + sequence */
+    if (rd_varint(tx, len, &off, &vout) < 0) { set_err(errbuf, errlen, "truncated vout"); return -1; }
+    for (uint64_t i = 0; i < vout; i++) {
+        size_t voff = off;
+        if (off + 8 > len) { set_err(errbuf, errlen, "truncated output"); return -1; }
+        off += 8;
+        uint64_t spk = 0;
+        if (rd_varint(tx, len, &off, &spk) < 0 || off + spk > len) { set_err(errbuf, errlen, "truncated spk"); return -1; }
+        int op_return = (spk >= 1 && tx[off] == 0x6a);
+        if (!op_return) { (*spendable)++; *value_off = voff; }
+        if (spk == 38 && memcmp(tx + off, "\x6a\x24\xaa\x21\xa9\xed", 6) == 0) { (*wc_count)++; *wc_spk_off = off; }
+        off += spk;
+    }
+    return 0;
+}
+
+/* Overwrite the 32 commitment bytes inside the coinbase's own OP_RETURN
+ * output (hex in place). This is the output the pool copies VERBATIM into
+ * every coinbase it renders (coinbase.c copies non-reward outputs as-is), so
+ * the field default_witness_commitment alone would never reach a block —
+ * the round-1 review of 3708a1a found exactly that. Returns 0 ok, -1 when
+ * the output is absent or present more than once. */
+static int cb_rewrite_commitment(char *hex, const uint8_t wc[32], char *errbuf, size_t errlen) {
+    size_t len = 0; uint8_t *tx = hex_alloc(hex, &len);
+    if (!tx) { set_err(errbuf, errlen, "bad coinbase hex"); return -1; }
+    size_t voff, woff; int sp, wn;
+    int rc = cb_locate(tx, len, &voff, &sp, &woff, &wn, errbuf, errlen);
+    free(tx);
+    if (rc < 0) return -1;
+    if (wn != 1) { set_err(errbuf, errlen, "coinbase carries %d witness-commitment outputs (expected 1)", wn); return -1; }
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        hex[2 * (woff + 6 + i)]     = digits[wc[i] >> 4];
+        hex[2 * (woff + 6 + i) + 1] = digits[wc[i] & 0x0f];
+    }
+    return 0;
+}
+
+/* The 32 commitment bytes embedded in the coinbase's OP_RETURN, or -1. */
+static int cb_embedded_commitment(const char *hex, uint8_t out[32], char *errbuf, size_t errlen) {
+    size_t len = 0; uint8_t *tx = hex_alloc(hex, &len);
+    if (!tx) { set_err(errbuf, errlen, "bad coinbase hex"); return -1; }
+    size_t voff, woff; int sp, wn;
+    int rc = cb_locate(tx, len, &voff, &sp, &woff, &wn, errbuf, errlen);
+    if (rc == 0 && wn != 1) { set_err(errbuf, errlen, "coinbase carries %d witness-commitment outputs (expected 1)", wn); rc = -1; }
+    if (rc == 0) memcpy(out, tx + woff + 6, 32);
+    free(tx);
+    return rc;
+}
+
 int evict_adjust_template_reward(char *hex, int64_t delta_sats,
                                  char *errbuf, size_t errlen) {
     if (!hex) { set_err(errbuf, errlen, "null coinbase"); return -1; }
@@ -184,6 +250,12 @@ int evict_tail_for_coinbase(bitcoind_template_t *t, int64_t need_wu,
         set_err(errbuf, errlen, "witness commitment self-check FAILED for the full template — refusing to evict");
         return -1;
     }
+    uint8_t embedded[32];
+    if (cb_embedded_commitment(t->coinbasetxn_hex, embedded, errbuf, errlen) < 0) return -1;
+    if (memcmp(embedded, theirs, 32) != 0) {
+        set_err(errbuf, errlen, "coinbasetxn's embedded commitment differs from default_witness_commitment — refusing to evict");
+        return -1;
+    }
 
     /* Drop from the tail until the txs fit inside the budget. */
     size_t keep = t->tx_count;
@@ -216,6 +288,10 @@ int evict_tail_for_coinbase(bitcoind_template_t *t, int64_t need_wu,
      * come off. Done on a copy so a parse failure leaves the original intact. */
     char *cb = strdup(t->coinbasetxn_hex);
     if (!cb) { free(spk); t->tx_count = saved; set_err(errbuf, errlen, "oom"); return -1; }
+    /* The commitment the block will actually carry lives INSIDE this hex. */
+    if (cb_rewrite_commitment(cb, wc, errbuf, errlen) < 0) {
+        free(cb); free(spk); t->tx_count = saved; return -1;
+    }
     if (dropped_fee > 0 && evict_adjust_template_reward(cb, -dropped_fee, errbuf, errlen) < 0) {
         free(cb); free(spk); t->tx_count = saved; return -1;
     }

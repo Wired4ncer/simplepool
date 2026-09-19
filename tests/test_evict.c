@@ -42,6 +42,9 @@ static bitcoind_template_t *mk(size_t n, const char *dwc, int64_t weight_limit) 
     if (dwc) {
         t->default_witness_commitment = (char *)malloc(77);
         snprintf(t->default_witness_commitment, 77, "6a24aa21a9ed%s", dwc);
+        /* The enforcer embeds the same commitment in the coinbase's OP_RETURN;
+         * the gate requires the two to agree, so the fixture writes it there too. */
+        char *e = strstr(t->coinbasetxn_hex, "6a24aa21a9ed"); memcpy(e + 12, dwc, 64);
     }
     t->txs = (bitcoind_template_tx_t *)calloc(n ? n : 1, sizeof *t->txs);
     t->tx_count = n;
@@ -99,6 +102,13 @@ static void test_evict_drops_tail_and_recomputes(void) {
     CHECK(wu == 5000 && fee == 500);
     CHECK(strcmp(t->default_witness_commitment + 12, C4) == 0);
     CHECK(strncmp(t->default_witness_commitment, "6a24aa21a9ed", 12) == 0);
+    /* ⛔ The copy that reaches a block is the one INSIDE the coinbase hex
+     * (coinbase.c copies the OP_RETURN verbatim). Round-1 review of 3708a1a:
+     * this was rewritten in the field only, and every evicted block would
+     * have failed bad-witness-merkle-match. */
+    { char *e = strstr(t->coinbasetxn_hex, "6a24aa21a9ed"); CHECK(e != NULL);
+      CHECK(e && strncmp(e + 12, C4, 64) == 0);
+      CHECK(strstr(t->coinbasetxn_hex, C5) == NULL); }
     CHECK(t->coinbase_value_sats == 318107917 - 500);
     /* 318107917-500 = 318107417 = 0x12F5EF19 -> 19 ef f5 12 */
     CHECK(strstr(t->coinbasetxn_hex, "19eff5120000000022512") != NULL);
@@ -111,6 +121,38 @@ static void test_evict_drops_tail_and_recomputes(void) {
     /* Two more: need 16,500 -> budget 3,500 -> keep tx1+tx2 (3,000). */
     n = evict_tail_for_coinbase(t, 16500, &wu, &fee, err, sizeof err);
     CHECK(n == 2 && t->tx_count == 2 && wu == 7000 && fee == 700);
+    fr(t);
+}
+
+/* Exact-fit boundaries (mutant `>` -> `>=` in the drop loop survived the
+ * first version of this file). limit 20,000: 5 txs = 15,000 WU. */
+static void test_exact_fit_boundaries(void) {
+    char err[128] = {0}; int64_t wu = -1, fee = -1;
+    /* need 5,000 -> budget 15,000 == tx weight: must evict NOTHING. */
+    bitcoind_template_t *t = mk(5, C5, 20000);
+    CHECK(evict_tail_for_coinbase(t, 5000, &wu, &fee, err, sizeof err) == 0);
+    CHECK(t->tx_count == 5 && wu == 0);
+    CHECK(strstr(t->coinbasetxn_hex, C5) != NULL);
+    /* need 10,000 -> budget 10,000: dropping tx5 lands EXACTLY on the budget -> 1 evicted, not 2. */
+    CHECK(evict_tail_for_coinbase(t, 10000, &wu, &fee, err, sizeof err) == 1);
+    CHECK(t->tx_count == 4 && wu == 5000);
+    fr(t);
+}
+
+static void test_gate_needs_embedded_commitment(void) {
+    char err[128] = {0}; int64_t wu = -1, fee = -1;
+    /* Field says C5 (correct) but the coinbase embeds something else: refuse. */
+    bitcoind_template_t *t = mk(5, C5, 20000);
+    char *e = strstr(t->coinbasetxn_hex, "6a24aa21a9ed"); memcpy(e + 12, C4, 64);
+    CHECK(evict_tail_for_coinbase(t, 9500, &wu, &fee, err, sizeof err) == -1);
+    CHECK(strstr(err, "embedded") != NULL);
+    CHECK(t->tx_count == 5);
+    fr(t);
+    /* No commitment output in the coinbase at all: refuse. */
+    t = mk(5, C5, 20000);
+    e = strstr(t->coinbasetxn_hex, "6a24aa21a9ed"); memcpy(e, "6a24bb21a9ed", 12);
+    CHECK(evict_tail_for_coinbase(t, 9500, &wu, &fee, err, sizeof err) == -1);
+    CHECK(t->tx_count == 5);
     fr(t);
 }
 
@@ -145,6 +187,8 @@ int main(void) {
     test_reward_adjust();
     test_evict_drops_tail_and_recomputes();
     test_safety_gate_refuses();
+    test_exact_fit_boundaries();
+    test_gate_needs_embedded_commitment();
     if (fails) { fprintf(stderr, "test_evict: %d of %d checks FAILED\n", fails, checks); return 1; }
     printf("test_evict: %d checks passed\n", checks);
     return 0;

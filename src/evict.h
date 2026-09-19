@@ -30,7 +30,8 @@
  *
  * ⛔ SAFETY GATE. Before evicting anything, the commitment is recomputed for
  * the UNCHANGED template and compared with the enforcer's own
- * default_witness_commitment. If they differ, our arithmetic does not match
+ * default_witness_commitment AND with the copy embedded in its coinbase (the
+ * two must agree with each other and with us). If they differ, our arithmetic does not match
  * the backend's for this template and NOTHING is evicted — the caller gets
  * -1 and the old behaviour (shrink the coinbase) stands. A wrong commitment
  * is a wrong block; this gate is what makes the feature safe to switch on.
@@ -51,8 +52,11 @@ int evict_witness_commitment(const bitcoind_template_t *t, uint8_t out[32],
 /* Drop transactions from the tail of `t` until the sum of tx weights is at
  * most `weight_limit - need_wu`, where need_wu is the weight the caller's
  * coinbase needs (template coinbase + growth + payouts + fee + safety).
- * Recomputes default_witness_commitment and reduces the reward in
- * coinbasetxn_hex by the dropped fees. Frees the dropped entries.
+ * Recomputes the witness commitment and writes it BOTH into
+ * default_witness_commitment and into the OP_RETURN output inside
+ * coinbasetxn_hex (the one the coinbase builder copies verbatim into every
+ * rendered coinbase — the only copy that reaches a block), and reduces the
+ * reward in coinbasetxn_hex by the dropped fees. Frees the dropped entries.
  *
  * Returns the number of txs evicted (0 when nothing had to go), or -1 and
  * leaves `t` UNTOUCHED when: the safety gate fails, the template has no
