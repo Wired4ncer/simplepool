@@ -34,7 +34,16 @@ typedef struct stratum_job stratum_job_t;
  * per job, and a plan ring shorter than this made the oldest still-solvable
  * job settle with no plan — silently paying its finder solo instead of the
  * window. Size against this constant, never against a hand-picked number. */
-#define STRATUM_RECENT_JOBS 16
+/* 16 -> 64 on 2026-09-19: the template refresh cadence dropped from 30 s to
+ * 5 s (bitcoind_poll_interval_ms in the beta conf) so a rig gets fresh work
+ * before it can exhaust its search space on a long-lived job — at 11-minute
+ * blocks two 230 TH/s rigs were re-submitting old work ("duplicate share",
+ * 8 % of the pool's rejects). 64 x 5 s = 320 s keeps the 300 s
+ * RECENT_JOB_TTL_MS reachable; at 16 the ring would have bound at 80 s and
+ * silently reintroduced the 08-29 stale-share bleed. Memory: each retained
+ * job holds its template's tx hex (~8 MB on a full betanet block), so this is
+ * ~0.5 GB at the ceiling — fine on the 29 GB beta host, revisit for a small box. */
+#define STRATUM_RECENT_JOBS 64
 
 /* Default listen() backlog. 1024 rather than the kernel's own default: a
  * marketplace order arrives as one burst of hundreds of connections, and the

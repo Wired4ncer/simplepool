@@ -2,6 +2,7 @@
 #include "bitcoind.h"
 #include "broadcast.h"
 #include "coinbase.h"
+#include "evict.h"
 #include "config.h"
 #include "log.h"
 #include "pplns.h"
@@ -370,6 +371,36 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
         if (by_bytes < n) n = by_bytes;
     }
     return n;
+}
+
+/* Make room in a full template for the FULL payout set before any job is
+ * built from it (prop_evict_txs). need_wu mirrors coinbase_max_payout_outputs
+ * exactly: the template coinbase, our scriptSig growth, the safety margin,
+ * and (ceiling - 1 + fee) payout outputs beyond the one the template already
+ * budgets. Returns nothing — on refusal the old shrink-to-fit path applies
+ * and the reason is logged once per template. */
+static void prop_evict_for_payouts(const proxy_config_t *cfg, bitcoind_template_t *t) {
+    if (!cfg->prop_evict_txs || !t || !t->coinbasetxn_hex || t->weight_limit <= 0) return;
+    size_t ceiling = (size_t)cfg->prop_max_outputs;
+    if (ceiling > PROP_PLAN_MAX_PAY) ceiling = PROP_PLAN_MAX_PAY;
+    if (ceiling < 1) ceiling = 1;
+    int fee_output = cfg->operator_address[0] && cfg->fee_bps > 0;
+    size_t ss_growth = STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE;
+    size_t taglen = strlen(cfg->coinbase_tag);
+    if (taglen) ss_growth += (taglen > 75 ? 75 : taglen) + 1;
+    int64_t need_wu = (int64_t)(strlen(t->coinbasetxn_hex) / 2) * 4
+                    + (int64_t)ss_growth * 4
+                    + COINBASE_WEIGHT_SAFETY_WU
+                    + (int64_t)(ceiling - 1 + (fee_output ? 1 : 0)) * COINBASE_PAYOUT_TXOUT_WU;
+    int64_t wu = 0, fee = 0; char err[256] = {0};
+    int n = evict_tail_for_coinbase(t, need_wu, &wu, &fee, err, sizeof err);
+    if (n < 0) {
+        LOG_WARN("evict: refused for template at height %d — %s (falling back to shrinking the payout set)",
+                 t->height, err);
+    } else if (n > 0) {
+        LOG_INFO("evict: dropped %d tail tx(s), %lld WU, %lld sats of fees, so %zu payout outputs fit (height %d, %zu txs kept)",
+                 n, (long long)wu, (long long)fee, ceiling, t->height, t->tx_count);
+    }
 }
 
 /* The size of the operator's own fee output, or 0 when no fee is taken.
@@ -1645,6 +1676,7 @@ static void *tip_watcher(void *arg) {
 
         if (need_rebuild) {
             char berr[256] = {0};
+            prop_evict_for_payouts(s->cfg, t);
             stratum_job_t *job = build_job_from_template(s, s->cfg, t, berr, sizeof berr);
             if (!job) {
                 LOG_ERROR("rebuild job failed: %s", berr);
@@ -2083,6 +2115,7 @@ int main(int argc, char **argv) {
     snprintf(sctx.last_prev_hash, sizeof sctx.last_prev_hash, "%s", tmpl->prev_hash_hex);
     sctx.last_built_ms = now_ms();
 
+    prop_evict_for_payouts(&cfg, tmpl);
     stratum_job_t *initial_job = build_job_from_template(&sctx, &cfg, tmpl, err, sizeof err);
     if (!initial_job) {
         fprintf(stderr, "build initial job failed: %s\n", err);

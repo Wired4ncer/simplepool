@@ -238,6 +238,16 @@ typedef struct {
     double prop_window_k;
     int64_t prop_min_payout_sats;
     int prop_max_outputs;
+    /* prop_evict_txs = 1: when a template is so full that the pool's coinbase
+     * (prop_max_outputs payouts + fee + tag) would not fit, drop transactions
+     * from the END of the template until it does, recomputing the witness
+     * commitment and the reward (src/evict.h). 0 (default) = the old
+     * behaviour: shrink the payout count to what fits — which on a full
+     * mempool is ONE output per block, and even that overflowed by 177 WU
+     * on 2026-09-19 (bad-blk-weight). The eviction refuses itself, loudly,
+     * whenever its own witness-commitment arithmetic does not reproduce the
+     * enforcer's for the unchanged template. */
+    int prop_evict_txs;
     /* prop_carry_slots reserves this many of the AVAILABLE payout outputs for
      * the addresses owed most from previous blocks, instead of for the largest
      * claims in this one. 0 (the default) is the pure largest-claim selection.

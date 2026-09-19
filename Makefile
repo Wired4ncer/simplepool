@@ -60,7 +60,7 @@ GIT_DIRTY  := $(shell git status --porcelain --untracked-files=no 2>/dev/null | 
 VERSION_H  := $(BUILD_DIR)/version_gen.h
 
 # Sources compiled in this wave. More modules land in later waves.
-SRCS := src/main.c src/log.c src/config.c src/coinbase.c \
+SRCS := src/main.c src/log.c src/config.c src/coinbase.c src/evict.c \
         src/share.c src/sha256.c src/stratum.c src/store.c \
         src/pplns.c \
         src/bitcoind.c src/broadcast.c src/thunder.c src/version.c \
@@ -118,6 +118,7 @@ include tests/test_broadcast.mk
 include tests/test_thunder.mk
 include tests/test_pplns.mk
 include tests/test_config.mk
+include tests/test_evict.mk
 
 # Rebuild every test binary when any header changes. The test .mk rules list
 # only .c files, so a header-only edit used to leave stale test binaries in
@@ -126,10 +127,10 @@ include tests/test_config.mk
 # extra prerequisites never reach the compiler as inputs.
 TEST_BINS := build/test_share build/test_bitcoind build/test_stratum \
              build/test_store build/test_coinbase build/test_broadcast \
-             build/test_thunder build/test_pplns build/test_config
+             build/test_thunder build/test_pplns build/test_config build/test_evict
 $(TEST_BINS): $(wildcard src/*.h)
 
-test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_pplns build/test_config
+test: build/test_share build/test_bitcoind build/test_stratum build/test_store build/test_coinbase build/test_broadcast build/test_thunder build/test_pplns build/test_config build/test_evict
 	./build/test_share
 	./build/test_bitcoind
 	./build/test_stratum
@@ -139,6 +140,7 @@ test: build/test_share build/test_bitcoind build/test_stratum build/test_store b
 	./build/test_thunder
 	./build/test_pplns
 	./build/test_config
+	./build/test_evict
 
 # Run the suites under AddressSanitizer + UndefinedBehaviorSanitizer.
 #

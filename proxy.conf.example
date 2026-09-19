@@ -278,3 +278,12 @@ pool_mode = solo
 # pps_refuse_shares_below_min = 1
 
 log_level = info
+
+# prop_evict_txs = 1: on a FULL template, drop transactions from the end
+# until the coinbase with prop_max_outputs payouts + fee + tag fits, and
+# recompute the witness commitment and reward. 0 (default) shrinks the payout
+# count instead — on a saturated mempool that is ONE payout per block, and on
+# 2026-09-19 even that overflowed (bad-blk-weight). The eviction refuses
+# itself, loudly, if its own commitment arithmetic does not reproduce the
+# backend's for the unchanged template.
+# prop_evict_txs = 1

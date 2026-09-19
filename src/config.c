@@ -60,6 +60,7 @@ void proxy_config_defaults(proxy_config_t *cfg) {
     cfg->vardiff_max_window_mult = 8;
     cfg->vardiff_idle_step       = 2.0;
     cfg->clean_jobs_on_refresh = 1;
+    cfg->prop_evict_txs = 0;
     cfg->idle_timeout_sec   = 600;    /* 10 min silent recv → reap */
     cfg->idle_timeout_authorized_sec = 3600;  /* authorized miners: 1 h */
 
@@ -407,6 +408,7 @@ int proxy_config_load(const char *path, proxy_config_t *cfg,
         else if (strcmp(k, "prop_window_k")             == 0) cfg->prop_window_k = atof(v);
         else if (strcmp(k, "prop_min_payout_sats")      == 0) cfg->prop_min_payout_sats = (int64_t)atoll(v);
         else if (strcmp(k, "prop_max_outputs")          == 0) cfg->prop_max_outputs = atoi(v);
+        else if (strcmp(k, "prop_evict_txs")            == 0) cfg->prop_evict_txs = atoi(v);
         else if (strcmp(k, "prop_carry_slots")          == 0) cfg->prop_carry_slots = atoi(v);
         else if (strcmp(k, "prop_max_coinbase_bytes")   == 0) cfg->prop_max_coinbase_bytes = atoi(v);
         else if (strcmp(k, "prop_window_min_sec")       == 0) cfg->prop_window_min_sec = atoi(v);

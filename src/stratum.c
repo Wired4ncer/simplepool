@@ -100,11 +100,13 @@
  * exactly the state this pool shipped in until 2026-08-30, in the other
  * direction — 8 slots that never once bound because the TTL was 60 s.
  *
- * ⚠️ 30000 is `bitcoind_poll_interval_ms`'s DEFAULT (config.c:38), not a law:
+ * ⚠️ 5000 is the CONFIGURED `bitcoind_poll_interval_ms` on beta since 2026-09-19
+ * (the compiled default is still 30000, config.c:38), not a law:
  * the cadence is configurable, so this assert checks the shipped configuration,
  * not every possible one. Lower that key materially below 30 s and the ring
  * binds first again at runtime, with no build error to warn you. */
-_Static_assert((uint64_t)STRATUM_RECENT_JOBS * 30000u >= RECENT_JOB_TTL_MS,
+/* 30000 -> 5000 on 2026-09-19 with the cadence change (see STRATUM_RECENT_JOBS). */
+_Static_assert((uint64_t)STRATUM_RECENT_JOBS * 5000u >= RECENT_JOB_TTL_MS,
                "retention ring too shallow for RECENT_JOB_TTL_MS at the default "
                "job cadence: raise STRATUM_RECENT_JOBS or lower the TTL");
 /* Per-connection job -> issued-difficulty ring. Must cover every job stratum
