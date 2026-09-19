@@ -156,7 +156,7 @@ static int cb_rewrite_commitment(char *hex, const uint8_t wc[32], char *errbuf, 
     int rc = cb_locate(tx, len, &voff, &sp, &woff, &wn, errbuf, errlen);
     free(tx);
     if (rc < 0) return -1;
-    if (wn != 1) { set_err(errbuf, errlen, "coinbase carries %d witness-commitment outputs (expected 1)", wn); return -1; }
+    if (wn != 1) { set_err(errbuf, errlen, "coinbase carries %d 38-byte witness-commitment (6a24aa21a9ed) outputs (expected exactly 1)", wn); return -1; }
     static const char digits[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) {
         hex[2 * (woff + 6 + i)]     = digits[wc[i] >> 4];
@@ -171,7 +171,7 @@ static int cb_embedded_commitment(const char *hex, uint8_t out[32], char *errbuf
     if (!tx) { set_err(errbuf, errlen, "bad coinbase hex"); return -1; }
     size_t voff, woff; int sp, wn;
     int rc = cb_locate(tx, len, &voff, &sp, &woff, &wn, errbuf, errlen);
-    if (rc == 0 && wn != 1) { set_err(errbuf, errlen, "coinbase carries %d witness-commitment outputs (expected 1)", wn); rc = -1; }
+    if (rc == 0 && wn != 1) { set_err(errbuf, errlen, "coinbase carries %d 38-byte witness-commitment (6a24aa21a9ed) outputs (expected exactly 1)", wn); rc = -1; }
     if (rc == 0) memcpy(out, tx + woff + 6, 32);
     free(tx);
     return rc;

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "evict.h"
+#include "coinbase.h"
 
 static int fails = 0, checks = 0;
 #define CHECK(c) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -182,6 +183,42 @@ static void test_safety_gate_refuses(void) {
     fr(t);
 }
 
+/* The contract the whole module rests on: coinbase.c copies the template's
+ * OP_RETURN commitment output VERBATIM into what it renders, so the commitment
+ * the block carries is the one INSIDE coinbasetxn_hex. A future builder that
+ * sourced it elsewhere (e.g. job->wc_hex) would break eviction with every
+ * other test still green — this one would not stay green. */
+static void test_builder_emits_the_new_commitment(void) {
+    char err[256] = {0}; int64_t wu = 0, fee = 0;
+    bitcoind_template_t *t = mk(5, C5, 20000);
+    CHECK(evict_tail_for_coinbase(t, 9500, &wu, &fee, err, sizeof err) == 1);
+    int64_t reward = 0;
+    CHECK(coinbase_template_reward(t->coinbasetxn_hex, &reward, err, sizeof err) == 0);
+    CHECK(reward == 318107917 - 500);
+    /* one payout taking the whole reward-after-fee; the builder checks the sum */
+    const char *op = "bc1p8f2nswh6pa6aedye80wkak74z0g40gkfdds8wcsaznm550altd4qptz0dk";
+    int64_t fee_sats = reward * 50 / 10000;
+    coinbase_payout_t p = { "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", reward - fee_sats };
+    coinbase_parts_t parts = {0}; int has_wit = 0;
+    CHECK(coinbase_build_from_template_multi(t->coinbasetxn_hex, &p, 1, op, 50, "/ecpool.tech/",
+                                             4, 8, &parts, &has_wit, NULL, NULL, err, sizeof err) == 0);
+    CHECK(has_wit == 1);
+    /* find the 38-byte OP_RETURN in cb2 and compare its 32 bytes with the field */
+    uint8_t want[32]; for (int i = 0; i < 32; i++) { unsigned b; sscanf(t->default_witness_commitment + 12 + 2*i, "%2x", &b); want[i] = (uint8_t)b; }
+    int found = 0, old_found = 0;
+    uint8_t old[32]; for (int i = 0; i < 32; i++) { unsigned b; sscanf(C5 + 2*i, "%2x", &b); old[i] = (uint8_t)b; }
+    for (size_t i = 0; i + 38 <= parts.cb2_len; i++) {
+        if (memcmp(parts.cb2 + i, "\x6a\x24\xaa\x21\xa9\xed", 6) == 0) {
+            if (memcmp(parts.cb2 + i + 6, want, 32) == 0) found++;
+            if (memcmp(parts.cb2 + i + 6, old, 32) == 0) old_found++;
+        }
+    }
+    CHECK(found == 1);
+    CHECK(old_found == 0);
+    free(parts.cb1); free(parts.cb2);
+    fr(t);
+}
+
 int main(void) {
     test_commitment_vectors();
     test_reward_adjust();
@@ -189,6 +226,7 @@ int main(void) {
     test_safety_gate_refuses();
     test_exact_fit_boundaries();
     test_gate_needs_embedded_commitment();
+    test_builder_emits_the_new_commitment();
     if (fails) { fprintf(stderr, "test_evict: %d of %d checks FAILED\n", fails, checks); return 1; }
     printf("test_evict: %d checks passed\n", checks);
     return 0;
