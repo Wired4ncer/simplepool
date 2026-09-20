@@ -200,7 +200,7 @@ static void test_builder_emits_the_new_commitment(void) {
     int64_t fee_sats = reward * 50 / 10000;
     coinbase_payout_t p = { "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", reward - fee_sats };
     coinbase_parts_t parts = {0}; int has_wit = 0;
-    CHECK(coinbase_build_from_template_multi(t->coinbasetxn_hex, &p, 1, op, 50, "/ecpool.tech/",
+    CHECK(coinbase_build_from_template_multi(t->coinbasetxn_hex, &p, 1, op, 50, "/ecpool.tech/", 0,
                                              4, 8, &parts, &has_wit, NULL, NULL, err, sizeof err) == 0);
     CHECK(has_wit == 1);
     /* find the 38-byte OP_RETURN in cb2 and compare its 32 bytes with the field */

@@ -772,7 +772,10 @@ static int prop_build_plan(server_ctx_t *s, const bitcoind_template_t *t,
             coinbase_build_from_template_multi(t->coinbasetxn_hex, cb, n_payouts,
                                                s->cfg->operator_address,
                                                s->cfg->fee_bps,
-                                               s->cfg->coinbase_tag,
+                                               /* salt 1, not 0: the probe must
+                                                * measure the 5 salt bytes the
+                                                * real render will add */
+                                               s->cfg->coinbase_tag, 1,
                                                /*en1*/ STRATUM_EXTRANONCE1_SIZE,
                                                /*en2*/ STRATUM_EXTRANONCE2_SIZE,
                                                &probe, NULL, NULL, NULL,

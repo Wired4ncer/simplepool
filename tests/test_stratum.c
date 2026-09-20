@@ -1863,7 +1863,8 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     stratum_server_start(&cfg, &s);
 
     uint8_t net[32] = {0};
-    stratum_server_set_job(s, make_test_job("J1", net), 1);
+    stratum_job_t *j1 = make_test_job("J1", net);
+    stratum_server_set_job(s, j1, 1);
 
     stratum_conn_t *c = stratum_conn_new_for_test(s);
     char *out = NULL; size_t olen = 0;
@@ -1881,8 +1882,13 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     CHECK(obs.shares == 1);
     free(out); out=NULL; olen=0;
 
-    /* Same template, new id. Identical header -> identical hash. */
-    stratum_server_set_job(s, make_test_job("J2", net), 1);
+    /* Same template, new id, and — pinned for this test — the same coinbase
+     * salt, so the header really is identical. In production every job gets
+     * its own salt (see the next block), which is exactly why this ring is
+     * now the second line and not the first. */
+    stratum_job_t *j2 = make_test_job("J2", net);
+    stratum_job_set_cb_salt_for_test(j2, stratum_job_cb_salt_for_test(j1));
+    stratum_server_set_job(s, j2, 1);
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J2\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
@@ -1890,6 +1896,24 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     CHECK(obs.shares == 1);  /* still one */
     CHECK(obs.rejects >= 1);
     CHECK(strstr(obs.last_reason, "duplicate") != NULL);
+    free(out); out=NULL; olen=0;
+
+    /* Same template AGAIN under a third id, this time with its own salt (the
+     * production path): the coinbase differs, so the same (en2, ntime, nonce)
+     * is a different header and a genuinely new share. This is the 2026-09-20
+     * duplicate-share fix — a rig that re-searches identical work no longer
+     * re-finds credited hashes because the work is no longer identical. */
+    stratum_job_t *j3 = make_test_job("J3", net);
+    CHECK(stratum_job_cb_salt_for_test(j3) != stratum_job_cb_salt_for_test(j1));
+    CHECK(stratum_job_cb_salt_for_test(j3) != 0);
+    stratum_server_set_job(s, j3, 1);
+    int rejects_before = obs.rejects;
+    stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J3\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == rejects_before);
     free(out);
 
     stratum_conn_free_for_test(c);

@@ -29,11 +29,16 @@ typedef struct {
  * Kept for tests and simple solo configurations.
  *
  * `witness_commitment_hex` may be NULL.
+ *
+ * `job_salt` (every builder): when non-zero, a 4-byte push after the tag so
+ * jobs built from an unchanged template are still distinct work; 0 emits
+ * nothing and keeps the classic layout. Pass the job's salt from the stratum
+ * layer, 0 from probes/tests. See cb_tag_push in coinbase.c for why.
  * Returns 0 ok, negative on error (errbuf populated). */
 int coinbase_build(uint32_t height, int64_t value_sats,
                    const char *payout_address,
                    const char *witness_commitment_hex,
-                   const char *coinbase_tag,
+                   const char *coinbase_tag, uint32_t job_salt,
                    size_t extranonce1_size, size_t extranonce2_size,
                    coinbase_parts_t *out, char *errbuf, size_t errlen);
 
@@ -53,7 +58,7 @@ int coinbase_build_split(uint32_t height, int64_t value_sats,
                          const char *operator_address,
                          int fee_bps,
                          const char *witness_commitment_hex,
-                         const char *coinbase_tag,
+                         const char *coinbase_tag, uint32_t job_salt,
                          size_t extranonce1_size, size_t extranonce2_size,
                          coinbase_parts_t *out,
                          int64_t *out_miner_sats, int64_t *out_fee_sats,
@@ -84,7 +89,7 @@ int coinbase_build_from_template(const char *coinbase_tx_hex,
                                  const char *miner_address,
                                  const char *operator_address,
                                  int fee_bps,
-                                 const char *coinbase_tag,
+                                 const char *coinbase_tag, uint32_t job_salt,
                                  size_t extranonce1_size,
                                  size_t extranonce2_size,
                                  coinbase_parts_t *out,
@@ -109,7 +114,7 @@ int coinbase_build_from_template_multi(const char *coinbase_tx_hex,
                                        size_t n_payouts,
                                        const char *operator_address,
                                        int fee_bps,
-                                       const char *coinbase_tag,
+                                       const char *coinbase_tag, uint32_t job_salt,
                                        size_t extranonce1_size,
                                        size_t extranonce2_size,
                                        coinbase_parts_t *out,

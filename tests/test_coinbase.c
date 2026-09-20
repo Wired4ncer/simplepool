@@ -93,7 +93,7 @@ static void test_build_coinbase_structural(void) {
 
     int rc = coinbase_build(800000, 625000000,
                             "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-                            wc_hex, "/drivepool/", 4, 4,
+                            wc_hex, "/drivepool/", 0, 4, 4,
                             &parts, err, sizeof err);
     if (rc != 0) {
         fprintf(stderr, "coinbase_build err: %s\n", err);
@@ -192,7 +192,7 @@ static void test_build_coinbase_split_fee_math(void) {
         800000, 5000000000LL,
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-        100, NULL, "/simplepool/", 4, 4,
+        100, NULL, "/simplepool/", 0, 4, 4,
         &parts, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats   == 50000000LL);
@@ -204,7 +204,7 @@ static void test_build_coinbase_split_fee_math(void) {
         800000, 5000000000LL,
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-        0, NULL, "/simplepool/", 4, 4,
+        0, NULL, "/simplepool/", 0, 4, 4,
         &parts, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats   == 0);
@@ -217,7 +217,7 @@ static void test_build_coinbase_split_fee_math(void) {
         800000, 30000LL,
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
         "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-        100, NULL, "/simplepool/", 4, 4,
+        100, NULL, "/simplepool/", 0, 4, 4,
         &parts, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats   == 0);
@@ -237,7 +237,7 @@ static void test_bip34_small_height_uses_opn(void) {
     /* height = 5 should produce scriptSig starting with OP_5 = 0x55. */
     int rc = coinbase_build(5, 5000000000LL,
                             "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
-                            NULL, "/simplepool/", 4, 4,
+                            NULL, "/simplepool/", 0, 4, 4,
                             &parts, err, sizeof err);
     assert(rc == 0);
 
@@ -295,7 +295,7 @@ static void test_build_from_template(void) {
     int64_t miner_sats = 0, fee_sats = 0;
 
     int rc = coinbase_build_from_template(
-        ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/", 4, 4,
+        ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/", 0, 4, 4,
         &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
     if (rc != 0) fprintf(stderr, "build_from_template err: %s\n", err);
     assert(rc == 0);
@@ -389,7 +389,7 @@ static void test_build_from_template_fee_split(void) {
     int64_t miner_sats = 0, fee_sats = 0;
 
     int rc = coinbase_build_from_template(
-        ENF_COINBASE_HEX, ENF_ADDR, ENF_ADDR, 100, "/x/", 4, 4,
+        ENF_COINBASE_HEX, ENF_ADDR, ENF_ADDR, 100, "/x/", 0, 4, 4,
         &parts, &has_witness, &miner_sats, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(fee_sats == 50000000LL);       /* 1% of 50 BTC */
@@ -447,7 +447,7 @@ static void test_count_outputs(void) {
                                 /* witness_commitment_hex */
                                 "6a24aa21a9ed2222222222222222222222222222"
                                 "222222222222222222222222222222222222",
-                                /* coinbase_tag */ NULL,
+                                /* coinbase_tag */ NULL, 0,
                                 4, 4, &parts, NULL, NULL, err, sizeof err) == 0);
     /* cb1 + extranonce1 + extranonce2 + cb2 is the coinbase a miner submits. */
     size_t n = parts.cb1_len * 2 + 16 + parts.cb2_len * 2 + 1;
@@ -494,7 +494,7 @@ static void test_template_reward(void) {
     int64_t fee_expect = (reward * 100) / 10000;
     coinbase_payout_t payouts[] = { { ENF_ADDR, reward - fee_expect } };
     assert(coinbase_build_from_template_multi(
-               ENF_COINBASE_HEX, payouts, 1, ENF_ADDR, 100, "/x/", 4, 4,
+               ENF_COINBASE_HEX, payouts, 1, ENF_ADDR, 100, "/x/", 0, 4, 4,
                &parts, NULL, &total_payout, &fee_sats, err, sizeof err) == 0);
     assert(fee_sats == fee_expect);
     assert(total_payout + fee_sats == reward);
@@ -846,7 +846,7 @@ static void test_build_from_template_multi(void) {
     };
 
     int rc = coinbase_build_from_template_multi(
-        ENF_COINBASE_HEX, payouts, 3, NULL, 0, "/x/", 4, 4,
+        ENF_COINBASE_HEX, payouts, 3, NULL, 0, "/x/", 0, 4, 4,
         &parts, &has_witness, &total_payout, &fee_sats, err, sizeof err);
     if (rc != 0) fprintf(stderr, "build_from_template_multi err: %s\n", err);
     assert(rc == 0);
@@ -926,7 +926,7 @@ static void test_build_from_template_multi_fee(void) {
     };
 
     int rc = coinbase_build_from_template_multi(
-        ENF_COINBASE_HEX, payouts, 2, ENF_ADDR, 100, "/x/", 4, 4,
+        ENF_COINBASE_HEX, payouts, 2, ENF_ADDR, 100, "/x/", 0, 4, 4,
         &parts, NULL, &total_payout, &fee_sats, err, sizeof err);
     assert(rc == 0);
     assert(total_payout == 4950000000LL);
@@ -967,7 +967,7 @@ static void test_build_from_template_multi_sum_check(void) {
     };
 
     int rc = coinbase_build_from_template_multi(
-        ENF_COINBASE_HEX, payouts, 2, NULL, 0, "/x/", 4, 4,
+        ENF_COINBASE_HEX, payouts, 2, NULL, 0, "/x/", 0, 4, 4,
         &parts, NULL, NULL, NULL, err, sizeof err);
     assert(rc < 0);
     printf("ok: coinbase_build_from_template_multi sum check\n");
@@ -1024,7 +1024,7 @@ static void test_scriptsig_length_matches_advertised_extranonce(void) {
     assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
                                 "6a24aa21a9ed2222222222222222222222222222"
                                 "222222222222222222222222222222222222",
-                                "/simplepool/",
+                                "/simplepool/", 0,
                                 en1, en2, &parts, NULL, NULL,
                                 err, sizeof err) == 0);
 
@@ -1070,7 +1070,7 @@ static void test_wrong_width_extranonce_desyncs_the_parse(void) {
     assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, ENF_ADDR, 100,
                                 "6a24aa21a9ed2222222222222222222222222222"
                                 "222222222222222222222222222222222222",
-                                "/simplepool/",
+                                "/simplepool/", 0,
                                 STRATUM_EXTRANONCE1_SIZE,
                                 STRATUM_EXTRANONCE2_SIZE, &parts, NULL, NULL,
                                 err, sizeof err) == 0);
@@ -1108,12 +1108,82 @@ static void test_scriptsig_over_100_is_rejected(void) {
     coinbase_parts_t parts = {0};
     char err[256] = {0};
     int rc = coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0,
-                                  NULL, "/simplepool/",
+                                  NULL, "/simplepool/", 0,
                                   /* en1 */ 4, /* en2 */ 90,
                                   &parts, NULL, NULL, err, sizeof err);
     assert(rc < 0);
     assert(strstr(err, "scriptSig length") != NULL);
     printf("ok: oversized coinbase scriptSig rejected (%s)\n", err);
+}
+
+
+/* Per-job salt (2026-09-20): a non-zero job_salt appends one 5-byte push
+ * (0x04 + 4 LE bytes) right after the tag, before the extranonce, and it is
+ * counted against the 100-byte scriptSig cap. Salt 0 is byte-identical to the
+ * pre-salt layout. Two salts -> two different cb1 -> different merkle roots,
+ * which is the whole point. Exercised on the template path (the one beta
+ * mines with) and on the split path. */
+static void test_job_salt_push(void) {
+    coinbase_parts_t a = {0}, b = {0}, z = {0};
+    char err[256] = {0};
+
+    assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/",
+                                        0x11223344u, 4, 4,
+                                        &a, NULL, NULL, NULL, err, sizeof err) == 0);
+    assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/",
+                                        0x11223345u, 4, 4,
+                                        &b, NULL, NULL, NULL, err, sizeof err) == 0);
+    assert(coinbase_build_from_template(ENF_COINBASE_HEX, ENF_ADDR, NULL, 0, "/x/",
+                                        0, 4, 4,
+                                        &z, NULL, NULL, NULL, err, sizeof err) == 0);
+    /* exactly 5 more bytes than the unsalted build, all in cb1 */
+    assert(a.cb1_len == z.cb1_len + 5);
+    assert(a.cb2_len == z.cb2_len);
+    assert(b.cb1_len == a.cb1_len);
+    /* different salts -> different cb1; same everything else */
+    assert(memcmp(a.cb1, b.cb1, a.cb1_len) != 0);
+    assert(memcmp(a.cb2, b.cb2, a.cb2_len) == 0);
+
+    /* Walk to the scriptSig: version(4) vin(1) prevout(36) varint(len). */
+    size_t off = 4 + 1 + 36;
+    uint64_t ss_len = 0;
+    assert(read_varint(a.cb1, a.cb1_len, &off, &ss_len) == 0);
+    assert(ss_len == 4 + 4 + 5 + 8); /* height + "/x/" + salt push + extranonce */
+    /* height push, then tag push, then the salt push, then cb1 ends (extranonce
+     * follows on the wire) */
+    assert(a.cb1[off + 4] == 0x03 && a.cb1[off + 5] == '/' && a.cb1[off + 7] == '/');
+    assert(a.cb1[off + 8]  == 0x04);
+    assert(a.cb1[off + 9]  == 0x44 && a.cb1[off + 10] == 0x33 &&
+           a.cb1[off + 11] == 0x22 && a.cb1[off + 12] == 0x11);
+    assert(off + 13 == a.cb1_len);
+    /* the tag text itself is untouched */
+    assert(memcmp(a.cb1 + off, z.cb1 + off, 8) == 0);
+
+    /* Split path: same 5 bytes, same position rule. */
+    coinbase_parts_t sa = {0}, sz = {0};
+    assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0, NULL,
+                                "/simplepool/", 0xdeadbeefu, 4, 4,
+                                &sa, NULL, NULL, err, sizeof err) == 0);
+    assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0, NULL,
+                                "/simplepool/", 0, 4, 4,
+                                &sz, NULL, NULL, err, sizeof err) == 0);
+    assert(sa.cb1_len == sz.cb1_len + 5);
+    assert(sa.cb1[sa.cb1_len - 5] == 0x04 && sa.cb1[sa.cb1_len - 4] == 0xef &&
+           sa.cb1[sa.cb1_len - 1] == 0xde);
+
+    /* The cap counts the salt: 4 (height) + 76 (75-byte tag) + 8 + 8 = 96 fits
+     * unsalted, 101 salted -> refused. */
+    char longtag[76]; memset(longtag, 'T', 75); longtag[75] = 0;
+    coinbase_parts_t fit = {0}, over = {0};
+    assert(coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0, NULL,
+                                longtag, 0, 8, 8, &fit, NULL, NULL, err, sizeof err) == 0);
+    int rc = coinbase_build_split(800000, 5000000000LL, ENF_ADDR, NULL, 0, NULL,
+                                  longtag, 7, 8, 8, &over, NULL, NULL, err, sizeof err);
+    assert(rc < 0 && strstr(err, "scriptSig length") != NULL);
+
+    free(a.cb1); free(a.cb2); free(b.cb1); free(b.cb2); free(z.cb1); free(z.cb2);
+    free(sa.cb1); free(sa.cb2); free(sz.cb1); free(sz.cb2); free(fit.cb1); free(fit.cb2);
+    printf("ok: job salt = one 5-byte push after the tag, counted against the cap, 0 = unchanged\n");
 }
 
 
@@ -1318,6 +1388,7 @@ int main(void) {
     test_scriptsig_length_matches_advertised_extranonce();
     test_wrong_width_extranonce_desyncs_the_parse();
     test_scriptsig_over_100_is_rejected();
+    test_job_salt_push();
     test_bip350_supported();
     test_bip350_refused_by_policy();
     test_bip350_invalid();
