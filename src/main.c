@@ -339,10 +339,13 @@ static size_t prop_max_outputs_for_template(const bitcoind_template_t *t,
     for (size_t i = 0; i < t->tx_count; i++) tx_weight += t->txs[i].weight;
 
     /* What the builder splices into the scriptSig: both extranonces, plus the
-     * tag and its length byte. Same constants the probe build passes to
-     * coinbase_build_from_template_multi — a literal here went stale when
-     * extranonce2 grew 4 → 8 and overstated the headroom by 16 WU. */
-    size_t ss_growth = STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE;
+     * tag and its length byte, plus the per-job salt push. Same constants the
+     * probe build passes to coinbase_build_from_template_multi — a literal
+     * here went stale when extranonce2 grew 4 → 8 and overstated the headroom
+     * by 16 WU, and the model missed the salt's 5 bytes on its first cut
+     * (review 2026-09-20). */
+    size_t ss_growth = STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE
+                     + COINBASE_JOB_SALT_PUSH_BYTES;
     size_t taglen = strlen(cfg->coinbase_tag);
     if (taglen) ss_growth += (taglen > 75 ? 75 : taglen) + 1;
 
@@ -389,7 +392,8 @@ static void prop_evict_for_payouts(const proxy_config_t *cfg, bitcoind_template_
     if (ceiling > PROP_PLAN_MAX_PAY) ceiling = PROP_PLAN_MAX_PAY;
     if (ceiling < 1) ceiling = 1;
     int fee_output = cfg->operator_address[0] && cfg->fee_bps > 0;
-    size_t ss_growth = STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE;
+    size_t ss_growth = STRATUM_EXTRANONCE1_SIZE + STRATUM_EXTRANONCE2_SIZE
+                     + COINBASE_JOB_SALT_PUSH_BYTES;   /* mirrors the site above */
     size_t taglen = strlen(cfg->coinbase_tag);
     if (taglen) ss_growth += (taglen > 75 ? 75 : taglen) + 1;
     int64_t need_wu = (int64_t)(strlen(t->coinbasetxn_hex) / 2) * 4

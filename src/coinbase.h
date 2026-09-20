@@ -15,6 +15,10 @@ typedef struct {
  * output would not be relayed, so sub-dust operator fees and PPLNS payouts
  * are dropped or carried forward instead of emitted. */
 #define COINBASE_DUST_SATS 546
+/* Bytes the per-job salt adds to the coinbase scriptSig when job_salt != 0:
+ * one length byte + 4. Every byte/weight model of the coinbase (main.c's
+ * ss_growth sites) adds this; the builders themselves add it via cb_tag_push. */
+#define COINBASE_JOB_SALT_PUSH_BYTES 5
 
 /* One payout destination for coinbase_build_from_template_multi(). */
 typedef struct {

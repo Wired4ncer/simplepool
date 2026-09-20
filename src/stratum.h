@@ -531,12 +531,13 @@ void stratum_server_free(stratum_server_t *s);
  * construct one of these directly. */
 typedef struct stratum_conn stratum_conn_t;
 
-/* Allocate a connection state attached to a server. Used by tests; the
- * real listener uses an internal allocator. */
 /* Override a job's coinbase salt. Only for tests that need two job ids to be
  * the SAME work (the hash-dedupe ring); production salts come from job_id. */
 void            stratum_job_set_cb_salt_for_test(stratum_job_t *j, uint32_t salt);
 uint32_t        stratum_job_cb_salt_for_test(const stratum_job_t *j);
+
+/* Allocate a connection state attached to a server. Used by tests; the
+ * real listener uses an internal allocator. */
 stratum_conn_t *stratum_conn_new_for_test(stratum_server_t *s);
 void            stratum_conn_free_for_test(stratum_conn_t *c);
 
