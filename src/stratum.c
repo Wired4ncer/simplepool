@@ -494,7 +494,11 @@ struct stratum_server {
      * current job's was mined on a tip that is already gone, yet the grace
      * window credits it. The share table stores no job height, so this cannot
      * be recovered afterwards; these running totals are logged at each new
-     * height. Difficulty is summed rounded to whole units (shares are >= 1).
+     * height. It is a LOWER BOUND on stale-tip credits: a same-height
+     * competing block or a reorg downward leaves the height unchanged/lower,
+     * so those are not counted. Difficulty is summed rounded to whole units —
+     * exact on beta (shares >= 1024), undercounted for shares below 0.5 (a
+     * minimum-difficulty window); the share COUNT is exact either way.
      * Measurement only — nothing reads them to decide anything. */
     atomic_ullong sh_acc_n, sh_acc_diff;
     atomic_ullong sh_old_n, sh_old_diff;
@@ -2760,6 +2764,14 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
      * (or no negotiation) this leaves job->version unchanged. We fall back to
      * the standard BIP320 mask if a version arrives without prior configure,
      * so miners that roll by default still verify correctly. */
+    /* The height current when the share ARRIVED (superseded-height count
+     * below): read before any submitblock, so the share that finds a block is
+     * not counted old because the tip moved while it was being submitted. */
+    uint32_t arrival_h = 0;
+    pthread_rwlock_rdlock(&s->job_lock);
+    if (s->current_job) arrival_h = s->current_job->height;
+    pthread_rwlock_unlock(&s->job_lock);
+
     int32_t submit_version = job->version;
     if (cJSON_GetArraySize(params) >= 6) {
         cJSON *v = cJSON_GetArrayItem(params, 5);
@@ -3020,14 +3032,11 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     free(cb);
 
     {
-        uint32_t cur_h = 0;
-        pthread_rwlock_rdlock(&s->job_lock);
-        if (s->current_job) cur_h = s->current_job->height;
-        pthread_rwlock_unlock(&s->job_lock);
-        unsigned long long d = share_diff > 0 ? (unsigned long long)(share_diff + 0.5) : 0;
+        unsigned long long d = (isfinite(share_diff) && share_diff > 0)
+                                   ? (unsigned long long)(share_diff + 0.5) : 0;
         atomic_fetch_add_explicit(&s->sh_acc_n, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&s->sh_acc_diff, d, memory_order_relaxed);
-        if (job->height < cur_h) {
+        if (job->height < arrival_h) {
             atomic_fetch_add_explicit(&s->sh_old_n, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&s->sh_old_diff, d, memory_order_relaxed);
         }
