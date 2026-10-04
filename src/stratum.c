@@ -2758,12 +2758,6 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
                            cJSON *params, stratum_job_t *job,
                            const char *en2, const char *ntime,
                            const char *nonce, char **buf, size_t *len) {
-    /* Version rolling (BIP310): the optional 6th submit param carries the
-     * version the miner actually hashed. Keep the job's version bits outside
-     * the negotiated mask and take the miner's bits inside it; with no param
-     * (or no negotiation) this leaves job->version unchanged. We fall back to
-     * the standard BIP320 mask if a version arrives without prior configure,
-     * so miners that roll by default still verify correctly. */
     /* The height current when the share ARRIVED (superseded-height count
      * below): read before any submitblock, so the share that finds a block is
      * not counted old because the tip moved while it was being submitted. */
@@ -2772,6 +2766,12 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     if (s->current_job) arrival_h = s->current_job->height;
     pthread_rwlock_unlock(&s->job_lock);
 
+    /* Version rolling (BIP310): the optional 6th submit param carries the
+     * version the miner actually hashed. Keep the job's version bits outside
+     * the negotiated mask and take the miner's bits inside it; with no param
+     * (or no negotiation) this leaves job->version unchanged. We fall back to
+     * the standard BIP320 mask if a version arrives without prior configure,
+     * so miners that roll by default still verify correctly. */
     int32_t submit_version = job->version;
     if (cJSON_GetArraySize(params) >= 6) {
         cJSON *v = cJSON_GetArrayItem(params, 5);
