@@ -489,6 +489,16 @@ struct stratum_server {
     atomic_int  cb_ceiling_hwm;
     atomic_int  cb_ceiling_warnings;
 
+    /* Superseded-height credits (operator 2026-10-03, "measure first" on
+     * height-aware retention). A share on a job whose height is BELOW the
+     * current job's was mined on a tip that is already gone, yet the grace
+     * window credits it. The share table stores no job height, so this cannot
+     * be recovered afterwards; these running totals are logged at each new
+     * height. Difficulty is summed rounded to whole units (shares are >= 1).
+     * Measurement only — nothing reads them to decide anything. */
+    atomic_ullong sh_acc_n, sh_acc_diff;
+    atomic_ullong sh_old_n, sh_old_diff;
+
     /* Share dedupe, keyed on the resulting block-header hash. The
      * per-connection ring in stratum_conn cannot catch a duplicate that
      * arrives on a *different* connection. Keying on the final hash makes the
@@ -3009,6 +3019,20 @@ static int submit_with_job(stratum_server_t *s, stratum_conn_t *c, cJSON *id,
     }
     free(cb);
 
+    {
+        uint32_t cur_h = 0;
+        pthread_rwlock_rdlock(&s->job_lock);
+        if (s->current_job) cur_h = s->current_job->height;
+        pthread_rwlock_unlock(&s->job_lock);
+        unsigned long long d = share_diff > 0 ? (unsigned long long)(share_diff + 0.5) : 0;
+        atomic_fetch_add_explicit(&s->sh_acc_n, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->sh_acc_diff, d, memory_order_relaxed);
+        if (job->height < cur_h) {
+            atomic_fetch_add_explicit(&s->sh_old_n, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&s->sh_old_diff, d, memory_order_relaxed);
+        }
+    }
+
     if (s->cfg.on_share) {
         /* Always pass the actual share hash so the dashboard can show the
          * hash of every share (and the user can eyeball its leading zeros
@@ -3296,6 +3320,14 @@ void stratum_conn_free_for_test(stratum_conn_t *c) {
 
 stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id) {
     return find_job(s, job_id);
+}
+void stratum_height_credits_for_test(stratum_server_t *s,
+                                     unsigned long long *acc_n,
+                                     unsigned long long *old_n,
+                                     unsigned long long *old_diff) {
+    *acc_n    = atomic_load(&s->sh_acc_n);
+    *old_n    = atomic_load(&s->sh_old_n);
+    *old_diff = atomic_load(&s->sh_old_diff);
 }
 uint32_t stratum_job_height_for_test(const stratum_job_t *j) {
     return j ? j->height : 0;
@@ -3966,6 +3998,15 @@ void stratum_server_set_job(stratum_server_t *s, stratum_job_t *new_job,
     stratum_job_t *old = s->current_job;
     s->current_job = new_job;
     pthread_rwlock_unlock(&s->job_lock);
+    if (old && old->height != new_job->height) {
+        LOG_INFO("stratum: height %u -> %u; superseded-height credits since "
+                 "start: %llu of %llu shares, %llu of %llu diff",
+                 old->height, new_job->height,
+                 atomic_load_explicit(&s->sh_old_n, memory_order_relaxed),
+                 atomic_load_explicit(&s->sh_acc_n, memory_order_relaxed),
+                 atomic_load_explicit(&s->sh_old_diff, memory_order_relaxed),
+                 atomic_load_explicit(&s->sh_acc_diff, memory_order_relaxed));
+    }
     if (old) retire_job(s, old);
 
     /* Broadcast the new job. Each conn renders its own coinbase against it

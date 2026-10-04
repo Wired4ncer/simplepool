@@ -1707,6 +1707,79 @@ static void test_vardiff_grace_accepts_old_diff_shares(void) {
     stratum_server_free(s);
 }
 
+static stratum_job_t *make_test_job_h(const char *job_id,
+                                      const uint8_t *network_target_be,
+                                      uint32_t height) {
+    uint8_t prev[32] = {0};
+    return stratum_job_new(job_id, 1, prev, 5000000000LL, NULL,
+                           STRATUM_EXTRANONCE1_SIZE, STRATUM_EXTRANONCE2_SIZE,
+                           NULL, 0, 0x1d00ffffu, 0x60000000u,
+                           network_target_be, height, NULL, 0, NULL, 0);
+}
+
+/* Superseded-height credits (2026-10-03): a share credited on a job below the
+ * current height is counted as old; one on the current height is not; a
+ * same-height refresh is not a new height. Measurement only. */
+static void test_superseded_height_credits_are_counted(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                           .initial_diff = 1e-12,
+                           .ctx = &obs, .on_share = on_share,
+                           .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job_h("H1", net, 100), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    unsigned long long acc = 0, old = 0, oldd = 0;
+    stratum_handle_message(s, c,
+        "{\"id\":3,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"H1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_height_credits_for_test(s, &acc, &old, &oldd);
+    CHECK(obs.shares == 1 && acc == 1 && old == 0);
+
+    /* same-height refresh: H1 is not superseded */
+    stratum_server_set_job(s, make_test_job_h("H1b", net, 100), 0);
+    stratum_handle_message(s, c,
+        "{\"id\":4,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"H1\",\"" TEST_EN2 "\",\"60000000\",\"00000002\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_height_credits_for_test(s, &acc, &old, &oldd);
+    CHECK(obs.shares == 2 && acc == 2 && old == 0);
+
+    /* new height: a share still on H1 (height 100) is credited AND counted old */
+    stratum_server_set_job(s, make_test_job_h("H2", net, 101), 1);
+    stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"H1\",\"" TEST_EN2 "\",\"60000000\",\"00000003\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_height_credits_for_test(s, &acc, &old, &oldd);
+    CHECK(obs.shares == 3 && acc == 3 && old == 1);
+
+    /* a share on the current height is not old */
+    stratum_handle_message(s, c,
+        "{\"id\":6,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"H2\",\"" TEST_EN2 "\",\"60000000\",\"00000004\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+    stratum_height_credits_for_test(s, &acc, &old, &oldd);
+    CHECK(obs.shares == 4 && acc == 4 && old == 1);
+    CHECK(obs.rejects == 0);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+}
+
 /* Idle-socket reaper: verify the accepted-socket setup path applies
  * SO_RCVTIMEO derived from idle_timeout_sec. We can't cheaply test the
  * "silent client gets dropped" path in a unit test — that would need a
@@ -4567,6 +4640,7 @@ int main(void) {
     test_vardiff_still_lowers_for_a_matched_miner();
     test_vardiff_clamped_to_network_diff();
     test_vardiff_grace_accepts_old_diff_shares();
+    test_superseded_height_credits_are_counted();
     test_vardiff_waits_for_min_samples();
     test_password_diff_raises_difficulty();
     test_password_diff_cannot_lower_difficulty();

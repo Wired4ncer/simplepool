@@ -634,6 +634,11 @@ void stratum_conn_register_for_test(stratum_server_t *s, stratum_conn_t *c,
  * for a holder even after the tip watcher has retired and freed it. */
 stratum_job_t *stratum_job_find_for_test(stratum_server_t *s, const char *job_id);
 uint32_t stratum_job_height_for_test(const stratum_job_t *j);
+/* Superseded-height credit totals (measurement only). */
+void stratum_height_credits_for_test(stratum_server_t *s,
+                                     unsigned long long *acc_n,
+                                     unsigned long long *old_n,
+                                     unsigned long long *old_diff);
 int64_t  stratum_job_value_sats_for_test(const stratum_job_t *j);
 
 /* Process one JSON-RPC line. Appends one or more newline-delimited JSON
