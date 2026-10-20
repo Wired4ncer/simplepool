@@ -118,7 +118,12 @@ same way while preserving the BIP301 commitment outputs byte-for-byte.
 
 - `pps_credits` — one row per worker: `worker_id`, `accrued_sats`,
   `paid_sats`, `last_updated`. The C proxy only INCREMENTs
-  `accrued_sats`; the payout worker only writes `paid_sats`.
+  `accrued_sats`; the payout worker only writes `paid_sats`. Each increment
+  is written together with the share row that carries the same amount in
+  `credited_sats` — one savepoint, both or neither — so a worker's
+  `accrued_sats` equals the sum of its shares' `credited_sats`. A share that
+  cannot be written is rolled back whole and counted in
+  `pool_meta.events_lost`, which the dashboard health check watches.
 - `payouts_in_flight` — write-ahead log for the at-most-once payout
   protocol. INSERT before broadcast; one atomic transaction after
   (`txid` write + `paid_sats +=` + DELETE row). `listDue()` skips any

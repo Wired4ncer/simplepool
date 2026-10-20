@@ -133,7 +133,9 @@ CREATE TABLE IF NOT EXISTS pool_meta (
   block_value_sats    INTEGER,
   credited_from       INTEGER,
   /* Mirror of the proxy's in-memory events_lost counter: accepted shares that
-   * never reached the DB after every commit retry failed. Must be 0 — it is
+   * never reached the DB — a batch whose every commit retry failed, one
+   * event whose own statements failed (rolled back alone, share and credit
+   * together), or a share refused by a full writer queue. Must be 0 — it is
    * work a miner was told was accepted and that no query can otherwise see. */
   events_lost         INTEGER NOT NULL DEFAULT 0,  /* unix seconds */
   /* The stratum ports this pool listens on and the difficulty policy of
@@ -211,9 +213,11 @@ CREATE INDEX IF NOT EXISTS templates_ts_idx     ON templates(ts);
 CREATE INDEX IF NOT EXISTS templates_height_idx ON templates(height);
 
 /* PPS accrual ledger. One row per worker. The C proxy only INCREMENTs
- * accrued_sats; a separate payout service updates paid_sats after
- * issuing Thunder transactions for (accrued_sats - paid_sats). Empty in
- * solo mode. */
+ * accrued_sats, by each share's credited_sats and in the same savepoint as
+ * that share's row, so accrued_sats = SUM(shares.credited_sats) per worker
+ * (over shares written since credited_sats existed). A separate payout
+ * service updates paid_sats after issuing Thunder transactions for
+ * (accrued_sats - paid_sats). Empty in solo mode. */
 CREATE TABLE IF NOT EXISTS pps_credits (
   worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),
   accrued_sats  INTEGER NOT NULL DEFAULT 0,

@@ -19,7 +19,7 @@
 /* Grow this when you add a test. It used to be 16 with no bound check, so the
  * seventeenth test scribbled past the end of the table and the failure landed
  * on an innocent store_open() several tests later. */
-#define MAX_TEST_DBS 32
+#define MAX_TEST_DBS 40
 static char g_db_paths[MAX_TEST_DBS][256];
 static int  g_db_count = 0;
 
@@ -346,6 +346,9 @@ static void test_drop(void) {
     store_get_stats(s, &st);
     assert(dropped_observed);
     assert(st.shares_dropped > 0);
+    /* An accepted share the queue refused is lost work — and, under PPS, a
+     * lost credit — so it must show where health looks, not only here. */
+    assert(st.events_lost == st.shares_dropped);
 
     /* Don't bother flushing fully -- just close (which drains). */
     store_close(s);
@@ -414,6 +417,14 @@ static void test_credited_sats(void) {
         "SELECT sum(credited_sats) FROM shares "
         "WHERE worker_id = (SELECT id FROM workers WHERE name='legacy')");
     assert(legacy == 0);
+
+    /* The credit is applied from the share event itself: no separate call,
+     * and only workers that were credited get a pps_credits row. */
+    assert(scalar_i64(db,
+        "SELECT accrued_sats FROM pps_credits "
+        "WHERE worker_id = (SELECT id FROM workers WHERE name='payer')")
+        == expected);
+    assert(scalar_i64(db, "SELECT count(*) FROM pps_credits") == 1);
 
     /* The audit invariant. Every credited share must re-derive exactly from
      * the pair stored on its own row, with no reference to any current rate.
@@ -726,6 +737,146 @@ static void test_commit_survives_a_locked_db(void) {
     sqlite3_close(db);
     store_close(s);
     printf("  ok test_commit_survives_a_locked_db\n");
+}
+
+/* One share and its credit are one unit. A statement failing partway through
+ * an event used to bump pg_errors and nothing else: the batch committed the
+ * half that had landed — the share row with its credited_sats, no
+ * accrued_sats behind it — and events_lost stayed 0, so health stayed green
+ * while the ledger and the audit disagreed.
+ *
+ * A trigger makes the credit upsert fail for one worker only, after its share
+ * row has already been inserted. That event must vanish whole and be counted
+ * lost; every other event in the batch must still commit. */
+static void test_failed_credit_takes_its_share_with_it(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* RAISE(ABORT) rolls back the one statement and leaves the transaction
+     * open — an ordinary statement failure, not a lost transaction. */
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER fail_bad_credit BEFORE INSERT ON pps_credits "
+        "WHEN NEW.worker_id = (SELECT id FROM workers WHERE name = 'bad') "
+        "BEGIN SELECT RAISE(ABORT, 'injected credit failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(store_record_share_addr(s, "good1", "addr1", 1700000000000ULL,
+                                   2.0, 0, NULL, 14, 7.0, 0) == 0);
+    assert(store_record_share_addr(s, "bad",   "addr2", 1700000001000ULL,
+                                   3.0, 0, NULL, 21, 7.0, 0) == 0);
+    assert(store_record_share_addr(s, "good2", "addr3", 1700000002000ULL,
+                                   4.0, 0, NULL, 28, 7.0, 0) == 0);
+    assert(store_record_share_addr(s, "good1", "addr1", 1700000003000ULL,
+                                   1.0, 0, NULL, 7, 7.0, 0) == 0);
+    assert(store_flush(s) == 0);
+
+    /* Neither half of the failed event survived. */
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM shares WHERE worker_id = "
+        "  (SELECT id FROM workers WHERE name = 'bad')") == 0);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM pps_credits WHERE worker_id = "
+        "  (SELECT id FROM workers WHERE name = 'bad')") == 0);
+    /* Everything else in the batch did. */
+    assert(scalar_i64(db, "SELECT count(*) FROM shares") == 3);
+    assert(scalar_i64(db,
+        "SELECT accrued_sats FROM pps_credits WHERE worker_id = "
+        "  (SELECT id FROM workers WHERE name = 'good1')") == 21);
+    assert(scalar_i64(db,
+        "SELECT accrued_sats FROM pps_credits WHERE worker_id = "
+        "  (SELECT id FROM workers WHERE name = 'good2')") == 28);
+    /* The invariant the audit and the payout worker both lean on. */
+    assert(scalar_i64(db, "SELECT COALESCE(SUM(accrued_sats),0) FROM pps_credits")
+        == scalar_i64(db, "SELECT COALESCE(SUM(credited_sats),0) FROM shares"));
+
+    store_stats_t st;
+    store_get_stats(s, &st);
+    assert(st.events_lost == 1);
+    assert(st.shares_committed == 3);
+    assert(st.pg_errors > 0);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_failed_credit_takes_its_share_with_it\n");
+}
+
+/* SQLite may answer SQLITE_FULL / SQLITE_IOERR / SQLITE_NOMEM by rolling back
+ * the whole transaction itself. The writer used to carry on regardless: the
+ * rest of the batch ran in autocommit, each statement committing on its own,
+ * then COMMIT failed and the retry replayed the whole batch — writing those
+ * shares and credits a second time.
+ *
+ * The hook rolls the transaction back mid-event, right after one share row.
+ * Every share must end up on the ledger exactly once, with its credit. */
+static void test_auto_rollback_mid_batch_does_not_double_write(void) {
+    const char *path = fresh_db_path();
+    store_cfg_t cfg = {0};
+    snprintf(cfg.path, sizeof(cfg.path), "%s", path);
+    cfg.commit_window_ms = 20;
+    cfg.commit_max_shares = 200;
+    store_t *s = NULL;
+    assert(store_open(&cfg, &s) == 0);
+
+    /* Hold the write lock so everything after the warm-up share queues up
+     * and is taken as ONE batch — the failure must have events after it in
+     * the same transaction for the replay to matter. */
+    sqlite3 *hog = NULL;
+    assert(sqlite3_open(path, &hog) == SQLITE_OK);
+    assert(sqlite3_exec(hog, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+
+    store_test_rollback_tx_at_worker("boom");
+
+    static const char *workers[] = { "w0", "a1", "a2", "boom", "b1", "b2", "b3" };
+    const int N = (int)(sizeof workers / sizeof workers[0]);
+    int64_t expected = 0;
+    for (int i = 0; i < N; ++i) {
+        int64_t credited = 10 * (i + 1);
+        expected += credited;
+        assert(store_record_share_addr(s, workers[i], "addr",
+                                       1700000000000ULL + (uint64_t)i * 1000,
+                                       (double)(i + 1), 0, NULL,
+                                       credited, 10.0, 0) == 0);
+        if (i == 0) {
+            struct timespec ws = { .tv_sec = 0, .tv_nsec = 50L * 1000000L };
+            nanosleep(&ws, NULL);
+        }
+    }
+    struct timespec hold = { .tv_sec = 0, .tv_nsec = 200L * 1000000L };
+    nanosleep(&hold, NULL);
+    assert(sqlite3_exec(hog, "COMMIT", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(hog);
+
+    assert(store_flush(s) == 0);
+    store_test_rollback_tx_at_worker(NULL);
+
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    /* Exactly once each: no row from the abandoned attempt survived beside
+     * its replay, and the replay itself landed. */
+    assert(scalar_i64(db, "SELECT count(*) FROM shares") == N);
+    assert(scalar_i64(db,
+        "SELECT count(*) FROM (SELECT worker_id FROM shares "
+        "  GROUP BY worker_id HAVING count(*) > 1)") == 0);
+    assert(scalar_i64(db, "SELECT SUM(credited_sats) FROM shares") == expected);
+    assert(scalar_i64(db, "SELECT SUM(accrued_sats) FROM pps_credits") == expected);
+
+    store_stats_t st;
+    store_get_stats(s, &st);
+    assert(st.events_lost == 0);
+    assert(st.pg_errors > 0);              /* the hook did fire */
+    /* Counted on the attempt that committed, not once per try. */
+    assert(st.shares_committed == (uint64_t)N);
+
+    sqlite3_close(db);
+    store_close(s);
+    printf("  ok test_auto_rollback_mid_batch_does_not_double_write\n");
 }
 
 /* Retention keeps the table bounded. Pruning runs when a new row is opened
@@ -2072,6 +2223,8 @@ int main(void) {
     test_template_history();
     test_template_retention();
     test_commit_survives_a_locked_db();
+    test_failed_credit_takes_its_share_with_it();
+    test_auto_rollback_mid_batch_does_not_double_write();
     test_block_candidate_status();
     test_reconcile_from_templates();
     test_block_hash_index_after_dedupe();

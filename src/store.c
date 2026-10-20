@@ -230,8 +230,9 @@ static const char *SCHEMA_SQL_PARTS[] = {
 
     /* ---- part 2 ---- */
     /* PPS accrual ledger. One row per worker; the C proxy only INCREMENTS
-     * accrued_sats. paid_sats is updated by a downstream payout service
-     * that issues Thunder transactions to drain accrued - paid. */
+     * accrued_sats, from the share event that earned the credit and in the
+     * same savepoint as its row. paid_sats is updated by a downstream payout
+     * service that issues Thunder transactions to drain accrued - paid. */
     "CREATE TABLE IF NOT EXISTS pps_credits ("
     "  worker_id     INTEGER PRIMARY KEY REFERENCES workers(id),"
     "  accrued_sats  INTEGER NOT NULL DEFAULT 0,"
@@ -455,7 +456,13 @@ static const char *MIGRATIONS_SQL[] = {
 #define EV_SHARE   1
 #define EV_REJECT  2
 #define EV_BLOCK   3
-#define EV_CREDIT  4
+/* There is deliberately no separate credit event. A PPS credit used to be its
+ * own EV_CREDIT, enqueued right after the share that earned it — two ring
+ * slots, two independent outcomes. A full ring could take one and refuse the
+ * other, a batch boundary could land between them, and a failed statement in
+ * either left the other standing, so pps_credits.accrued_sats drifted from
+ * SUM(shares.credited_sats) with nothing counted anywhere. The credit now
+ * rides on the share (delta_sats) and both are written in one savepoint. */
 
 #define WORKER_NAME_MAX 128
 #define HASH_STR_MAX    96
@@ -476,11 +483,12 @@ typedef struct {
     int64_t  reward_sats;       /* EV_BLOCK only */
     int64_t  fee_sats;          /* EV_BLOCK only */
     uint8_t  block_status;      /* EV_BLOCK only: STORE_BLOCK_* */
-    int64_t  delta_sats;        /* EV_CREDIT only */
+    int64_t  delta_sats;        /* EV_SHARE only: credited_sats, and the PPS
+                                 * credit applied with it; 0 = no accrual */
     double   rate_used;         /* EV_SHARE only: multiplicand for delta_sats */
     int      solo;              /* EV_SHARE only: 1 = arrived on a solo listener */
     char     worker_name[WORKER_NAME_MAX];
-    char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK, EV_CREDIT: may be empty */
+    char     payout_address[ADDR_MAX];   /* EV_SHARE, EV_BLOCK: may be empty */
     char     hash[HASH_STR_MAX];
     char     reason[REASON_MAX];
     char     peer_ip[PEER_IP_MAX];          /* EV_REJECT only: may be empty */
@@ -504,6 +512,11 @@ struct store {
     sqlite3_stmt *st_insert_block;
     sqlite3_stmt *st_upsert_node_tip;
     sqlite3_stmt *st_upsert_credit;
+    /* Per-event savepoint, so one event's statements land or vanish
+     * together without taking the rest of the batch with them. */
+    sqlite3_stmt *st_sp_begin;
+    sqlite3_stmt *st_sp_release;
+    sqlite3_stmt *st_sp_rollback;
     pthread_mutex_t node_tip_mu;   /* serialise binds on st_upsert_node_tip */
 
     /* Serialises TRANSACTION SCOPES on `db`.
@@ -563,6 +576,15 @@ struct store {
 static size_t g_test_ring_cap = 0;
 
 void store_test_set_ring_capacity(size_t cap) { g_test_ring_cap = cap; }
+
+/* See store.h. Set by the test thread before it enqueues the share, read by
+ * the writer after dequeuing it; the ring mutex orders the two. */
+static char g_test_rollback_worker[WORKER_NAME_MAX];
+
+void store_test_rollback_tx_at_worker(const char *worker_name) {
+    snprintf(g_test_rollback_worker, sizeof g_test_rollback_worker, "%s",
+             worker_name ? worker_name : "");
+}
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -652,13 +674,49 @@ static int64_t resolve_worker_id(store_t *s, const char *name,
 
 /* ---- writer thread ---------------------------------------------------- */
 
-static void process_event(store_t *s, const event_t *ev) {
+/* What one batch attempt achieved. Tallied locally and folded into the
+ * public counters only once COMMIT succeeds, so an attempt that is thrown
+ * away and replayed is counted once, not once per try. */
+typedef struct {
+    uint64_t shares;
+    uint64_t credits;
+    uint64_t rejects;
+    uint64_t blocks;
+    uint64_t lost;
+} batch_tally_t;
+
+/* SQLite answers SQLITE_FULL, SQLITE_IOERR, SQLITE_NOMEM and friends by
+ * rolling back the WHOLE transaction on its own ("Response To Errors Within
+ * A Transaction" in the SQLite docs) — the connection silently drops back to
+ * autocommit, and every statement run after that commits by itself, outside
+ * the batch. So this is checked after each step that can fail, before
+ * anything else is allowed to run. */
+static int tx_gone(store_t *s) {
+    return sqlite3_get_autocommit(s->db) != 0;
+}
+
+static int run_sp(store_t *s, sqlite3_stmt *st) {
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    if (rc == SQLITE_DONE) return 0;
+    atomic_fetch_add(&s->pg_errors, 1);
+    return -1;
+}
+
+/* Runs one event's statements. Returns 0 when every one of them landed and
+ * -1 at the first that did not, without running the rest: the caller rolls
+ * the event back as a unit, so a share is never left on the ledger without
+ * its credit, or a credit without its share. */
+static int apply_event(store_t *s, const event_t *ev, batch_tally_t *t) {
     if (ev->kind == EV_SHARE) {
         int64_t wid = resolve_worker_id(s, ev->worker_name,
                                         ev->payout_address, ev->ts_ms);
-        if (wid < 0) {
+        /* A cached id survives a failed worker upsert — unless that failure
+         * took the transaction with it, in which case the insert below would
+         * commit on its own. */
+        if (wid < 0 || tx_gone(s)) {
             atomic_fetch_add(&s->pg_errors, 1);
-            return;
+            return -1;
         }
         sqlite3_reset(s->st_insert_share);
         sqlite3_clear_bindings(s->st_insert_share);
@@ -679,12 +737,42 @@ static void process_event(store_t *s, const event_t *ev) {
         /* Which payout scheme this share was submitted under. Fixed here, at
          * accept time, and never recomputed -- see the shares.solo migration. */
         sqlite3_bind_int   (s->st_insert_share, 8, ev->solo);
-        if (sqlite3_step(s->st_insert_share) != SQLITE_DONE) {
-            atomic_fetch_add(&s->pg_errors, 1);
-        } else {
-            atomic_fetch_add(&s->shares_committed, 1);
-        }
+        int rc = sqlite3_step(s->st_insert_share);
         sqlite3_reset(s->st_insert_share);
+        if (rc != SQLITE_DONE) {
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+        t->shares++;
+
+        /* Test hook: stands in for the credit upsert below failing with
+         * SQLITE_FULL and SQLite rolling the whole transaction back. */
+        if (g_test_rollback_worker[0] &&
+            strcmp(g_test_rollback_worker, ev->worker_name) == 0) {
+            g_test_rollback_worker[0] = '\0';
+            sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+
+        /* The PPS credit for this share, in the same savepoint as the row
+         * that records it — so accrued_sats is SUM(credited_sats) by
+         * construction rather than by two writes happening to agree. */
+        if (ev->delta_sats > 0) {
+            sqlite3_reset(s->st_upsert_credit);
+            sqlite3_clear_bindings(s->st_upsert_credit);
+            sqlite3_bind_int64(s->st_upsert_credit, 1, wid);
+            sqlite3_bind_int64(s->st_upsert_credit, 2, ev->delta_sats);
+            sqlite3_bind_int64(s->st_upsert_credit, 3, (sqlite3_int64)(ev->ts_ms / 1000));
+            rc = sqlite3_step(s->st_upsert_credit);
+            sqlite3_reset(s->st_upsert_credit);
+            if (rc != SQLITE_DONE) {
+                atomic_fetch_add(&s->pg_errors, 1);
+                return -1;
+            }
+            t->credits++;
+        }
+        return 0;
     } else if (ev->kind == EV_REJECT) {
         sqlite3_reset(s->st_insert_reject);
         sqlite3_clear_bindings(s->st_insert_reject);
@@ -713,17 +801,21 @@ static void process_event(store_t *s, const event_t *ev) {
             sqlite3_bind_int64(s->st_insert_reject, 6, (sqlite3_int64)ev->job_age_ms);
         else
             sqlite3_bind_null(s->st_insert_reject, 6);
-        if (sqlite3_step(s->st_insert_reject) != SQLITE_DONE) {
-            atomic_fetch_add(&s->pg_errors, 1);
-        } else {
-            atomic_fetch_add(&s->rejects_committed, 1);
-        }
+        int rc = sqlite3_step(s->st_insert_reject);
         sqlite3_reset(s->st_insert_reject);
+        if (rc != SQLITE_DONE) {
+            atomic_fetch_add(&s->pg_errors, 1);
+            return -1;
+        }
+        t->rejects++;
+        return 0;
     } else if (ev->kind == EV_BLOCK) {
         int64_t finder = -1;
-        if (ev->worker_name[0])
+        if (ev->worker_name[0]) {
             finder = resolve_worker_id(s, ev->worker_name,
                                        ev->payout_address, ev->ts_ms);
+            if (tx_gone(s)) return -1;
+        }
         sqlite3_reset(s->st_insert_block);
         sqlite3_clear_bindings(s->st_insert_block);
         sqlite3_bind_int64(s->st_insert_block, 1, (sqlite3_int64)(ev->ts_ms / 1000));
@@ -754,36 +846,64 @@ static void process_event(store_t *s, const event_t *ev) {
                               SQLITE_TRANSIENT);
         else
             sqlite3_bind_null(s->st_insert_block, 9);
-        if (sqlite3_step(s->st_insert_block) != SQLITE_DONE) {
+        int rc = sqlite3_step(s->st_insert_block);
+        int inserted = (rc == SQLITE_DONE && sqlite3_changes(s->db) > 0);
+        sqlite3_reset(s->st_insert_block);
+        if (rc != SQLITE_DONE) {
             atomic_fetch_add(&s->pg_errors, 1);
-        } else if (sqlite3_changes(s->db) > 0 &&
-                   ev->block_status != STORE_BLOCK_REJECTED) {
+            return -1;
+        }
+        if (inserted && ev->block_status != STORE_BLOCK_REJECTED) {
             /* Candidates submitblock refused are recorded but not counted:
              * the whole point of this column is that they are not blocks.
              * An OR IGNORE that changed nothing is a duplicate hash, which
              * is not a new block either. */
-            atomic_fetch_add(&s->blocks_committed, 1);
+            t->blocks++;
         }
-        sqlite3_reset(s->st_insert_block);
-    } else if (ev->kind == EV_CREDIT) {
-        int64_t wid = resolve_worker_id(s, ev->worker_name,
-                                        ev->payout_address, ev->ts_ms);
-        if (wid < 0) {
-            atomic_fetch_add(&s->pg_errors, 1);
-            return;
-        }
-        sqlite3_reset(s->st_upsert_credit);
-        sqlite3_clear_bindings(s->st_upsert_credit);
-        sqlite3_bind_int64(s->st_upsert_credit, 1, wid);
-        sqlite3_bind_int64(s->st_upsert_credit, 2, ev->delta_sats);
-        sqlite3_bind_int64(s->st_upsert_credit, 3, (sqlite3_int64)(ev->ts_ms / 1000));
-        if (sqlite3_step(s->st_upsert_credit) != SQLITE_DONE) {
-            atomic_fetch_add(&s->pg_errors, 1);
-        } else {
-            atomic_fetch_add(&s->credits_committed, 1);
-        }
-        sqlite3_reset(s->st_upsert_credit);
+        return 0;
     }
+    return 0;
+}
+
+#define EVENT_OK       0   /* landed */
+#define EVENT_DROPPED  1   /* rolled back on its own; the batch carries on */
+#define EVENT_ABORT   -1   /* the transaction is gone; abandon the attempt */
+
+/* One event, as one unit. Its statements run inside a savepoint: if any of
+ * them fails, ROLLBACK TO undoes the ones that had already landed and the
+ * event is counted in events_lost, while the rest of the batch still
+ * commits. Before this a failing statement only bumped pg_errors and the
+ * batch committed whatever part of the event had made it — and events_lost,
+ * the number health watches, never moved.
+ *
+ * The exception is a failure that took the whole transaction with it: then
+ * there is no savepoint left to roll back to, and nothing more may run. */
+static int process_event(store_t *s, const event_t *ev, batch_tally_t *t) {
+    if (run_sp(s, s->st_sp_begin) != 0) return EVENT_ABORT;
+
+    batch_tally_t et = {0};
+    int rc = apply_event(s, ev, &et);
+    if (tx_gone(s)) return EVENT_ABORT;
+
+    if (rc == 0) {
+        if (run_sp(s, s->st_sp_release) != 0) return EVENT_ABORT;
+        t->shares  += et.shares;
+        t->credits += et.credits;
+        t->rejects += et.rejects;
+        t->blocks  += et.blocks;
+        return EVENT_OK;
+    }
+
+    /* errmsg first: the savepoint statements below overwrite it. */
+    LOG_WARN("store: dropping one %s event for '%s': %s",
+             ev->kind == EV_SHARE  ? "share"  :
+             ev->kind == EV_REJECT ? "reject" : "block",
+             ev->worker_name, sqlite3_errmsg(s->db));
+    if (run_sp(s, s->st_sp_rollback) != 0 ||
+        run_sp(s, s->st_sp_release)  != 0 || tx_gone(s))
+        return EVENT_ABORT;
+    t->lost++;
+    return EVENT_DROPPED;
 }
 
 /* Attempts to land one batch. The events are already out of the ring, so a
@@ -806,20 +926,39 @@ static int commit_batch(store_t *s, event_t *batch, size_t take) {
             continue;
         }
 
-        for (size_t i = 0; i < take; ++i) process_event(s, &batch[i]);
+        batch_tally_t t = {0};
+        int aborted = 0;
+        for (size_t i = 0; i < take; ++i) {
+            if (process_event(s, &batch[i], &t) == EVENT_ABORT) {
+                aborted = 1;
+                break;
+            }
+        }
 
-        if (sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+        if (!aborted &&
+            sqlite3_exec(s->db, "COMMIT", NULL, NULL, &err) == SQLITE_OK) {
+            atomic_fetch_add(&s->shares_committed,  t.shares);
+            atomic_fetch_add(&s->credits_committed, t.credits);
+            atomic_fetch_add(&s->rejects_committed, t.rejects);
+            atomic_fetch_add(&s->blocks_committed,  t.blocks);
+            if (t.lost) atomic_fetch_add(&s->events_lost, t.lost);
             atomic_fetch_add(&s->batches, 1);
             pthread_mutex_unlock(&s->tx_mu);
             return 0;
         }
-        LOG_WARN("store: COMMIT failed (attempt %d/%d): %s",
-                 attempt, STORE_COMMIT_ATTEMPTS, err ? err : "?");
+        LOG_WARN("store: %s failed (attempt %d/%d): %s",
+                 aborted ? "batch" : "COMMIT", attempt, STORE_COMMIT_ATTEMPTS,
+                 aborted ? "transaction rolled back mid-batch"
+                         : (err ? err : "?"));
         sqlite3_free(err);
-        /* Nothing was durably written, so replaying the batch is safe. The
-         * per-event counters process_event() bumped are lost accuracy we
-         * accept: they describe attempts, the ledger describes reality. */
-        sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
+        /* Replaying is safe only because nothing from this attempt is
+         * durable. While the transaction is still open that is what the
+         * ROLLBACK makes true. When SQLite has already rolled it back on its
+         * own, it is true because process_event() stops at the first step
+         * that finds the connection back in autocommit — no statement ever
+         * runs outside the transaction, where it would have committed by
+         * itself and then been written again by the replay. */
+        if (!tx_gone(s)) sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
         atomic_fetch_add(&s->pg_errors, 1);
         backoff_sleep(attempt);
     }
@@ -1011,9 +1150,10 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         "    ELSE node_status.tip_observed_at "
         "  END, "
         "  updated_at = excluded.updated_at";
-    /* PPS credit: increment accrued_sats for this worker_id. The downstream
-     * payout worker reads (accrued_sats - paid_sats) and updates paid_sats
-     * after a successful Thunder tx. */
+    /* PPS credit: increment accrued_sats for this worker_id. Run only from
+     * the share event that earned it, in that share's savepoint. The
+     * downstream payout worker reads (accrued_sats - paid_sats) and updates
+     * paid_sats after a successful Thunder tx. */
     static const char *Q_UPSERT_CREDIT =
         "INSERT INTO pps_credits (worker_id, accrued_sats, paid_sats, last_updated) "
         "VALUES (?, ?, 0, ?) "
@@ -1029,7 +1169,10 @@ int store_open(const store_cfg_t *cfg, store_t **out) {
         sqlite3_prepare_v2(s->db, Q_INS_REJECT, -1, &s->st_insert_reject, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_INS_BLOCK, -1, &s->st_insert_block, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(s->db, Q_UPSERT_NODE_TIP, -1, &s->st_upsert_node_tip, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(s->db, Q_UPSERT_CREDIT, -1, &s->st_upsert_credit, NULL) != SQLITE_OK)
+        sqlite3_prepare_v2(s->db, Q_UPSERT_CREDIT, -1, &s->st_upsert_credit, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(s->db, "SAVEPOINT ev", -1, &s->st_sp_begin, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(s->db, "RELEASE ev", -1, &s->st_sp_release, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(s->db, "ROLLBACK TO ev", -1, &s->st_sp_rollback, NULL) != SQLITE_OK)
     {
         LOG_ERROR("store: prepare failed: %s", sqlite3_errmsg(s->db));
         store_close(s);
@@ -1065,6 +1208,9 @@ void store_close(store_t *s) {
     if (s->st_insert_block)  sqlite3_finalize(s->st_insert_block);
     if (s->st_upsert_node_tip) sqlite3_finalize(s->st_upsert_node_tip);
     if (s->st_upsert_credit) sqlite3_finalize(s->st_upsert_credit);
+    if (s->st_sp_begin)      sqlite3_finalize(s->st_sp_begin);
+    if (s->st_sp_release)    sqlite3_finalize(s->st_sp_release);
+    if (s->st_sp_rollback)   sqlite3_finalize(s->st_sp_rollback);
     if (s->db) sqlite3_close(s->db);
     pthread_mutex_destroy(&s->node_tip_mu);
     pthread_mutex_destroy(&s->tx_mu);
@@ -1108,7 +1254,12 @@ int store_record_share_addr(store_t *s, const char *worker_name,
         strncpy(ev.hash, share_hash_or_null, HASH_STR_MAX - 1);
     }
     if (enqueue(s, &ev) != 0) {
+        /* An accepted share that will never reach the ledger — and with it
+         * its credit — is the same shortfall as a batch that failed to
+         * commit, so it is counted where health looks, not only in the
+         * process-local overflow counter. */
         atomic_fetch_add(&s->shares_dropped, 1);
+        atomic_fetch_add(&s->events_lost, 1);
         return -1;
     }
     atomic_fetch_add(&s->shares_queued, 1);
@@ -1378,26 +1529,6 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
     if (finder_name) strncpy(ev.worker_name, finder_name, WORKER_NAME_MAX - 1);
     if (finder_address)
         strncpy(ev.payout_address, finder_address, ADDR_MAX - 1);
-    if (enqueue(s, &ev) != 0) {
-        atomic_fetch_add(&s->shares_dropped, 1);
-        return -1;
-    }
-    return 0;
-}
-
-int store_record_credit(store_t *s, const char *worker_name,
-                        const char *payout_address,
-                        uint64_t ts_ms, int64_t delta_sats)
-{
-    if (!s || !worker_name || delta_sats <= 0) return -1;
-    event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.kind = EV_CREDIT;
-    ev.ts_ms = ts_ms;
-    ev.delta_sats = delta_sats;
-    strncpy(ev.worker_name, worker_name, WORKER_NAME_MAX - 1);
-    if (payout_address)
-        strncpy(ev.payout_address, payout_address, ADDR_MAX - 1);
     if (enqueue(s, &ev) != 0) {
         atomic_fetch_add(&s->shares_dropped, 1);
         return -1;

@@ -97,7 +97,7 @@ export function health(handle) {
         const n = Number(r?.n || 0);
         return { ok: n === 0, value: n,
                  detail: n > 0
-                    ? `${n} accepted event(s) lost to failed commits; those shares are uncredited`
+                    ? `${n} accepted event(s) never stored; those shares are uncredited`
                     : null };
     }));
 

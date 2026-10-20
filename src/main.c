@@ -1263,7 +1263,9 @@ static void on_share_cb(void *ctx, const char *worker_name,
      *
      * Computed before the share is recorded so the amount can be written
      * onto the share itself; an audit then reports what was paid rather than
-     * recomputing it against a rate that may since have moved. */
+     * recomputing it against a rate that may since have moved. The store
+     * applies the credit from that same event, so the share row and the
+     * accrued_sats bump commit together — never one without the other. */
     int64_t delta = 0;
     double  rate_used = 0.0;
     if (s && s->cfg && strcmp(s->cfg->pool_mode, "pps-classic") == 0) {
@@ -1291,10 +1293,6 @@ static void on_share_cb(void *ctx, const char *worker_name,
                         ts_ms, difficulty, is_block, block_hash_or_null);
     }
     if (delta > 0) {
-        if (s->store) {
-            store_record_credit(s->store, worker_name, payout_address,
-                                ts_ms, delta);
-        }
         if (s->bcast) {
             /* accrued_total is the running balance after this credit.
              * Since the writer thread is async we don't know it

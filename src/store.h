@@ -142,6 +142,13 @@ int store_record_block(store_t *s, uint64_t ts_ms, int height,
  * recomputing it against whatever rate is current. Pass 0 in solo mode or
  * when no accrual applies.
  *
+ * A credited_sats > 0 is also the PPS credit itself: the writer adds it to
+ * the worker's pps_credits.accrued_sats in the same savepoint as the share
+ * row, so the two land together or not at all and accrued_sats stays equal
+ * to SUM(shares.credited_sats). There is no separate credit call to make.
+ * If the queue is full the share is refused (returns negative) and counted
+ * in both shares_dropped and events_lost.
+ *
  * rate_used is the multiplicand that produced credited_sats. Pass the exact
  * double that was multiplied, not a rounded copy: the audit re-derives
  * CAST(difficulty * rate_used AS INTEGER) and expects credited_sats back
@@ -158,13 +165,6 @@ int store_record_share_addr(store_t *s, const char *worker_name,
                             int is_block, const char *share_hash_or_null,
                             int64_t credited_sats, double rate_used,
                             int solo);
-
-/* PPS credit: add delta_sats to the worker's accrued_sats in pps_credits.
- * Async (writer thread). delta_sats must be > 0. payout_address (the
- * miner's Thunder address) is tagged onto the workers row as usual. */
-int store_record_credit(store_t *s, const char *worker_name,
-                        const char *payout_address,
-                        uint64_t ts_ms, int64_t delta_sats);
 
 /* Publish what this proxy is actually paying, so the dashboard reads the
  * effective rate from the running process instead of keeping its own copy
@@ -275,9 +275,11 @@ typedef struct {
     uint64_t blocks_committed;
     uint64_t batches;
     uint64_t pg_errors;        /* poorly named; sqlite errors */
-    /* Events that left the ring but never reached the DB, after every
-     * commit retry failed. Accepted work that will never be credited —
-     * distinct from shares_dropped, which is enqueue-side overflow.
+    /* Accepted work that never reached the DB: a whole batch whose every
+     * commit retry failed, a single event whose own statements failed (it
+     * is rolled back alone and the rest of its batch commits), or a share
+     * the full queue refused — that last one is also in shares_dropped,
+     * which additionally counts refused rejects and blocks.
      * Must be 0; anything else is a ledger shortfall against miners. */
     uint64_t events_lost;
 } store_stats_t;
@@ -286,6 +288,13 @@ void store_get_stats(store_t *s, store_stats_t *out);
 /* Optional: override default ring buffer capacity (events). Must be called
  * before store_open by setting a global; for tests only. */
 void store_test_set_ring_capacity(size_t cap);
+
+/* The next time the writer applies a share from `worker_name`, it rolls the
+ * whole transaction back right after inserting the share row and reports the
+ * step as failed — what SQLite itself does on SQLITE_FULL, SQLITE_IOERR or
+ * SQLITE_NOMEM mid-transaction. Fires once; NULL or "" disarms. For tests
+ * only. */
+void store_test_rollback_tx_at_worker(const char *worker_name);
 
 /* Override the PPLNS window walk's page size and row cap so paging and
  * truncation can be exercised without inserting millions of shares. Pass <= 0

@@ -512,18 +512,19 @@ The C proxy credits every accepted share with:
 delta_sats = FLOOR(difficulty × pps_sats_per_diff)
 ```
 
-`src/main.c` at the `on_share_cb`:
+`src/main.c` at the `on_share_cb` (simplified):
 
 ```c
-int64_t delta = (int64_t)(difficulty * s->cfg->pps_sats_per_diff);
-if (delta > 0) {
-    if (s->store) {
-        store_record_credit(s->store, worker_name, payout_address,
-                            ts_ms, delta);
-    }
-    ...
-}
+double  rate  = atomic_load(&s->pps_rate);   /* derived from the template */
+int64_t delta = (int64_t)(difficulty * rate);
+store_record_share_addr(s->store, worker_name, payout_address, ts_ms,
+                        difficulty, is_block, hash, delta, rate, solo);
 ```
+
+The credit travels on the share itself: the store writer inserts the
+share row (with `credited_sats = delta`) and adds `delta` to
+`pps_credits.accrued_sats` in one savepoint, so the two can never
+disagree.
 
 The cast to `int64_t` is a **per-share floor**. That matters for the
 audit — see Part 4.
