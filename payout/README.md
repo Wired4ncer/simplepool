@@ -82,6 +82,30 @@ Two rows of defence, because "outstanding" has two shapes:
 Beyond both, `thunder.mempool()` catches what neither row can describe: a
 transfer the ledger has no record of at all.
 
+### One run at a time
+
+All of the above is read-then-act across Thunder RPCs, so it holds only if
+nothing else acts in between. Two runs that overlap — the timer loop and a
+**Trigger payout now** click — read the same ledger: both see a batch
+confirmed and both credit it (`paid_sats` overstated by the whole batch, a
+duplicate `payouts` row, the miner silently short), or both see the same
+workers due and both broadcast.
+
+- **In-process:** `runOnce()` is single-flight per database handle. The timer
+  loop queues behind a run in progress; the admin `/tick` answers `busy`
+  rather than queueing (see above).
+- **In the ledger:** `finalizeBatch()` deletes each in-flight row *before*
+  crediting it and rolls the whole batch back if a row is already gone;
+  `beginBatch()` refuses, under an IMMEDIATE write lock, if any in-flight row
+  exists. Either refusal is logged as a lost race and is harmless — nothing was
+  written and nothing sent. This is what covers a second *process*.
+
+`run-once.mjs` is such a second process. Running it while the service runs is
+safe — the ledger fences above stop a double credit or double broadcast — but
+it can still lose a race and do nothing, or briefly see the service's
+not-yet-stamped batch and log it as unresolved. Prefer the dashboard button (or
+`POST /tick`) while the service is up; use `run-once.mjs` when it is stopped.
+
 ## Batching
 
 Every due worker goes out in ONE transaction. Thunder advances only when a
@@ -140,8 +164,11 @@ by a long wait:
 [test/cadence.test.js](test/cadence.test.js) pins each row of that table.
 
 To force a run without waiting for the next one, use the dashboard's
-**Trigger payout now** button (or `POST /payout/run` on the worker's admin
-HTTP surface) — restarting the service also ticks immediately.
+**Trigger payout now** button (or `POST /tick` on the worker's admin HTTP
+surface) — restarting the service also ticks immediately. If the worker's own
+timer run is already in progress, `/tick` does not start a second one beside
+it; it returns at once with `result.busy: true` and the dashboard says "payout
+run already in progress". See *One run at a time*.
 
 ## `paid` means mined, not sent
 
@@ -230,8 +257,9 @@ spends no BMM bids on empty blocks. A failed nudge never fails the tick.
    read the same way. `runOnce()` reports which it was as `ambiguous`.
 3. `attachBatchTxid()` — stamp the txid. The rows **stay** in flight.
 4. On a later tick, once the transaction is confirmed: in ONE SQLite
-   transaction across the whole batch, `paid_sats += sats`, append to
-   `payouts`, DELETE the in-flight rows.
+   transaction across the whole batch, DELETE each in-flight row (and roll
+   everything back if one is already gone — another run settled it),
+   `paid_sats += sats`, append to `payouts`.
 
 Crash semantics:
 

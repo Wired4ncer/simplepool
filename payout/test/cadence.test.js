@@ -98,3 +98,11 @@ test('a delay past the 32-bit timer ceiling is served in hops', () => {
     assert.equal(second.remaining, 0);
     assert.equal(first.wait + second.wait, monthly);
 });
+
+test('a run that lost the begin race to another process comes back on the settle clock', () => {
+    /* The other process's batch is now the outstanding one; waiting a day to
+     * settle it would leave a sent payout uncredited for a day. */
+    assert.equal(nextDelayMs(cfg, { attempted: 0, paid: 0, failed: 0, settled: 0,
+                                    reason: 'lost-race' }),
+                 cfg.settleIntervalMs);
+});

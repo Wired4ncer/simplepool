@@ -111,14 +111,48 @@ export function abortPayout(db, rowId) {
  * are still "waiting" on — and a crash inside that window is unreconcilable,
  * because the txid is the same for all of them. */
 
+/* Thrown by beginBatch / finalizeBatch when another run got there first.
+ *
+ * runOnce() is single-flight within the service, but that lock is in-process:
+ * run-once.mjs beside the running service, or a second service pointed at the
+ * same database, is a second run the lock cannot see. Both functions below
+ * therefore re-check, inside their own write transaction, that the rows they
+ * are about to act on are still in the state the caller read — and if not,
+ * they roll back and throw this rather than write. Callers treat it as "the
+ * other run did it", not as a failure. */
+export function lostRace(msg) {
+    const e = new Error(msg);
+    e.code = 'PAYOUT_LOST_RACE';
+    return e;
+}
+
+/* Reserve in-flight rows for a batch — but only if nothing is in flight.
+ *
+ * runOnce() checks inFlightCount() and listDue() before it gets here, but
+ * between those reads and this write it awaits Thunder (mempool, balance), and
+ * a second run in that window reads the same empty table and the same due
+ * workers. Without this re-check both would INSERT and both would broadcast:
+ * the same workers paid twice, or two transactions on the same UTXOs. The
+ * check is "any row", not "a row for these workers", because one payout at a
+ * time is the invariant (see inFlightCount).
+ *
+ * IMMEDIATE so the check and the INSERT happen under the write lock: a
+ * deferred transaction would read a snapshot another connection could commit
+ * past before we upgrade. */
 export function beginBatch(db, items, nowSec) {
     const ins = db.prepare(`
         INSERT INTO payouts_in_flight (worker_id, sats, txid, started_at)
         VALUES (?, ?, '', ?)
     `);
-    return db.transaction(() =>
-        items.map(i => ins.run(i.worker_id, Number(i.sats), nowSec).lastInsertRowid)
-    )();
+    const busy = db.prepare('SELECT COUNT(*) AS n FROM payouts_in_flight');
+    return db.transaction(() => {
+        const n = busy.get().n;
+        if (n > 0) {
+            throw lostRace(`beginBatch: ${n} payout row(s) already in flight — ` +
+                           'another run started a batch first');
+        }
+        return items.map(i => ins.run(i.worker_id, Number(i.sats), nowSec).lastInsertRowid);
+    }).immediate();
 }
 
 /* Stamp the txid onto a batch's in-flight rows, immediately after broadcast.
@@ -179,7 +213,16 @@ export function pendingBatch(db) {
  * single fee covering all recipients. It is divided evenly across the ledger
  * rows with the remainder on the first, so SUM(payouts.fee_sats) equals what
  * was actually spent — which is what any accounting query over that column
- * assumes. */
+ * assumes.
+ *
+ * The in-flight row is the fence. It is DELETEd FIRST, and if that removes
+ * nothing the whole transaction is rolled back and lostRace is thrown: the
+ * row being gone means another run already credited this batch. Two runs can
+ * both read the batch (pendingBatch is synchronous, the settlement check that
+ * follows it is not) and both be told it confirmed — and before this check
+ * both credited it, overstating paid_sats by the whole batch and writing a
+ * duplicate ledger row, so the miner silently lost that much of what they are
+ * owed. Deleting before crediting makes the second finalize a no-op error. */
 export function finalizeBatch(db, rows, totalFeeSats, txid, nowSec) {
     const n = BigInt(rows.length);
     const fee = BigInt(totalFeeSats);
@@ -189,8 +232,13 @@ export function finalizeBatch(db, rows, totalFeeSats, txid, nowSec) {
     db.transaction(() => {
         rows.forEach((r, i) => {
             const rowFee = share + (i === 0 ? remainder : 0n);
-            db.prepare('UPDATE payouts_in_flight SET txid = ? WHERE id = ?')
-              .run(txid, r.rowId);
+            const gone = db.prepare('DELETE FROM payouts_in_flight WHERE id = ?')
+                           .run(r.rowId).changes;
+            if (gone !== 1) {
+                throw lostRace(`finalizeBatch: in-flight row ${r.rowId} ` +
+                               `(txid=${txid}) is already gone — another run ` +
+                               'settled this batch first');
+            }
             db.prepare(`
                 UPDATE pps_credits
                    SET paid_sats = paid_sats + ?, last_updated = ?
@@ -201,7 +249,6 @@ export function finalizeBatch(db, rows, totalFeeSats, txid, nowSec) {
                 VALUES (?, ?, ?, ?, ?, ?)
             `).run(r.worker_id, Number(r.sats), Number(rowFee), txid, nowSec,
                    rows.length > 1 ? `batch of ${rows.length}` : null);
-            db.prepare('DELETE FROM payouts_in_flight WHERE id = ?').run(r.rowId);
         });
     })();
 }

@@ -55,6 +55,8 @@ import { listDue, listStuck, recordTxAttempt, asRawTx,
          beginBatch, finalizeBatch, abortBatch, attachBatchTxid,
          pendingBatch, inFlightCount } from './db.js';
 
+const isLostRace = e => e?.code === 'PAYOUT_LOST_RACE';
+
 /* Fee model: flat per-tx fee, configurable later. Thunder is a sidechain
  * with relatively low fees; 100 sats covers a one-input one-output tx
  * comfortably on regtest and should be a sane default for early
@@ -126,8 +128,20 @@ async function settlePending(ctx, log) {
 
     if (state === 'confirmed') {
         const total = pending.rows.reduce((a, r) => a + r.sats, 0n);
-        finalizeBatch(db, pending.rows, TX_FEE_SATS, pending.txid,
-                      Math.floor(Date.now() / 1000));
+        try {
+            finalizeBatch(db, pending.rows, TX_FEE_SATS, pending.txid,
+                          Math.floor(Date.now() / 1000));
+        } catch (e) {
+            if (!isLostRace(e)) throw e;
+            /* Another run (another process — in-process runs are serialised by
+             * runOnce) credited this batch while we were asking Thunder about
+             * it. finalizeBatch rolled back without writing, so the ledger is
+             * exactly as that run left it; carry on and let the rest of the
+             * tick re-read it. */
+            log.warn(`payout: ${short(pending.txid)} was settled by another run; ` +
+                     `not crediting it again (${e.message})`);
+            return { blocked: false };
+        }
         log.info(`payout: settled ${pending.rows.length} worker(s), ${total} sats, ` +
                  `txid=${short(pending.txid)} confirmed`);
         return { blocked: false, settled: pending.rows.length };
@@ -254,7 +268,53 @@ export function groupByAddress(rows) {
         .sort((a, b) => (a.owed < b.owed ? 1 : a.owed > b.owed ? -1 : 0));
 }
 
-export async function runOnce(ctx, log) {
+/* One payout run at a time per ledger, within this process.
+ *
+ * The timer loop and the admin `POST /tick` both call runOnce(). A run reads
+ * the ledger and then awaits Thunder, so a second run starting inside one of
+ * those awaits reads the same snapshot: both settle the same confirmed batch,
+ * or both broadcast to the same due workers. Every decision in runOnceLocked
+ * assumes it is the only one looking — so it is.
+ *
+ * Keyed on the db handle, not on ctx: index.js gives the loop and the admin
+ * server separate ctx objects over one handle, and a ctx-keyed lock would
+ * serialise nothing. The value is the tail of the queue; a rejected run does
+ * not poison it.
+ *
+ * In-process only. run-once.mjs beside the service is a second process the
+ * lock cannot see; beginBatch and finalizeBatch fence that case themselves
+ * inside their transactions (see lostRace in db.js). */
+const runTails = new WeakMap();
+
+export function runOnce(ctx, log) {
+    const prev = runTails.get(ctx.db) ?? Promise.resolve();
+    /* Released before the caller sees the result, so a /tick arriving the
+     * moment a run returns is not told `busy`. */
+    const run  = prev.then(() => runOnceLocked(ctx, log)).finally(() => {
+        if (runTails.get(ctx.db) === tail) runTails.delete(ctx.db);
+    });
+    const tail = run.catch(() => {});
+    runTails.set(ctx.db, tail);
+    return run;
+}
+
+/* For the admin `/tick`: run now if nothing is running, otherwise say so and
+ * return at once.
+ *
+ * Queueing behind the loop would be correct but wrong for the button. The run
+ * in progress is already doing what the operator asked for, and waiting for
+ * it plus a second run of up to a dozen 10s-timeout RPCs could outlast the
+ * dashboard's 60s request timeout, which would then report the worker as
+ * unreachable. `busy` is an honest, immediate answer. */
+export function runOnceIfIdle(ctx, log) {
+    if (runTails.has(ctx.db)) {
+        log.info('payout: tick requested while a run is in progress; not starting another');
+        return Promise.resolve({ attempted: 0, paid: 0, failed: 0, settled: 0, busy: true });
+    }
+    return runOnce(ctx, log);
+}
+
+async function runOnceLocked(ctx, log) {
     const { db, thunder, cfg } = ctx;
 
     /* Settle first, pay second — and both before listDue, because the answer
@@ -410,7 +470,18 @@ export async function runOnce(ctx, log) {
         worker_id: r.worker_id, worker_name: r.worker_name,
         address: r.thunder_address, sats: r.owed_sats,
     }));
-    const rowIds = beginBatch(db, batch, now_s);
+    let rowIds;
+    try {
+        rowIds = beginBatch(db, batch, now_s);
+    } catch (e) {
+        if (!isLostRace(e)) throw e;
+        /* Another process began a batch while we were checking the mempool and
+         * the balance. Nothing was written and nothing sent; its batch is now
+         * the outstanding one, so come back on the settle clock to wait on it
+         * rather than sleeping off the daily interval. */
+        log.warn(`payout: not broadcasting — ${e.message}`);
+        return { attempted: 0, paid: 0, failed: 0, settled, reason: 'lost-race' };
+    }
 
     let res;
     try {
@@ -588,6 +659,8 @@ export function reportStuck(ctx, log, staleAfterSec = 300) {
  * full interval. */
 export function nextDelayMs(cfg, res) {
     if (res?.reason === 'undetermined')       return cfg.retryIntervalMs;
+    /* Another process began a batch under us: it is now the outstanding one. */
+    if (res?.reason === 'lost-race')          return cfg.settleIntervalMs;
     if (res?.waiting_on || res?.txid)         return cfg.settleIntervalMs;
     if (res?.failed > 0 || res?.reserve_short) return cfg.retryIntervalMs;
     /* Blocked on someone else's unmined transaction: nothing was broadcast and

@@ -176,6 +176,18 @@ export async function triggerPayout({ payoutAdminUrl }) {
             };
         }
         const res = j.result || {};
+        /* The worker runs one payout cycle at a time — two overlapping runs
+         * would credit a confirmed batch twice — so a click that lands while
+         * its own timer's run is in progress starts nothing. Say that, rather
+         * than an all-zero summary that reads as "ran and found nothing". */
+        if (res.busy) {
+            return {
+                ok: true,
+                msg: 'payout run already in progress',
+                detail: 'the worker is mid-cycle; nothing new started — check the ' +
+                        'payout log, or click again once it finishes',
+            };
+        }
         return {
             ok: true,
             msg: `payout tick fired`,

@@ -5,13 +5,16 @@
  *   POST /tick    — run one payout cycle synchronously, return its result
  *                   as JSON. The dashboard uses this to fire the
  *                   "Trigger payout now" button without waiting for the
- *                   next interval.
+ *                   next interval. If the timer loop's run is in progress
+ *                   this does NOT start a second one alongside it — two
+ *                   overlapping runs credit a confirmed batch twice — and
+ *                   returns at once with `result.busy: true`.
  *
  * Deliberately minimal — no auth (loopback bind is the boundary), no
  * express dependency, no framework. */
 
 import { createServer } from 'node:http';
-import { runOnce }      from './payout.js';
+import { runOnceIfIdle } from './payout.js';
 
 export function startAdminHttp({ port, bind, ctx, log }) {
     const server = createServer(async (req, res) => {
@@ -22,7 +25,7 @@ export function startAdminHttp({ port, bind, ctx, log }) {
         };
         if (req.method === 'POST' && req.url === '/tick') {
             try {
-                const result = await runOnce(ctx, log);
+                const result = await runOnceIfIdle(ctx, log);
                 return send(200, { ok: true, result });
             } catch (e) {
                 log.error(`admin: /tick threw: ${e.message}`);

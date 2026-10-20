@@ -5,7 +5,17 @@
  * Exit codes: 0 = tick completed with no failed payouts,
  *             1 = at least one payout failed,
  *             2 = bad config.
- * Prints the tick summary as one JSON line on stdout. */
+ * Prints the tick summary as one JSON line on stdout.
+ *
+ * Meant for when the service is NOT running. runOnce() is single-flight only
+ * within one process, so this is a second, unserialised run beside a live
+ * service. That is still safe for the money — beginBatch and finalizeBatch
+ * refuse inside their transactions when another run got there first, so a
+ * batch is neither broadcast nor credited twice — but this run may lose that
+ * race and do nothing, or catch the service mid-broadcast and report its rows
+ * as unresolved. With the service up, use the dashboard's "Trigger payout now"
+ * (POST /tick), which joins the service's own lock. See payout/README.md ->
+ * One run at a time. */
 
 import { loadConfig } from './lib/config.js';
 import { openDb } from './lib/db.js';
