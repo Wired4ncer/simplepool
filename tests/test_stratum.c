@@ -103,8 +103,13 @@ static int on_block(void *ctx, const char *hex, char *errbuf, size_t errlen) {
     (void)hex;
     obs_t *o = ctx;
     if (!o) return 0;
+    /* Under obs_mu like on_share: test_job_rotation_races_submits finds
+     * "blocks" from several threads at once (its network target is all-ones). */
+    pthread_mutex_lock(&obs_mu);
     o->submits++;
-    if (o->submit_rejects) {
+    int reject = o->submit_rejects;
+    pthread_mutex_unlock(&obs_mu);
+    if (reject) {
         snprintf(errbuf, errlen, "inconclusive");
         return -30;
     }
@@ -449,7 +454,23 @@ static void test_submit_rejects_wrong_extranonce2_size(void) {
  * cb1/cb1_len and on the vardiff fields). It is a stress test, not a
  * deterministic one: run it under -fsanitize=address or =thread for it to mean
  * anything. Without a sanitizer it still exercises the paths and must not
- * crash. */
+ * crash.
+ *
+ * ⛔ IT WENT VACUOUS ONCE, SILENTLY. Extranonce2 was widened to 8 bytes after
+ * this test was written, and its submits kept sending 4: every one was refused
+ * as "bad extranonce2 size" BEFORE the render, the cb1/cb2 copy and the vardiff
+ * tick — the code this test exists for. The old guard (shares + rejects > 0)
+ * was satisfied by those very refusals, so with c->state_lock deleted from
+ * submit_with_job TSan reported nothing new. Hence: the en2 width comes from
+ * the header, the difficulty is low enough that shares CREDIT, and the guard
+ * demands credited shares, which only exist past the render.
+ *
+ * The free only happens when the two threads render DIFFERENT jobs into the
+ * same cache — the watcher the new job, the submitter the one it replaced,
+ * which is exactly a miner finishing work on the previous job at a new block.
+ * Submitting against job ids picked at random mostly missed both (not yet
+ * issued, or already off the ring), so the submitter now aims at the job the
+ * watcher just retired, alternating with the current one. */
 #define RACE_CONNS   4
 #define RACE_SUBMITS 400
 #define RACE_JOBS    300
@@ -461,19 +482,25 @@ typedef struct {
 } race_arg_t;
 
 static atomic_int race_stop;
+/* Index of the job race_job_thread most recently made current: "J<n>". */
+static atomic_int race_cur_job;
 
 static void *race_submit_thread(void *arg) {
     race_arg_t *a = (race_arg_t *)arg;
     char msg[256];
     for (int i = 0; i < RACE_SUBMITS && !atomic_load(&race_stop); ++i) {
         char *out = NULL; size_t olen = 0;
-        /* Alternate between the job most likely to be current and an older
-         * one, so both the current_job and recent-ring paths of find_job()
-         * get exercised against a concurrent retire. */
+        /* Mostly the job just retired (the recent-ring path of find_job, and
+         * a coinbase that is NOT the cached one, so the render frees cb1/cb2
+         * while the watcher is rendering the new job into them), every third
+         * the current one. en2 is unique per submit so dedupe never refuses
+         * one before the render. */
+        int cur = atomic_load(&race_cur_job);
+        int jn  = (i % 3 == 0 || cur == 0) ? cur : cur - 1;
         snprintf(msg, sizeof msg,
                  "{\"id\":9,\"method\":\"mining.submit\","
-                 "\"params\":[\"w\",\"J%d\",\"%08x\",\"60000000\",\"%08x\"]}",
-                 (i % 2) ? (i % RACE_JOBS) : ((i + 3) % RACE_JOBS),
+                 "\"params\":[\"w\",\"J%d\",\"%0*x\",\"60000000\",\"%08x\"]}",
+                 jn, STRATUM_EXTRANONCE2_SIZE * 2,
                  (unsigned)(a->id * 1000 + i), (unsigned)i);
         stratum_handle_message(a->s, a->c, msg, &out, &olen);
         free(out);
@@ -507,14 +534,18 @@ static void *race_job_thread(void *arg) {
         stratum_job_t *j = make_test_job(jid, net);
         if (!j) break;
         stratum_server_set_job(s, j, 1);
+        atomic_store(&race_cur_job, i);
     }
     return NULL;
 }
 
 static void test_job_rotation_races_submits(void) {
     obs_t obs = {0};
+    /* Difficulty far below what one nonce reaches, so submits CREDIT: a
+     * credited share is the only observable proof a submit got past the
+     * coinbase render and copy (see the vacuity guard below). */
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = RACE_CONNS,
-                           .initial_diff = 1.0,
+                           .initial_diff = 1e-9,
                            .vardiff_enabled = 1, .vardiff_window_sec = 1,
                            .vardiff_target_spm = 60, .vardiff_min = 0.001,
                            .vardiff_max = 1e6,
@@ -524,6 +555,7 @@ static void test_job_rotation_races_submits(void) {
     stratum_server_t *s = NULL;
     stratum_server_start(&cfg, &s);
     atomic_store(&race_stop, 0);
+    atomic_store(&race_cur_job, 0);
 
     uint8_t net[32];
     memset(net, 0xff, sizeof net);
@@ -572,9 +604,11 @@ static void test_job_rotation_races_submits(void) {
     pthread_join(jobthr, NULL);
     for (int i = 0; i < RACE_CONNS; ++i) pthread_join(drains[i], NULL);
 
-    /* Some work has to have landed, or the threads raced past each other
-     * without ever meeting and the test is vacuous. */
-    CHECK(obs.shares + obs.rejects > 0);
+    /* Shares have to have CREDITED, or no submit reached the render and the
+     * test is vacuous. Rejects do not count: most refusals (bad en2 width,
+     * unknown job, duplicate) happen before the coinbase is touched — that is
+     * how this guard once passed while testing nothing. */
+    CHECK(obs.shares > 0);
 
     for (int i = 0; i < RACE_CONNS; ++i) {
         close(fds[i][0]);
