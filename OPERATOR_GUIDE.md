@@ -16,14 +16,23 @@ tracked by git.
 
 | what | where | credentials |
 | --- | --- | --- |
-| Public dashboard | `http://<pool-host>:8081/` | none |
-| **Admin dashboard** | `http://<pool-host>:8081/admin` | **`admin` / `<see /root/simplepool-admin-cred.txt on the box>`** |
-| Admin JSON API | `http://<pool-host>:8081/api/admin/summary` | same basic auth |
-| Everything as JSON | `http://<pool-host>:8081/api/status` | none |
-| Which commit is running | `http://<pool-host>:8081/api/versions` | none |
+| Public dashboard | `https://<pool-domain>/` | none |
+| **Admin dashboard** | `https://<pool-domain>/admin` | **`admin` / `<see /root/simplepool-admin-cred.txt on the box>`** |
+| Admin JSON API | `https://<pool-domain>/api/admin/summary` | same basic auth |
+| Everything as JSON | `https://<pool-domain>/api/status` | none |
+| Which commit is running | `https://<pool-domain>/api/versions` | none |
 | Stratum (miner endpoint) | `stratum+tcp://<pool-host>:3334` | username = Thunder base58 address |
 | SSH | `root@<pool-host>` | `<ssh-key>` |
 | Everything from the shell | `simplepoolctl status` / `doctor` / `logs -f` | root for `restart`, `upgrade`, `uninstall` |
+
+The dashboard listens on `127.0.0.1:8081` (`DASHBOARD_BIND`) and nginx
+publishes it, so the URLs above go through nginx. Without a domain, reach it
+over an SSH tunnel — `ssh -L 8081:127.0.0.1:8081 root@<pool-host>`, then
+`http://127.0.0.1:8081/admin`. Serving `:8081` directly needs
+`Environment=DASHBOARD_BIND=0.0.0.0` in
+`/etc/systemd/system/simplepool-dashboard.service.d/local.conf` (what
+`install.sh --no-nginx` writes) — and then `/admin`'s Basic auth goes over
+plain HTTP, so only behind a firewall or TLS.
 
 The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
 box (root-only). To rotate, edit

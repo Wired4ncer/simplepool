@@ -60,6 +60,13 @@ Everything reads/writes the same SQLite file via a shared bind mount:
   `host.docker.internal:6009` (which `extra_hosts` maps to the host gateway
   on Linux, native on macOS/Windows). If Thunder lives on a different box,
   set `THUNDER_RPC_URL` to a real hostname/IP.
+- The **dashboard** port is published on the host's loopback only
+  (`127.0.0.1:${DASHBOARD_PORT}`): Docker's port rules bypass ufw, and
+  `/admin` is HTTP Basic auth. Front it with nginx on the host
+  (`deploy/nginx/`), or reach it over `ssh -L 8081:127.0.0.1:8081 <host>`.
+  `DASHBOARD_PUBLISH_ADDR=0.0.0.0` in `.env` exposes it on every interface —
+  only with TLS in front. Inside the container it listens on `0.0.0.0`
+  (`DASHBOARD_BIND`), which the published port needs.
 
 ## Updating after a code change
 

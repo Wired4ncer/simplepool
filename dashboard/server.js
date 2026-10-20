@@ -19,10 +19,13 @@ import { startHealthMonitor, currentHealth } from './lib/health.js';
 import { versions } from './lib/versions.js';
 import * as fmt from './lib/fmt.js';
 import { createAdminRouter } from './lib/admin-router.js';
+import { parseBasicAuth } from './lib/basic-auth.js';
+import { resolveBind } from './lib/bind.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT     = parseInt(process.env.PORT || '8081', 10);
+const BIND     = resolveBind();   // 127.0.0.1 unless DASHBOARD_BIND — see lib/bind.js
 const DB_PATH  = process.env.PROXY_DB_PATH || '../data/shares.db';
 
 const app = express();
@@ -116,10 +119,13 @@ function loadAdminCredentials() {
         user = raw.slice(0, sep);
         pass = raw.slice(sep + 1);
     }
-    /* HTTP Basic auth uses ':' as the user/password separator, so a colon
-     * in either would silently truncate at login time. Refuse at boot. */
-    if (user.includes(':') || pass.includes(':')) {
-        throw new Error('admin credentials must not contain ":" ' +
+    /* HTTP Basic auth uses ':' as the user/password separator and splits on
+     * the first one (RFC 7617), so a colon in the user would shift the split
+     * and could never log in. Refuse that at boot. A colon in the password is
+     * fine: the credentials file splits on its first ':' too, and so does
+     * parseBasicAuth. */
+    if (user.includes(':')) {
+        throw new Error('admin user must not contain ":" ' +
                         '(HTTP Basic auth uses it as the separator)');
     }
     return { user, pass };
@@ -147,11 +153,8 @@ function requireAdminAuth(req, res, next) {
     if (!ADMIN_USER || !ADMIN_PASS) {
         return res.status(503).send('admin disabled — set ADMIN_USER + ADMIN_PASSWORD or ADMIN_CREDENTIALS_FILE');
     }
-    const h = req.headers.authorization || '';
-    if (h.startsWith('Basic ')) {
-        const [u, p] = Buffer.from(h.slice(6), 'base64').toString('utf8').split(':');
-        if (credEq(u, ADMIN_USER) && credEq(p, ADMIN_PASS)) return next();
-    }
+    const c = parseBasicAuth(req.headers.authorization);
+    if (c && credEq(c.user, ADMIN_USER) && credEq(c.pass, ADMIN_PASS)) return next();
     res.setHeader('WWW-Authenticate', 'Basic realm="simplepool admin"');
     return res.status(401).send('unauthorised');
 }
@@ -309,6 +312,10 @@ app.use('/admin',
 
 app.use((_req, res) => res.status(404).render('404', { what: 'page' }));
 
-app.listen(PORT, () => {
-    console.log(`simplepool dashboard on :${PORT} (db: ${db.path})`);
+/* Log the address actually bound (not the configured PORT), so the journal
+ * says whether this is loopback-behind-nginx or exposed on every interface. */
+const server = app.listen(PORT, BIND, () => {
+    const a = server.address();
+    const host = a.family === 'IPv6' ? `[${a.address}]` : a.address;
+    console.log(`simplepool dashboard on ${host}:${a.port} (db: ${db.path})`);
 });

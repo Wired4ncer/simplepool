@@ -46,10 +46,17 @@ services:
     image: simplepool-dashboard:latest
     container_name: simplepool-dashboard
     restart: unless-stopped
+    # Host side on loopback: Docker writes its own iptables rules, so a port
+    # published on every interface bypasses ufw entirely, and /admin is HTTP
+    # Basic auth. Front it with nginx on the host (deploy/nginx/), or set
+    # DASHBOARD_PUBLISH_ADDR=0.0.0.0 to expose it directly — then only with TLS.
     ports:
-      - "${DASHBOARD_PORT:-8081}:8081"
+      - "${DASHBOARD_PUBLISH_ADDR:-127.0.0.1}:${DASHBOARD_PORT:-8081}:8081"
     environment:
       PORT: "8081"
+      # Container side must listen on every interface or the published
+      # port reaches nothing; the mapping above is what limits exposure.
+      DASHBOARD_BIND: 0.0.0.0
       PROXY_DB_PATH: /data/shares.db
       PUBLIC_STRATUM_URL: ${PUBLIC_STRATUM_URL:-stratum+tcp://<pool-host>:3334}
       THUNDER_RPC_URL: ${THUNDER_RPC_URL:-http://host.docker.internal:6009}

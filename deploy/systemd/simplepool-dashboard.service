@@ -10,6 +10,9 @@ User=@USER@
 Group=@USER@
 WorkingDirectory=@ROOT@/dashboard
 Environment=PORT=8081
+# Loopback: nginx publishes the dashboard. Set 0.0.0.0 only to serve it
+# directly, and then only behind a firewall or TLS -- /admin uses Basic auth.
+Environment=DASHBOARD_BIND=127.0.0.1
 Environment=PROXY_DB_PATH=@ROOT@/data/shares.db
 # Rendered on the public "Connect a miner" card. Set to the actual
 # host miners should point their ASIC at. Leave unset to show

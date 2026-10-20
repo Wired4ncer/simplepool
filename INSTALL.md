@@ -513,8 +513,9 @@ either both `ADMIN_USER` and `ADMIN_PASSWORD` in the env, or
 `ADMIN_CREDENTIALS_FILE` pointing at a `user:password` file (handy for
 docker secrets — same shape as the enforcer's RPC cookie). The file
 takes precedence when both are set. A trailing newline in the file is
-ignored; neither the user nor the password may contain `:` (it's the
-HTTP Basic auth separator — the dashboard refuses to boot if one does).
+ignored. The user may not contain `:` (it's the HTTP Basic auth
+separator — the dashboard refuses to boot if it does); the password may,
+since both the file and the `Authorization` header split on the first `:`.
 
 ### Systemd drop-in
 
@@ -556,9 +557,17 @@ scripted one-liner in [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md#rotating-the-admin-p
 
 ### Reverse proxy (recommended)
 
-The dashboard binds `0.0.0.0:8081` — reachable directly. In
-production you probably want nginx / caddy in front of it. Solo
-`deploy/nginx/simplepool.conf` has a working template.
+The dashboard binds `127.0.0.1:8081` by default (`DASHBOARD_BIND`), so it
+is reachable only through a reverse proxy on the same host, or an SSH
+tunnel (`ssh -L 8081:127.0.0.1:8081 <your-host>`, then
+`http://127.0.0.1:8081/`). Put nginx / caddy in front of it;
+`deploy/nginx/pool.drivechain.info.conf` is the template `install.sh`
+renders (with `pool-ratelimit.conf`). To serve it
+directly instead, set `Environment=DASHBOARD_BIND=0.0.0.0` in its
+drop-in (`install.sh --no-nginx` does this) — and then put TLS in front of
+`/admin` some other way. A box that was reached directly on `:8081` before
+this default changed needs that line before upgrading by hand
+(`simplepoolctl upgrade` rewrites the drop-in itself).
 
 Do NOT expose `/admin` on plain HTTP over the internet without at
 least TLS from nginx. Basic auth over plain HTTP leaks the password
@@ -667,7 +676,9 @@ Then check:
    ```
    Should show a row with a growing `accrued_sats`.
 7. **Audit cross-check green**:
-   Open `http://<your-host>:8081/admin`, log in, click `audit →` on the
+   Open `https://<your-domain>/admin` (through nginx), or
+   `http://127.0.0.1:8081/admin` over an SSH tunnel
+   (`ssh -L 8081:127.0.0.1:8081 <your-host>`), log in, click `audit →` on the
    worker's row. The **Cross-check** card should show ✓ — meaning the
    stored `accrued_sats` matches `Σ FLOOR(diff × rate)`. If it shows ⚠,
    the `POOL_PPS_SATS_PER_DIFF` env var doesn't match your

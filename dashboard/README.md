@@ -43,7 +43,10 @@ npm start          # production
 npm run dev        # auto-restart on file change
 ```
 
-Defaults: `PORT=8081`, `PROXY_DB_PATH=../data/shares.snapshot.db`.
+Defaults: `PORT=8081`, `DASHBOARD_BIND=127.0.0.1` (set `0.0.0.0` to serve it
+without a reverse proxy — `/admin` is HTTP Basic auth, so only behind TLS or a
+firewall), `PROXY_DB_PATH=../data/shares.snapshot.db`. The startup line logs
+the address actually bound.
 
 If the snapshot file doesn't exist yet, the dashboard starts anyway and
 displays "no data yet" until the first `.backup` produces it. You can also
