@@ -320,13 +320,23 @@ the miner's firmware has retried a bad username three times within a
 minute (`auth_max_failures` / `auth_fail_lockout_sec`), and the pool is
 now refusing the address without decoding anything until the minute is
 up. This is the authorize budget doing its job — see
-`NONCE_AND_SHARES.md`, *Two limits on cheap requests*. Nothing to do on
+`NONCE_AND_SHARES.md`, *A limit on cheap requests*. Nothing to do on
 the pool side: the first *successful* authorize clears it instantly, so
 once they fix the username the next reconnect goes through. The journal
 has one `WARN` per lockout naming the address, which is how you find
 who it was. Only the first three failures per minute per address reach
 the `rejects` table, so a miner debugging a typo still gets their error
 text there; a flood does not.
+
+**`job share limit` in the rejects table / "stale job (share limit
+reached)" on the miner:** one job credited 4,194,304 shares and the
+pool stopped taking more on it rather than forget which ones it had
+already paid (see `NONCE_AND_SHARES.md`, *Share dedupe*). The journal
+has one `WARN` per job naming it. Miners move to the current job, which
+starts empty, so the cost is a few seconds of shares. Seeing it at all
+means millions of shares landed on one job within its few minutes of
+life — a difficulty set far too low for the hashrate on the port
+(`initial_diff`, `vardiff_min`) is the usual cause.
 
 ---
 

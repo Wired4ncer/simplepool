@@ -274,8 +274,11 @@ would be effort spent to reach the same answer more slowly.
 2. Look up the job by `job_id`. If unknown / expired → reject with
    `stale or unknown job`.
 3. **Per-connection dedupe.** A repeat of
-   `(job_id, en2, ntime, nonce, version)` this connection already sent
-   → reject with `duplicate share`.
+   `(job_id, en2, ntime, nonce, version)` among the last 1,024 this
+   connection sent → reject with `duplicate share`. A cheap filter that
+   saves the hashing below for a miner's immediate repeats; it forgets,
+   and a reconnect starts it empty, so payouts do not rely on it — the
+   per-job hash dedupe in step 12 is the real check.
 4. **ntime bounds.** The submitted `ntime` must lie within
    `-600 s … +7200 s` of the value this job went out with → otherwise
    reject with `ntime out of range`. See *Rolling ntime* above for why
@@ -289,28 +292,32 @@ would be effort spent to reach the same answer more slowly.
 7. Compute the merkle root from `dsha256(coinbase) → branches`.
 8. Reconstruct the header with the miner's `version|ntime|nonce`.
 9. `dsha256(header)` → `sent_hash`.
-10. **Global hash dedupe.** If this exact hash has already been
-    credited — on any connection, under any job id — → reject with
-    `duplicate share`. One solution is one solution regardless of how
-    the submission was framed. The pool remembers the last 16,384
-    credited hashes, oldest forgotten first, and answers the question
-    with a hash-table lookup rather than a scan of all 16,384 (which is
-    what it did until `3bc3064`, under one mutex, on every share: fine
-    at real difficulty, a ~23,000 shares/s ceiling for the whole pool at
-    a minimum-difficulty window). See *Two limits on cheap requests*
-    below for the numbers.
-11. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
+10. Log a `[SUBMIT CHECK]` line with `sent_hash`, `worker_target`,
     `network_target`, and version fields (this is what appears in
     `logs/simplepool.log`).
-12. Compare against both targets:
-    - `sent_hash > worker_target` **and** `sent_hash > network_target`
-      → reject with `low difficulty`, insert a row into `rejects`.
-    - Otherwise → insert a row into `shares` with the SHA256 of the
+11. Compare against both targets:
+    `sent_hash > worker_target` **and** `sent_hash > network_target`
+    → reject with `low difficulty`, insert a row into `rejects`.
+12. **Per-job hash dedupe.** Only a hash that passed step 11 gets here,
+    so rejects can never fill the set. If this exact hash has already
+    been credited against this job — on any connection — → reject with
+    `duplicate share`. Every job keeps the full set of hashes credited
+    against it until the job itself is freed, so a share stays a
+    duplicate for as long as its job can be submitted against, however
+    many other shares arrive in between. A job that has credited
+    4,194,304 shares refuses further ones with
+    `stale job (share limit reached)` (error 21; reject reason
+    `job share limit`) rather than forgetting old ones; a block is
+    never refused. Duplicates *across* job ids cannot occur: no two
+    live jobs share a coinbase salt, so the same `(en2, ntime, nonce)`
+    is a different header under each. See *Share dedupe* below.
+13. Credit:
+    - insert a row into `shares` with the SHA256 of the
       header as `block_hash` (nullable elsewhere), **the difficulty
       that job went out under** as the share's difficulty (see *The two
       targets* — not whatever the connection has drifted to since), and
       `is_block = 1` iff `sent_hash ≤ network_target`.
-    - If block: also enqueue `submitblock` to the backend.
+    - If block: also `submitblock` to the backend.
 
 Note the order of the last comparison. The network verdict wins over
 the share verdict: on a low-difficulty chain a share target can be
@@ -385,34 +392,45 @@ hashrate and assigned difficulty from being badly mismatched — a fleet
 pointed at a home-miner port is the usual cause — and past the ceiling
 a submit is refused before any validation work.
 
-### Two limits on cheap requests
+### Share dedupe
 
-Both of these exist because the pool's stratum port is public and a
-client on it can make the pool do work before it has proved anything.
-Neither changes what a correctly configured miner sees.
+Step 12 of the validation flow has to ask "has this
+exact hash been credited already?" on every share that reaches it, and
+the answer has to be right for as long as the share's job is
+submittable — that is what stops the same work being paid twice.
 
-**The share-dedupe index.** Step 10 of the validation flow has to ask
-"has this exact hash been credited already?" on every share that
-reaches it. Until `3bc3064` that was a walk of a 16,384-entry ring
-under a single mutex shared by every connection thread — 128 KB of
-compares per share, serialised. Measured (miss case, the common one):
+Until this changed it was one server-wide FIFO of the last 16,384
+credited hashes (indexed since `3bc3064`, a linear scan before that).
+Jobs stay solvable for minutes (`RECENT_JOB_TTL_MS`), and at
+difficulty 1 — the default `initial_diff` and `vardiff_min`, where
+every new connection starts — one ASIC credits 16,384 shares in about a
+second. After that the ring had forgotten shares whose jobs were still
+live, and resubmitting one verbatim was credited again. The
+per-connection ring (step 3) did not help: it is smaller still, and a
+reconnect empties it.
 
-| | per share | pool-wide ceiling |
-|---|---|---|
-| linear scan (before) | 42,725 ns | ~23,400 shares/s |
-| hashed index (now) | 247 ns | ~4,050,000 shares/s |
+Now each job owns a hash set of everything credited against it,
+freed with the job when the last reference goes. Open addressing,
+grown ×2 at 50% load, no deletion; the key is the hash's low 128 bits
+(a repeat has the identical hash, so truncation can never let one
+through). Each job has its own mutex, so submits on different jobs no
+longer contend, and nothing is ever evicted: the cap (4,194,304 shares
+per job — ~140k shares/s for a 30 s job, 128 MB at the cap, 16 KB for a
+typical job) makes a full job refuse, not forget.
 
-The old ceiling was invisible at real difficulty and would have been the
-binding constraint at a minimum-difficulty window, when the
-network-difficulty clamp has every miner submitting at its full hash
-rate. The ring is still there — it is what bounds memory (16,384 keys)
-and decides which hash is forgotten next — but it is now indexed by an
-open-addressed hash table with four slots per entry, so the load never
-passes 25%. Eviction uses backward-shift deletion rather than
-tombstones, because a table that deletes 16,384 keys per 16,384 inserts
-for the life of the process would otherwise fill with tombstones and
-degrade back toward the scan. The invariant a test holds it to: the
-index contains exactly the ring's keys, after any amount of churn.
+Cost, measured against the old index (miss case, gcc -O2, 4 cores):
+the set operation is ~150–240 ns single-threaded vs ~40–90 ns for the
+old fixed, cache-resident 512 KB index — the difference is growth and
+the larger table's cache misses — and ~400–540 ns vs ~130–250 ns
+aggregate with 8 threads on one job. End to end a `mining.submit`
+costs ~5.5 µs either way (hashing and coinbase assembly dominate);
+the difference is inside run-to-run noise.
+
+### A limit on cheap requests
+
+This exists because the pool's stratum port is public and a client on
+it can make the pool do work before it has proved anything. It does
+not change what a correctly configured miner sees.
 
 **The authorize budget.** A failed `mining.authorize` — no worker name,
 a malformed username, an address that does not decode — used to cost a

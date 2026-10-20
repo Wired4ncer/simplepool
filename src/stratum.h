@@ -531,8 +531,9 @@ void stratum_server_free(stratum_server_t *s);
  * construct one of these directly. */
 typedef struct stratum_conn stratum_conn_t;
 
-/* Override a job's coinbase salt. Only for tests that need two job ids to be
- * the SAME work (the hash-dedupe ring); production salts come from job_id. */
+/* Override a job's coinbase salt, before it is published. Lets a test hand
+ * stratum_server_set_job two job ids with the SAME salt, which it must
+ * re-salt; production salts come from job_id. */
 void            stratum_job_set_cb_salt_for_test(stratum_job_t *j, uint32_t salt);
 uint32_t        stratum_job_cb_salt_for_test(const stratum_job_t *j);
 
@@ -600,14 +601,15 @@ void        stratum_conn_rearm_vardiff_for_test(stratum_conn_t *c);
  * which is what makes tearing the server down afterwards safe. */
 int         stratum_server_conn_count_for_test(const stratum_server_t *s);
 
-/* Server-wide share dedupe, on a precomputed key rather than a header hash:
- * 1 = already recorded, 0 = recorded now. Lets a test drive the index through
- * eviction with keys it chooses. */
-int    stratum_share_dedupe_key_for_test(stratum_server_t *s, uint64_t key);
-/* Returns the ring's live count; *index_live gets the number of occupied
- * index slots. The two must be equal — that equality is the whole invariant
- * of backward-shift deletion. */
-size_t stratum_share_dedupe_live_for_test(stratum_server_t *s, size_t *index_live);
+/* A job's credited-share set (share dedupe), on a hash the test chooses
+ * rather than one it had to mine: 0 = recorded now, 1 = already credited,
+ * 2 = the job is full and recorded nothing. is_block bypasses the cap. */
+int    stratum_job_seen_for_test(stratum_job_t *j, const uint8_t hash_be[32],
+                                 int is_block);
+/* Hashes recorded; *slots (if non-NULL) gets the table size. */
+size_t stratum_job_seen_count_for_test(stratum_job_t *j, size_t *slots);
+/* Lower a job's share cap so a test can reach it without millions of shares. */
+void   stratum_job_set_share_cap_for_test(stratum_job_t *j, size_t cap);
 /* Connections currently pinned by `sd=`. */
 int         stratum_server_pinned_count_for_test(const stratum_server_t *s);
 

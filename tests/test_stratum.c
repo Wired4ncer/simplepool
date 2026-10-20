@@ -1920,11 +1920,13 @@ static void test_stop_waits_for_connection_threads(void) {
     printf("ok: stop drains connection threads before returning\n");
 }
 
-/* The per-connection ring keys on (job_id|en2|ntime|nonce|version), so the
- * same solution resubmitted under a *different* job id slips past it. When
- * both jobs carry the same template the header — and therefore the hash — is
- * identical, and it must still be credited only once. The server-wide ring
- * keys on the hash itself, which is what makes this hold. */
+/* Dedupe is per job (each job remembers every hash credited against it), so
+ * the same solution resubmitted under a *different* job id is not looked up
+ * in the first job's set at all. That is only safe because it cannot be the
+ * same hash: no two live jobs share a coinbase salt, so the same
+ * (en2, ntime, nonce) is a different header under each. Pinned here from both
+ * sides — a job handed in with a live job's salt is re-salted on publish, and
+ * a production salt already differs. */
 static void test_dedupe_same_hash_across_job_ids(void) {
     obs_t obs = {0};
     stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
@@ -1955,19 +1957,33 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     CHECK(obs.shares == 1);
     free(out); out=NULL; olen=0;
 
-    /* Same template, new id, and — pinned for this test — the same coinbase
-     * salt, so the header really is identical. In production every job gets
-     * its own salt (see the next block), which is exactly why this ring is
-     * now the second line and not the first. */
+    /* Same template, new id, and — forced for this test — J1's salt, which
+     * would make the header identical and let J1's share be paid again under
+     * J2 (J2's set has never seen it). The 32-bit salt CAN collide in
+     * production, and the salt is visible in cb1, so an attacker would know
+     * when. stratum_server_set_job must re-salt it before anyone sees it. */
     stratum_job_t *j2 = make_test_job("J2", net);
-    stratum_job_set_cb_salt_for_test(j2, stratum_job_cb_salt_for_test(j1));
+    const uint32_t salt1 = stratum_job_cb_salt_for_test(j1);
+    stratum_job_set_cb_salt_for_test(j2, salt1);
     stratum_server_set_job(s, j2, 1);
+    CHECK(stratum_job_cb_salt_for_test(j2) != salt1);
+    CHECK(stratum_job_cb_salt_for_test(j2) != 0);
+    CHECK(stratum_job_cb_salt_for_test(j1) == salt1);   /* live work untouched */
+    int rejects_before = obs.rejects;
     stratum_handle_message(s, c,
         "{\"id\":4,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J2\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
-    CHECK(obs.shares == 1);  /* still one */
-    CHECK(obs.rejects >= 1);
+    /* A different header now, so a genuinely new share — not a repeat. */
+    CHECK(obs.shares == 2);
+    CHECK(obs.rejects == rejects_before);
+    free(out); out=NULL; olen=0;
+    /* ...and J1's own repeat is still caught by J1's set. */
+    stratum_handle_message(s, c,
+        "{\"id\":5,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"J1\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
+        &out, &olen);
+    CHECK(obs.shares == 2);
     CHECK(strstr(obs.last_reason, "duplicate") != NULL);
     free(out); out=NULL; olen=0;
 
@@ -1980,17 +1996,76 @@ static void test_dedupe_same_hash_across_job_ids(void) {
     CHECK(stratum_job_cb_salt_for_test(j3) != stratum_job_cb_salt_for_test(j1));
     CHECK(stratum_job_cb_salt_for_test(j3) != 0);
     stratum_server_set_job(s, j3, 1);
-    int rejects_before = obs.rejects;
+    rejects_before = obs.rejects;
     stratum_handle_message(s, c,
-        "{\"id\":5,\"method\":\"mining.submit\","
+        "{\"id\":6,\"method\":\"mining.submit\","
         "\"params\":[\"w\",\"J3\",\"" TEST_EN2 "\",\"60000000\",\"00000001\"]}",
         &out, &olen);
-    CHECK(obs.shares == 2);
+    CHECK(obs.shares == 3);
     CHECK(obs.rejects == rejects_before);
     free(out);
 
     stratum_conn_free_for_test(c);
     stratum_server_free(s);
+}
+
+/* A credited share stays a duplicate for as long as its job can still be
+ * submitted against — not merely until enough OTHER shares have arrived.
+ *
+ * The regression this pins: dedupe used to be a server-wide FIFO of the last
+ * 16,384 credited hashes (plus a 1,024-entry per-connection ring). Jobs stay
+ * solvable for up to RECENT_JOB_TTL_MS, and at difficulty 1 — the default
+ * initial_diff and vardiff floor, which every fresh connection starts at — a
+ * single ASIC credits 16,384 shares in about a second. After that the first
+ * share had been forgotten and the identical submission was paid again, for
+ * as long as its job lived. Here: credit X, credit 20,000 others on the same
+ * job (more than both rings combined), resubmit X verbatim. */
+static void submit_j1(stratum_server_t *s, stratum_conn_t *c, uint32_t nonce) {
+    char *out = NULL; size_t olen = 0;
+    submit_nonce(s, c, TEST_EN2, nonce, &out, &olen);
+    free(out);
+}
+static void test_dedupe_outlives_share_volume(void) {
+    obs_t obs = {0};
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
+    snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
+    stratum_server_t *s = NULL;
+    stratum_server_start(&cfg, &s);
+
+    uint8_t net[32] = {0};
+    stratum_server_set_job(s, make_test_job("J1", net), 1);
+
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
+
+    enum { OTHERS = 20000 };   /* > 16384 + 1024, the two old rings */
+    submit_j1(s, c, 0);
+    CHECK(obs.shares == 1);
+    for (uint32_t n = 1; n <= OTHERS; ++n) submit_j1(s, c, n);
+    CHECK(obs.shares == 1 + OTHERS);   /* every one of them genuinely new */
+
+    int rejects_before = obs.rejects;
+    submit_j1(s, c, 0);       /* X again; J1 is still the current job */
+    CHECK(obs.shares == 1 + OTHERS);   /* not paid twice */
+    CHECK(obs.rejects == rejects_before + 1);
+    CHECK(strstr(obs.last_reason, "duplicate") != NULL);
+    /* And a share from the middle of the run, for good measure. */
+    submit_j1(s, c, OTHERS / 2);
+    CHECK(obs.shares == 1 + OTHERS);
+    CHECK(strstr(obs.last_reason, "duplicate") != NULL);
+
+    stratum_conn_free_for_test(c);
+    stratum_server_free(s);
+    printf("ok: a credited share stays a duplicate for its job's lifetime\n");
 }
 
 
@@ -4375,86 +4450,173 @@ static void test_sd_end_to_end_over_a_socket(void) {
     stratum_server_free(s);
     printf("ok: sd= in the password pins a real socket session end to end\n");
 }
-/* The share-dedupe index under churn. The ring holds SHARE_DEDUPE_RING keys
- * and the index must answer for exactly those: a key inside the window is a
- * duplicate, a key that fell out of it is not, and after any amount of
- * eviction the index holds precisely as many keys as the ring does. That
- * last equality is what backward-shift deletion has to preserve — a leaked
- * key would make the index disagree with the ring, and a blanked-instead-of-
- * shifted slot would make a present key read absent, which is the same share
- * paid twice. Keys come from a fixed-seed generator so a failure replays. */
+/* A job's credited-share set, driven directly with hashes the test chooses.
+ * What payouts rely on: a hash is new exactly once, and a duplicate however
+ * many others arrived in between — through every doubling of the table, which
+ * is where a rehash that dropped or misplaced a key would make a present key
+ * read absent (the same share paid twice). At the cap the job refuses rather
+ * than forgets, and a block is never refused. Hashes come from a fixed-seed
+ * generator so a failure replays; their high bytes are zeroed the way a real
+ * share's are, so the key has to come from the low end. */
 static uint64_t dd_next(uint64_t *st) {   /* splitmix64 */
     uint64_t z = (*st += 0x9E3779B97F4A7C15ull);
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     return z ^ (z >> 31);
 }
-static void test_share_dedupe_index_tracks_the_ring(void) {
+static void dd_hash(uint64_t *st, uint8_t h[32]) {
+    memset(h, 0, 32);   /* bytes 0..15: the zeros a share target demands */
+    for (int w = 0; w < 2; ++w) {
+        uint64_t v = dd_next(st);
+        for (int b = 0; b < 8; ++b) h[16 + w * 8 + b] = (uint8_t)(v >> (8 * b));
+    }
+}
+/* Racing submitters: several threads offer the SAME hashes to one job, as
+ * duplicate submissions on parallel connections would. Exactly one may win
+ * each — across table growth, which is when a lost update would show. */
+enum { SEEN_RACE_THREADS = 4, SEEN_RACE_N = 20000 };
+typedef struct {
+    stratum_job_t *j;
+    uint8_t (*h)[32];
+    int won;
+} seen_race_t;
+static void *seen_race_worker(void *arg) {
+    seen_race_t *r = arg;
+    for (int i = 0; i < SEEN_RACE_N; ++i)
+        r->won += (stratum_job_seen_for_test(r->j, r->h[i], 0) == 0);
+    return NULL;
+}
+static void test_job_seen_set(void) {
+    uint8_t net[32] = {0};
+    stratum_job_t *j = make_test_job("JS", net);
+    CHECK(stratum_job_seen_count_for_test(j, NULL) == 0);
+
+    enum { N = 100000 };   /* ~7 doublings past the first table */
+    uint8_t (*h)[32] = malloc((size_t)N * 32);
+    uint64_t st = 0x5EEDu;
+    for (int i = 0; i < N; ++i) dd_hash(&st, h[i]);
+
+    int fresh = 0, bad = 0;
+    for (int i = 0; i < N; ++i) {
+        fresh += (stratum_job_seen_for_test(j, h[i], 0) == 0);
+        /* The oldest key and the newest stay duplicates through every grow. */
+        if ((i & 4095) == 0 && (stratum_job_seen_for_test(j, h[0], 0) != 1 ||
+                                stratum_job_seen_for_test(j, h[i], 0) != 1)) bad++;
+    }
+    CHECK(fresh == N);
+    CHECK(bad == 0);
+    size_t slots = 0;
+    CHECK(stratum_job_seen_count_for_test(j, &slots) == N);
+    CHECK(slots >= 2 * (size_t)N);   /* load <= 50% */
+    int dups = 0;
+    for (int i = 0; i < N; ++i) dups += (stratum_job_seen_for_test(j, h[i], 0) == 1);
+    CHECK(dups == N);
+    CHECK(stratum_job_seen_count_for_test(j, NULL) == N);   /* asking adds nothing */
+
+    /* All-zero low bytes would be the empty marker; still recorded, once. */
+    uint8_t z[32] = {0};
+    CHECK(stratum_job_seen_for_test(j, z, 0) == 0);
+    CHECK(stratum_job_seen_for_test(j, z, 0) == 1);
+
+    /* At the cap: refuse, record nothing, keep answering for what is in it. */
+    stratum_job_set_share_cap_for_test(j, N + 1);
+    uint8_t x[32];
+    dd_hash(&st, x);
+    CHECK(stratum_job_seen_for_test(j, x, 0) == 2);
+    CHECK(stratum_job_seen_for_test(j, x, 0) == 2);       /* still not recorded */
+    CHECK(stratum_job_seen_for_test(j, h[N / 2], 0) == 1);
+    /* A block is never refused for space — and is then a duplicate like any
+     * other share. */
+    CHECK(stratum_job_seen_for_test(j, x, 1) == 0);
+    CHECK(stratum_job_seen_for_test(j, x, 1) == 1);
+    CHECK(stratum_job_seen_for_test(j, x, 0) == 1);
+    CHECK(stratum_job_seen_count_for_test(j, NULL) == N + 2);
+
+    {
+        stratum_job_t *jr = make_test_job("JR", net);
+        seen_race_t r[SEEN_RACE_THREADS];
+        pthread_t th[SEEN_RACE_THREADS];
+        for (int t = 0; t < SEEN_RACE_THREADS; ++t) {
+            r[t] = (seen_race_t){ .j = jr, .h = h, .won = 0 };
+            pthread_create(&th[t], NULL, seen_race_worker, &r[t]);
+        }
+        int won = 0;
+        for (int t = 0; t < SEEN_RACE_THREADS; ++t) {
+            pthread_join(th[t], NULL);
+            won += r[t].won;
+        }
+        CHECK(won == SEEN_RACE_N);
+        CHECK(stratum_job_seen_count_for_test(jr, NULL) == SEEN_RACE_N);
+        stratum_job_free(jr);
+    }
+
+    /* A different job starts empty: the set belongs to the job. */
+    stratum_job_t *j2 = make_test_job("JS2", net);
+    CHECK(stratum_job_seen_for_test(j2, h[0], 0) == 0);
+    stratum_job_free(j2);
+
+    free(h);
+    stratum_job_free(j);
+    printf("ok: a job's share set is exact through growth and closed at its cap\n");
+}
+
+/* End to end at the cap: the share past it is answered as stale with its own
+ * reject reason, the job still knows its duplicates, the current job is not
+ * affected, and a block on the full job is still submitted. */
+static void test_job_share_cap_fails_closed(void) {
     obs_t obs = {0};
-    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1, .initial_diff = 1.0,
-                           .ctx = &obs, .on_reject = on_reject };
+    stratum_cfg_t cfg = { .bind_port = 0, .max_conns = 1,
+                          .initial_diff = 1e-12,
+                          .ctx = &obs, .on_share = on_share,
+                          .on_reject = on_reject, .on_block = on_block };
     snprintf(cfg.bind_addr, sizeof(cfg.bind_addr), "127.0.0.1");
     stratum_server_t *s = NULL;
     stratum_server_start(&cfg, &s);
 
-    enum { RING = 16384 };   /* SHARE_DEDUPE_RING; a mismatch fails below */
-    uint64_t *keys = malloc(sizeof(uint64_t) * 2 * RING);
-    uint64_t st = 0x5EEDu;
-    for (int i = 0; i < 2 * RING; ++i) keys[i] = dd_next(&st);
+    uint8_t net[32] = {0};
+    stratum_job_t *j1 = make_test_job("J1", net);
+    stratum_job_set_share_cap_for_test(j1, 3);
+    stratum_server_set_job(s, j1, 1);
 
-    /* Fill exactly one window. Every key is new. */
-    int fresh = 0;
-    for (int i = 0; i < RING; ++i) fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
-    CHECK(fresh == RING);
-    size_t idx = 0, live = stratum_share_dedupe_live_for_test(s, &idx);
-    CHECK(live == RING);   /* also proves RING matches the real ring size */
-    CHECK(idx == RING);
-    /* Everything in the window is a duplicate, and saying so changes nothing. */
-    int dups = 0;
-    for (int i = 0; i < RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
-    CHECK(dups == RING);
-    live = stratum_share_dedupe_live_for_test(s, &idx);
-    CHECK(live == RING && idx == RING);
+    stratum_conn_t *c = stratum_conn_new_for_test(s);
+    char *out = NULL; size_t olen = 0;
+    stratum_handle_message(s, c, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}",
+                           &out, &olen); free(out); out=NULL; olen=0;
+    stratum_handle_message(s, c,
+        "{\"id\":2,\"method\":\"mining.authorize\","
+         "\"params\":[\"" TEST_ADDR "\",\"x\"]}",
+        &out, &olen); free(out); out=NULL; olen=0;
 
-    /* A second window evicts the first one key at a time, in order. Every
-     * new key is fresh; every evicted key is fresh again; the ones still
-     * inside the window stay duplicates throughout. */
-    fresh = 0;
-    for (int i = RING; i < 2 * RING; ++i) {
-        fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
-        if ((i & 1023) == 0) {
-            live = stratum_share_dedupe_live_for_test(s, &idx);
-            CHECK(live == RING && idx == RING);
-            /* Oldest surviving key and the newest are both present... */
-            CHECK(stratum_share_dedupe_key_for_test(s, keys[i - RING + 1]) == 1);
-            CHECK(stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
-        }
-    }
-    CHECK(fresh == RING);
-    live = stratum_share_dedupe_live_for_test(s, &idx);
-    CHECK(live == RING && idx == RING);
-    dups = 0;
-    for (int i = RING; i < 2 * RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
-    CHECK(dups == RING);
-    /* ...and the whole first window is gone. Each of these re-inserts,
-     * evicting the oldest of the second window in turn, so check the tail
-     * of the second window is still intact afterwards. */
-    fresh = 0;
-    for (int i = 0; i < 256; ++i) fresh += (stratum_share_dedupe_key_for_test(s, keys[i]) == 0);
-    CHECK(fresh == 256);
-    dups = 0;
-    for (int i = RING + 256; i < 2 * RING; ++i) dups += (stratum_share_dedupe_key_for_test(s, keys[i]) == 1);
-    CHECK(dups == RING - 256);
-    live = stratum_share_dedupe_live_for_test(s, &idx);
-    CHECK(live == RING && idx == RING);
+    for (uint32_t n = 1; n <= 3; ++n) submit_j1(s, c, n);
+    CHECK(obs.shares == 3);
+    submit_nonce(s, c, TEST_EN2, 4, &out, &olen);
+    CHECK(obs.shares == 3);
+    CHECK(strcmp(obs.last_reason, "job share limit") == 0);
+    CHECK(out && strstr(out, "\"error\":[21,") != NULL);
+    free(out); out=NULL; olen=0;
+    submit_j1(s, c, 2);                     /* a repeat is still a repeat */
+    CHECK(obs.shares == 3);
+    CHECK(strstr(obs.last_reason, "duplicate") != NULL);
 
-    /* 0 is the empty marker and is stored as 1; both read back as present. */
-    CHECK(stratum_share_dedupe_key_for_test(s, 0) == 0);
-    CHECK(stratum_share_dedupe_key_for_test(s, 0) == 1);
-    CHECK(stratum_share_dedupe_key_for_test(s, 1) == 1);
+    /* A block on the full job: every hash beats an all-0xff target. */
+    uint8_t easy[32];
+    memset(easy, 0xff, sizeof easy);
+    stratum_job_t *jb = make_test_job("JB", easy);
+    stratum_job_set_share_cap_for_test(jb, 0);
+    stratum_server_set_job(s, jb, 1);
+    int submits_before = obs.submits;
+    stratum_handle_message(s, c,
+        "{\"id\":7,\"method\":\"mining.submit\","
+        "\"params\":[\"w\",\"JB\",\"" TEST_EN2 "\",\"60000000\",\"00000009\"]}",
+        &out, &olen);
+    free(out); out=NULL; olen=0;
+    CHECK(obs.submits == submits_before + 1);
+    CHECK(obs.shares == 4);
+    CHECK(obs.last_is_block == 1);
 
-    free(keys);
+    stratum_conn_free_for_test(c);
     stratum_server_free(s);
+    printf("ok: a full job refuses shares as stale, never a block\n");
 }
 
 /* ---- authorize budget ---------------------------------------------------- */
@@ -4655,7 +4817,9 @@ int main(void) {
     test_extranonce1_unique_across_connections();
     test_stop_waits_for_connection_threads();
     test_dedupe_same_hash_across_job_ids();
-    test_share_dedupe_index_tracks_the_ring();
+    test_dedupe_outlives_share_volume();
+    test_job_seen_set();
+    test_job_share_cap_fails_closed();
     test_rejected_candidate_is_not_a_block();
     test_accepted_candidate_reports_accepted();
     test_job_survives_retirement_while_held();
