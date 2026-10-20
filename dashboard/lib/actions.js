@@ -156,7 +156,12 @@ export async function removeFromMempool({ thunderRpcUrl, txid }) {
 
 /* ---------- Action #2: kick the payout worker to run one cycle ---------- */
 
-export async function triggerPayout({ payoutAdminUrl }) {
+/* The worker's /tick runs a real payout cycle, so it wants the shared
+ * PAYOUT_ADMIN_TOKEN as a bearer token (see payout/lib/admin-http.js for why
+ * its loopback bind is not enough). Without one we still make the call: the
+ * worker answers 503 naming the missing variable, and that lands in the
+ * flash message where the operator will see it. */
+export async function triggerPayout({ payoutAdminUrl, payoutAdminToken = '' }) {
     if (!payoutAdminUrl) {
         return { ok: false, msg: 'PAYOUT_ADMIN_URL not configured' };
     }
@@ -165,6 +170,8 @@ export async function triggerPayout({ payoutAdminUrl }) {
     try {
         const r = await fetch(new URL('/tick', payoutAdminUrl), {
             method: 'POST',
+            headers: payoutAdminToken
+                ? { authorization: `Bearer ${payoutAdminToken}` } : {},
             signal: ctl.signal,
         });
         const j = await r.json().catch(() => ({}));

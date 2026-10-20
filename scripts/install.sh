@@ -944,6 +944,17 @@ ADMIN_CRED_FILE_SUPPORTED=0
 if grep -q 'ADMIN_CREDENTIALS_FILE' "$ROOT/dashboard/server.js" 2>/dev/null; then
     ADMIN_CRED_FILE_SUPPORTED=1
 fi
+# The payout worker's POST /tick (the "Trigger payout now" button) runs a
+# real payout, and its loopback bind does not keep the operator's browser
+# out — any page can fire a simple POST at 127.0.0.1:9080. Newer checkouts
+# require a shared bearer token on it; both services read it from this file.
+# Older checkouts know nothing about it, so only wire it where both do.
+PAYOUT_TOKEN_FILE="$STATE_DIR/payout-admin.token"
+PAYOUT_TOKEN_SUPPORTED=0
+if grep -q 'PAYOUT_ADMIN_TOKEN_FILE' "$ROOT/payout/lib/config.js" 2>/dev/null &&
+   grep -q 'PAYOUT_ADMIN_TOKEN_FILE' "$ROOT/dashboard/server.js" 2>/dev/null; then
+    PAYOUT_TOKEN_SUPPORTED=1
+fi
 render_unit() { # render_unit <name>
     sed -e "s|@USER@|${SVC_USER}|g" -e "s|@ROOT@|${ROOT}|g" \
         "$ROOT/deploy/systemd/$1" > "/etc/systemd/system/$1"
@@ -979,6 +990,9 @@ if [[ "$DO_DASH" == "1" ]]; then
         echo "Environment=THUNDER_RPC_URL=${THUNDER_RPC_URL}"
         if [[ "$DO_PAYOUT" == "1" ]]; then
             echo "Environment=PAYOUT_ADMIN_URL=http://127.0.0.1:9080"
+            if [[ "$PAYOUT_TOKEN_SUPPORTED" == "1" ]]; then
+                echo "Environment=PAYOUT_ADMIN_TOKEN_FILE=${PAYOUT_TOKEN_FILE}"
+            fi
         else
             echo "Environment=PAYOUT_ADMIN_URL="
         fi
@@ -1009,6 +1023,11 @@ if [[ "$DO_PAYOUT" == "1" ]]; then
         echo "# broadcast batch is credited until a tick sees it confirmed in a Thunder"
         echo "# block, so this must not follow the cadence above. Left at the worker's"
         echo "# defaults (30s / 5m) unless you have a reason to move them."
+        if [[ "$PAYOUT_TOKEN_SUPPORTED" == "1" ]]; then
+            echo "# Bearer token required on the admin POST /tick; the dashboard"
+            echo "# reads the same file."
+            echo "Environment=PAYOUT_ADMIN_TOKEN_FILE=${PAYOUT_TOKEN_FILE}"
+        fi
     } > "$PDROPIN"
     chmod 0644 "$PDROPIN"
     if [[ -z "$THUNDER_ADDRESS" ]]; then
@@ -1025,6 +1044,18 @@ if [[ "$DO_DASH" == "1" ]]; then
     printf '%s:%s\n' "$ADMIN_USER" "$ADMIN_PASSWORD" > "$CRED_FILE"
     chown "$SVC_USER:$SVC_USER" "$CRED_FILE"
     chmod 0400 "$CRED_FILE"
+fi
+
+# Payout admin token: generated once and kept across re-runs, so re-installing
+# never leaves one service holding a token the other has already forgotten.
+# Owned by the service user for the same reason as the credentials file —
+# both services treat a set-but-unreadable file as fatal.
+if [[ "$DO_PAYOUT" == "1" && "$PAYOUT_TOKEN_SUPPORTED" == "1" ]]; then
+    if [[ ! -s "$PAYOUT_TOKEN_FILE" ]]; then
+        ( umask 077; openssl rand -hex 32 > "$PAYOUT_TOKEN_FILE" )
+    fi
+    chown "$SVC_USER:$SVC_USER" "$PAYOUT_TOKEN_FILE"
+    chmod 0400 "$PAYOUT_TOKEN_FILE"
 fi
 
 # ============================== 10. nginx ===================================

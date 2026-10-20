@@ -58,6 +58,9 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # --- Write-action wiring ---
       PAYOUT_ADMIN_URL:   ${PAYOUT_ADMIN_URL:-http://host.docker.internal:9080}
+      # Bearer token for the payout worker's POST /tick — must equal the
+      # payout service's. Unset = the "Trigger payout now" button is refused.
+      PAYOUT_ADMIN_TOKEN: ${PAYOUT_ADMIN_TOKEN:-}
       ENFORCER_GRPC_ADDR: ${ENFORCER_GRPC_ADDR:-host.docker.internal:50051}
       THUNDER_SIDECHAIN_ID: ${THUNDER_SIDECHAIN_ID:-9}
     volumes:
@@ -90,9 +93,16 @@ services:
       PAYOUT_DRY_RUN: ${PAYOUT_DRY_RUN:-0}
       # Admin HTTP surface — dashboard reaches it at PAYOUT_ADMIN_URL.
       # Bind to 0.0.0.0 (default) so the dashboard container can reach
-      # it via host.docker.internal:PAYOUT_ADMIN_PORT.
+      # it via host.docker.internal:PAYOUT_ADMIN_PORT. That also puts it
+      # in reach of every other container on the network, so POST /tick
+      # requires PAYOUT_ADMIN_TOKEN; unset, /tick answers 503.
       PAYOUT_ADMIN_BIND: ${PAYOUT_ADMIN_BIND:-0.0.0.0}
       PAYOUT_ADMIN_PORT: ${PAYOUT_ADMIN_PORT:-9080}
+      PAYOUT_ADMIN_TOKEN: ${PAYOUT_ADMIN_TOKEN:-}
+      # Host names accepted in admin requests besides the loopback ones —
+      # anything else is refused as a DNS-rebinding attempt. Must include
+      # the host part of the dashboard's PAYOUT_ADMIN_URL.
+      PAYOUT_ADMIN_ALLOWED_HOSTS: ${PAYOUT_ADMIN_ALLOWED_HOSTS:-host.docker.internal}
     ports:
       # Expose the admin HTTP for the dashboard to hit. Loopback-only
       # on the host is the sane default.

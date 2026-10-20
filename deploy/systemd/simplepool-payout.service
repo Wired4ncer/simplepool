@@ -31,6 +31,10 @@ Environment=PAYOUT_RETRY_INTERVAL_MS=300000
 # button. Loopback-only. Set port=0 to disable.
 Environment=PAYOUT_ADMIN_BIND=127.0.0.1
 Environment=PAYOUT_ADMIN_PORT=9080
+# Loopback does not keep the operator's browser out, so POST /tick needs a
+# bearer token shared with the dashboard; without one it answers 503.
+# scripts/install.sh generates it into /etc/simplepool/payout-admin.token.
+# Environment=PAYOUT_ADMIN_TOKEN_FILE=/etc/simplepool/payout-admin.token
 ExecStart=/usr/bin/node @ROOT@/payout/index.js
 Restart=on-failure
 RestartSec=5

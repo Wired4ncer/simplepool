@@ -587,7 +587,17 @@ Environment=THUNDER_FROM_ADDRESS=<same as the dashboard's POOL_THUNDER_RESERVE_A
 # Environment=PAYOUT_SETTLE_INTERVAL_MS=30000
 # Environment=PAYOUT_RETRY_INTERVAL_MS=300000
 # Environment=PAYOUT_MAX_PER_TICK=50
+# The admin listener on 127.0.0.1:9080 (dashboard's "Trigger payout now")
+# requires a bearer token: loopback does not keep the operator's browser
+# out. Without it POST /tick answers 503; timed payouts still run.
+Environment=PAYOUT_ADMIN_TOKEN_FILE=/etc/simplepool/payout-admin.token
 CONF
+# Generate the token once and give the dashboard the same file
+# (Environment=PAYOUT_ADMIN_TOKEN_FILE=... in its drop-in too):
+sudo install -d -m 0755 /etc/simplepool
+sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/simplepool/payout-admin.token'
+sudo chown simplepool:simplepool /etc/simplepool/payout-admin.token
+sudo chmod 0400 /etc/simplepool/payout-admin.token
 sudo systemctl daemon-reload
 sudo systemctl enable --now simplepool-payout.service
 sudo journalctl -u simplepool-payout.service -f

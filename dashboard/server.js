@@ -128,6 +128,24 @@ const { user: ADMIN_USER, pass: ADMIN_PASS } = loadAdminCredentials();
 const RESERVE_ADDRESS      = process.env.POOL_THUNDER_RESERVE_ADDRESS || '(unset)';
 const THUNDER_RPC_URL      = process.env.THUNDER_RPC_URL      || 'http://127.0.0.1:6009';
 const PAYOUT_ADMIN_URL     = process.env.PAYOUT_ADMIN_URL     || '';
+/* Shared secret the payout worker requires on POST /tick. Same precedence
+ * and fail-loud rule as the admin credentials: PAYOUT_ADMIN_TOKEN_FILE wins
+ * over PAYOUT_ADMIN_TOKEN, and a set-but-unreadable file is fatal. */
+function loadPayoutAdminToken() {
+    const file = process.env.PAYOUT_ADMIN_TOKEN_FILE || '';
+    if (!file) return process.env.PAYOUT_ADMIN_TOKEN || '';
+    try {
+        return fs.readFileSync(file, 'utf8').replace(/[\r\n]+$/, '');
+    } catch (e) {
+        throw new Error(`PAYOUT_ADMIN_TOKEN_FILE ${file}: ${e.message}`);
+    }
+}
+const PAYOUT_ADMIN_TOKEN   = loadPayoutAdminToken();
+if (PAYOUT_ADMIN_URL && !PAYOUT_ADMIN_TOKEN) {
+    console.warn('[warn] PAYOUT_ADMIN_URL is set but PAYOUT_ADMIN_TOKEN is not — ' +
+                 'the payout worker will refuse "Trigger payout now". Set the ' +
+                 'same token on both services.');
+}
 const ENFORCER_GRPC_ADDR   = process.env.ENFORCER_GRPC_ADDR   || '127.0.0.1:50051';
 const THUNDER_SIDECHAIN_ID = parseInt(process.env.THUNDER_SIDECHAIN_ID || '9', 10);
 
@@ -300,6 +318,7 @@ app.use('/admin',
         dbRw,
         THUNDER_RPC_URL,
         PAYOUT_ADMIN_URL,
+        PAYOUT_ADMIN_TOKEN,
         ENFORCER_GRPC_ADDR,
         THUNDER_SIDECHAIN_ID,
         RESERVE_ADDRESS,

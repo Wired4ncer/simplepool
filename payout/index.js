@@ -54,7 +54,8 @@ reportStuck({ db }, log);
 const loop = startLoop({ db, thunder, cfg }, log);
 
 /* Small HTTP admin surface for the dashboard's "Trigger payout now"
- * button. port=0 disables. Loopback-only unless overridden. */
+ * button. port=0 disables. Loopback-only unless overridden, and /tick
+ * needs PAYOUT_ADMIN_TOKEN regardless — see lib/admin-http.js. */
 let adminHttp = null;
 if (cfg.adminHttpPort > 0) {
     adminHttp = startAdminHttp({
@@ -62,6 +63,8 @@ if (cfg.adminHttpPort > 0) {
         bind: cfg.adminHttpBind,
         ctx:  { db, thunder, cfg },
         log,
+        token:        cfg.adminToken,
+        allowedHosts: cfg.adminAllowedHosts,
     });
 }
 

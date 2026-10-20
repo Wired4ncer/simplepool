@@ -23,6 +23,8 @@ Environment=THUNDER_RPC_URL=http://127.0.0.1:6009
 # --- Write-action wiring (POST buttons on /admin) ---
 # Payout worker admin HTTP endpoint (see simplepool-payout.service).
 Environment=PAYOUT_ADMIN_URL=http://127.0.0.1:9080
+# Same token file as the payout worker — sent as a bearer token on /tick.
+# Environment=PAYOUT_ADMIN_TOKEN_FILE=/etc/simplepool/payout-admin.token
 # bip300301_enforcer address — the deposit action POSTs JSON to its
 # ConnectRPC endpoint for CreateDepositTransaction.
 Environment=ENFORCER_GRPC_ADDR=127.0.0.1:50051

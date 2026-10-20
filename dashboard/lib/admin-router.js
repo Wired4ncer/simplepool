@@ -18,6 +18,7 @@ export function createAdminRouter({
     dbRw,                   // writable handle (lazy wrapper)
     THUNDER_RPC_URL,
     PAYOUT_ADMIN_URL,
+    PAYOUT_ADMIN_TOKEN,     // bearer token for the worker's POST /tick
     ENFORCER_GRPC_ADDR,
     THUNDER_SIDECHAIN_ID,
     RESERVE_ADDRESS,
@@ -176,7 +177,10 @@ export function createAdminRouter({
     });
 
     router.post('/action/trigger-payout', parseAdminForm, requireCsrf, async (req, res) => {
-        const r = await actions.triggerPayout({ payoutAdminUrl: PAYOUT_ADMIN_URL });
+        const r = await actions.triggerPayout({
+            payoutAdminUrl:   PAYOUT_ADMIN_URL,
+            payoutAdminToken: PAYOUT_ADMIN_TOKEN,
+        });
         flashRedirect(res, r, returnTarget(req));
     });
 

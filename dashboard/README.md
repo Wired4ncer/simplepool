@@ -45,6 +45,12 @@ npm run dev        # auto-restart on file change
 
 Defaults: `PORT=8081`, `PROXY_DB_PATH=../data/shares.snapshot.db`.
 
+The admin **Trigger payout now** button calls the payout worker's
+`POST /tick` at `PAYOUT_ADMIN_URL`, sending `PAYOUT_ADMIN_TOKEN` (or the
+contents of `PAYOUT_ADMIN_TOKEN_FILE`) as a bearer token. It must equal the
+worker's token; without it the worker refuses with 503 and the button shows
+why. See [payout/README.md](../payout/README.md#admin-http-surface).
+
 If the snapshot file doesn't exist yet, the dashboard starts anyway and
 displays "no data yet" until the first `.backup` produces it. You can also
 point `PROXY_DB_PATH` at the live `shares.db` if you don't want to run a

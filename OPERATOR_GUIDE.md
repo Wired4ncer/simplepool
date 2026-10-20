@@ -170,7 +170,11 @@ So "nobody has been paid yet today" is the normal state for most of the day,
 not a fault. What does *not* wait a day is settlement: once a batch is
 broadcast the worker re-checks it every 30s until Thunder mines it, because
 nobody in that batch is credited until then. To pay out early, use **Trigger
-payout now** on the admin dashboard. To change the cadence, re-run the
+payout now** on the admin dashboard. That button calls the payout worker's
+admin port (`127.0.0.1:9080`) with a bearer token from
+`/etc/simplepool/payout-admin.token`, which the installer generates and both
+services read; if the button reports `PAYOUT_ADMIN_TOKEN not set`, that file
+is missing from one of the two drop-ins. To change the cadence, re-run the
 installer with `--payout-interval-hours N`, or edit
 `PAYOUT_INTERVAL_MS` in
 `/etc/systemd/system/simplepool-payout.service.d/local.conf`.

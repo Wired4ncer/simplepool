@@ -60,6 +60,13 @@ Everything reads/writes the same SQLite file via a shared bind mount:
   `host.docker.internal:6009` (which `extra_hosts` maps to the host gateway
   on Linux, native on macOS/Windows). If Thunder lives on a different box,
   set `THUNDER_RPC_URL` to a real hostname/IP.
+- **payout**'s admin listener binds `0.0.0.0` inside the docker network, so
+  any container on it can reach it. `POST /tick` (the dashboard's "Trigger
+  payout now") therefore requires `PAYOUT_ADMIN_TOKEN`, passed to both the
+  dashboard and payout containers from `.env` — generate one with
+  `openssl rand -hex 32`. Unset, `/tick` answers 503. Requests whose `Host`
+  is not loopback or in `PAYOUT_ADMIN_ALLOWED_HOSTS` (default
+  `host.docker.internal`) are refused.
 
 ## Updating after a code change
 

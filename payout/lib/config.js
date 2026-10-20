@@ -55,7 +55,23 @@
  *   THUNDER_FROM_ADDRESS   pool reserve address to send from (must match
  *                          the dashboard's POOL_THUNDER_RESERVE_ADDRESS —
  *                          the wallet the operator deposits mined BTC into)
+ *   PAYOUT_ADMIN_TOKEN     shared secret the dashboard must send to POST
+ *                          /tick (Authorization: Bearer). Unset = /tick
+ *                          answers 503. See lib/admin-http.js for why a
+ *                          loopback bind is not enough on its own.
+ *   PAYOUT_ADMIN_TOKEN_FILE
+ *                          file holding the token instead (installer and
+ *                          docker-secret friendly); takes precedence. A
+ *                          set-but-unreadable file is fatal, like the
+ *                          dashboard's ADMIN_CREDENTIALS_FILE.
+ *   PAYOUT_ADMIN_ALLOWED_HOSTS
+ *                          comma-separated extra hostnames accepted in the
+ *                          Host header of admin requests, on top of the
+ *                          loopback names and PAYOUT_ADMIN_BIND (e.g.
+ *                          host.docker.internal in the compose stack).
  */
+
+import fs from 'node:fs';
 
 function require_env(name) {
     const v = process.env[name];
@@ -64,6 +80,22 @@ function require_env(name) {
         process.exit(2);
     }
     return v;
+}
+
+/* Token from PAYOUT_ADMIN_TOKEN_FILE (preferred: keeps it out of the unit
+ * and the process environment) or PAYOUT_ADMIN_TOKEN. Trailing newlines are
+ * stripped — `echo tok > file` and docker secrets end with one. */
+export function loadAdminToken(env = process.env) {
+    const file = env.PAYOUT_ADMIN_TOKEN_FILE || '';
+    if (!file) return env.PAYOUT_ADMIN_TOKEN || '';
+    let raw;
+    try {
+        raw = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+        console.error(`fatal: PAYOUT_ADMIN_TOKEN_FILE ${file}: ${e.message}`);
+        process.exit(2);
+    }
+    return raw.replace(/[\r\n]+$/, '');
 }
 
 export function loadConfig() {
@@ -88,5 +120,8 @@ export function loadConfig() {
          * button. Loopback-bound by default; set port=0 to disable. */
         adminHttpBind: process.env.PAYOUT_ADMIN_BIND || '127.0.0.1',
         adminHttpPort: parseInt(process.env.PAYOUT_ADMIN_PORT || '9080', 10),
+        adminToken:    loadAdminToken(),
+        adminAllowedHosts: (process.env.PAYOUT_ADMIN_ALLOWED_HOSTS || '')
+            .split(',').map(s => s.trim()).filter(Boolean),
     };
 }

@@ -45,6 +45,10 @@ PAYOUT_DRY_RUN=1 PAYOUT_DB_PATH=../data/shares.db \
 | `PAYOUT_DEBUG` | no | — | `1` = verbose |
 | `PAYOUT_NUDGE_MINE` | no | on | `0` = never ask Thunder to mine |
 | `PAYOUT_NUDGE_INTERVAL_MS` | no | 120000 | floor between mine attempts |
+| `PAYOUT_ADMIN_BIND` / `PAYOUT_ADMIN_PORT` | no | 127.0.0.1 / 9080 | admin HTTP listener; port `0` disables it |
+| `PAYOUT_ADMIN_TOKEN` | no | — | bearer token required on `POST /tick`; unset = `/tick` answers 503. Must equal the dashboard's |
+| `PAYOUT_ADMIN_TOKEN_FILE` | no | — | read the token from this file instead (takes precedence; unreadable = fatal) |
+| `PAYOUT_ADMIN_ALLOWED_HOSTS` | no | — | extra comma-separated hostnames accepted in the admin `Host` header, besides `localhost` / `127.0.0.1` / `::1` / the bind address |
 
 ## What it does each tick
 
@@ -140,8 +144,36 @@ by a long wait:
 [test/cadence.test.js](test/cadence.test.js) pins each row of that table.
 
 To force a run without waiting for the next one, use the dashboard's
-**Trigger payout now** button (or `POST /payout/run` on the worker's admin
-HTTP surface) — restarting the service also ticks immediately.
+**Trigger payout now** button (or `POST /tick` on the worker's admin
+HTTP surface, below) — restarting the service also ticks immediately.
+
+## Admin HTTP surface
+
+`POST /tick` runs one payout cycle and returns its result; `GET /healthz` is
+an unauthenticated liveness probe. It listens on `127.0.0.1:9080` by default,
+but loopback is **not** the boundary: the operator's browser is on loopback,
+a body-less POST is a CORS "simple request" any web page can send without a
+preflight, DNS rebinding can make it same-origin, and in the compose stack
+the worker binds `0.0.0.0` on the docker network. So:
+
+- `/tick` requires `Authorization: Bearer <PAYOUT_ADMIN_TOKEN>` (401
+  otherwise). With no token configured it answers **503** rather than run
+  unauthenticated, and the worker warns at startup — timed payouts are
+  unaffected.
+- any request carrying an `Origin` header is refused (403) — the dashboard
+  calls server-side and never sends one; a browser always does.
+- a `Host` header that is not a loopback name, the bind address, or listed in
+  `PAYOUT_ADMIN_ALLOWED_HOSTS` is refused (403), which defeats DNS rebinding.
+
+```sh
+curl -X POST -H "Authorization: Bearer $(sudo cat /etc/simplepool/payout-admin.token)" \
+     http://127.0.0.1:9080/tick
+```
+
+`scripts/install.sh` generates the token into
+`/etc/simplepool/payout-admin.token` and points both services at it via
+`PAYOUT_ADMIN_TOKEN_FILE`. [test/admin-http.test.js](test/admin-http.test.js)
+pins each refusal.
 
 ## `paid` means mined, not sent
 

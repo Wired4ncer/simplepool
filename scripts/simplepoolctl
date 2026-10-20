@@ -213,6 +213,7 @@ cmd_config() {
     say "install answers  $STATE_FILE   ${DIM}(root only — contains secrets)${OFF}"
     say "database         $DB_PATH"
     [[ -f "$STATE_DIR/admin.cred" ]] && say "admin creds      $STATE_DIR/admin.cred"
+    [[ -f "$STATE_DIR/payout-admin.token" ]] && say "payout token     $STATE_DIR/payout-admin.token"
     for d in /etc/systemd/system/simplepool-dashboard.service.d/local.conf \
              /etc/systemd/system/simplepool-payout.service.d/local.conf; do
         [[ -f "$d" ]] && say "service env      $d"
