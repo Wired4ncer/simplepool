@@ -11,6 +11,11 @@
 # another file containing bitcoind RPC credentials into a PUBLIC repo's
 # working tree, one `git add -A` away from being committed.
 /proxy.conf.bak.*
+# deploy/docker/README.md has operators create these two beside the compose
+# file: .env holds the admin password, proxy.conf the bitcoind RPC password.
+# The root-anchored patterns above don't reach them.
+/deploy/docker/.env
+/deploy/docker/proxy.conf
 # Release tarballs built by scripts/release.sh. They contain a full copy of
 # the tree plus a binary; nothing here belongs in the repo.
 /dist/

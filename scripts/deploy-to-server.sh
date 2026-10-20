@@ -77,13 +77,20 @@ fi
 export SUDO_PASS
 
 run_sudo() {
-    # base64-encode BOTH the password and the command so quoting/special
-    # characters in either never appear unescaped on the remote side.
-    # base64 output is [A-Za-z0-9+/=] which is safe inside any shell quoting.
-    local pw_b64 cmd_b64
-    pw_b64="$(printf '%s\n' "$SUDO_PASS" | base64 | tr -d '\n')"
-    cmd_b64="$(printf '%s' "$*" | base64 | tr -d '\n')"
-    "${SSH[@]}" "echo $pw_b64 | base64 -d | sudo -S -p '' bash -c \"\$(echo $cmd_b64 | base64 -d)\""
+    # The password travels over the ssh session's stdin, never in the remote
+    # command line: anything in that string is in the remote shell's argv,
+    # which every local user on the server can read from ps or
+    # /proc/<pid>/cmdline (base64 hides nothing). sudo -S reads exactly one
+    # line from stdin. The command is base64-encoded so quoting/special
+    # characters never appear unescaped on the remote side ([A-Za-z0-9+/=]
+    # is safe inside any shell quoting), and starts by pointing its own
+    # stdin at /dev/null: when sudo doesn't need the password (cached
+    # timestamp, NOPASSWD) that line would otherwise still be sitting on
+    # stdin for whatever the command runs.
+    local cmd_b64
+    cmd_b64="$(printf 'exec </dev/null; %s' "$*" | base64 | tr -d '\n')"
+    printf '%s\n' "$SUDO_PASS" \
+        | "${SSH[@]}" "sudo -S -p '' bash -c \"\$(echo $cmd_b64 | base64 -d)\""
 }
 
 run_remote() {
@@ -131,17 +138,22 @@ SQL"
 
 echo "==> [7/8] render & install systemd units"
 TMP_UNIT="$(mktemp)"; TMP_DASH="$(mktemp)"
-trap 'rm -f "$TMP_UNIT" "$TMP_DASH"' EXIT
+# Staging on the remote goes in a fresh private (0700) directory, not at
+# fixed /tmp names: /tmp is shared, so any local user on the server could
+# pre-create /tmp/simplepool.service (or swap it between the scp and the
+# install) and have root install their unit or nginx config.
+REMOTE_TMP="$(run_remote 'mktemp -d')"
+[[ "$REMOTE_TMP" == /* ]] || { echo "remote mktemp -d failed" >&2; exit 1; }
+trap 'rm -f "$TMP_UNIT" "$TMP_DASH"; run_remote "rm -rf ${REMOTE_TMP}" 2>/dev/null || true' EXIT
 sed -e "s|@USER@|${USER_PART}|g" -e "s|@ROOT@|${ROOT}|g" \
     "${SCRIPT_DIR}/deploy/systemd/simplepool.service" > "$TMP_UNIT"
 sed -e "s|@USER@|${USER_PART}|g" -e "s|@ROOT@|${ROOT}|g" \
     "${SCRIPT_DIR}/deploy/systemd/simplepool-dashboard.service" > "$TMP_DASH"
 
-"${SCP[@]}" "$TMP_UNIT" "${HOST}:/tmp/simplepool.service" >/dev/null
-"${SCP[@]}" "$TMP_DASH" "${HOST}:/tmp/simplepool-dashboard.service" >/dev/null
-run_sudo "install -m 0644 /tmp/simplepool.service /etc/systemd/system/simplepool.service && \
-          install -m 0644 /tmp/simplepool-dashboard.service /etc/systemd/system/simplepool-dashboard.service && \
-          rm -f /tmp/simplepool.service /tmp/simplepool-dashboard.service && \
+"${SCP[@]}" "$TMP_UNIT" "${HOST}:${REMOTE_TMP}/simplepool.service" >/dev/null
+"${SCP[@]}" "$TMP_DASH" "${HOST}:${REMOTE_TMP}/simplepool-dashboard.service" >/dev/null
+run_sudo "install -m 0644 ${REMOTE_TMP}/simplepool.service /etc/systemd/system/simplepool.service && \
+          install -m 0644 ${REMOTE_TMP}/simplepool-dashboard.service /etc/systemd/system/simplepool-dashboard.service && \
           systemctl daemon-reload && \
           systemctl enable --now simplepool.service && \
           systemctl restart simplepool.service"
@@ -156,15 +168,14 @@ if [[ "$DO_NGINX" == "1" ]]; then
     TMP_NGX="$(mktemp)"
     sed -e "s|pool.drivechain.info|${HOSTNAME_}|g" \
         "${SCRIPT_DIR}/deploy/nginx/pool.drivechain.info.conf" > "$TMP_NGX"
-    "${SCP[@]}" "$TMP_NGX" "${HOST}:/tmp/${HOSTNAME_}.conf" >/dev/null
-    "${SCP[@]}" "${SCRIPT_DIR}/deploy/nginx/pool-ratelimit.conf" "${HOST}:/tmp/pool-ratelimit.conf" >/dev/null
+    "${SCP[@]}" "$TMP_NGX" "${HOST}:${REMOTE_TMP}/${HOSTNAME_}.conf" >/dev/null
+    "${SCP[@]}" "${SCRIPT_DIR}/deploy/nginx/pool-ratelimit.conf" "${HOST}:${REMOTE_TMP}/pool-ratelimit.conf" >/dev/null
     rm -f "$TMP_NGX"
 
-    run_sudo "install -m 0644 /tmp/${HOSTNAME_}.conf /etc/nginx/sites-available/${HOSTNAME_} && \
-              install -m 0644 /tmp/pool-ratelimit.conf /etc/nginx/conf.d/pool-ratelimit.conf && \
+    run_sudo "install -m 0644 ${REMOTE_TMP}/${HOSTNAME_}.conf /etc/nginx/sites-available/${HOSTNAME_} && \
+              install -m 0644 ${REMOTE_TMP}/pool-ratelimit.conf /etc/nginx/conf.d/pool-ratelimit.conf && \
               ln -sf /etc/nginx/sites-available/${HOSTNAME_} /etc/nginx/sites-enabled/${HOSTNAME_} && \
               rm -f /etc/nginx/sites-enabled/default && \
-              rm -f /tmp/${HOSTNAME_}.conf /tmp/pool-ratelimit.conf && \
               nginx -t && systemctl reload nginx"
 
     # Open ports if ufw is active.

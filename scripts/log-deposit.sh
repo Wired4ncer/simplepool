@@ -56,6 +56,29 @@ if [[ "$RECIP" == *_* ]]; then
     exit 3
 fi
 
+# Every value below is spliced into SQL text, so each one is checked before
+# it gets there: a note like "pool's top-up" used to break the INSERT, and a
+# crafted --txid or --sats could close the VALUES list and write arbitrary
+# rows into the ledger the admin dashboard audits against. Numbers and
+# identifiers have a fixed shape and are matched against it, so nothing
+# outside the pattern reaches the SQL at all; the note is the one free-text
+# field and is quoted the SQL way, by doubling every '. (sqlite3's
+# `.parameter set` would not help: it parses its value as SQL too.)
+bad() { echo "$1" >&2; exit 2; }
+[[ "$TXID" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || bad "--txid must be a 64-character hex txid, got '$TXID'"
+# Bare base58 — the alphabet dashboard/lib/thunder-address.js decodes (no
+# 0, O, I or l). Anything else cannot be a Thunder address.
+[[ "$RECIP" =~ ^[1-9A-HJ-NP-Za-km-z]+$ ]] \
+    || bad "--recipient must be a bare base58 Thunder address, got '$RECIP'"
+# 18 digits stays inside SQLite's signed 64-bit INTEGER.
+for n in SATS FEE BEFORE AFTER; do
+    [[ -z "${!n}" || "${!n}" =~ ^[0-9]{1,18}$ ]] \
+        || bad "--$(echo "$n" | tr '[:upper:]' '[:lower:]') must be a non-negative integer, got '${!n}'"
+done
+sql_int()  { if [[ -n "$1" ]]; then echo "$1"; else echo NULL; fi; }
+sql_text() { local q="'"; if [[ -n "$1" ]]; then echo "'${1//$q/$q$q}'"; else echo NULL; fi; }
+
 NOW=$(date +%s)
 sqlite3 "$DB" <<SQL
 INSERT INTO deposits
@@ -63,9 +86,9 @@ INSERT INTO deposits
    ctip_seq_before, ctip_seq_after, notes)
 VALUES
   ($NOW, '$TXID', $SATS, $FEE, '$RECIP',
-   $(if [[ -n "$BEFORE" ]]; then echo $BEFORE; else echo NULL; fi),
-   $(if [[ -n "$AFTER"  ]]; then echo $AFTER;  else echo NULL; fi),
-   $(if [[ -n "$NOTE"   ]]; then echo "'$NOTE'"; else echo NULL; fi));
+   $(sql_int "$BEFORE"),
+   $(sql_int "$AFTER"),
+   $(sql_text "$NOTE"));
 SQL
 
 echo "logged deposit: $SATS sats to $RECIP (txid $TXID)"

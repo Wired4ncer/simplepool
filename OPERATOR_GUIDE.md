@@ -17,7 +17,7 @@ tracked by git.
 | what | where | credentials |
 | --- | --- | --- |
 | Public dashboard | `http://<pool-host>:8081/` | none |
-| **Admin dashboard** | `http://<pool-host>:8081/admin` | **`admin` / `<see /root/simplepool-admin-cred.txt on the box>`** |
+| **Admin dashboard** | `http://<pool-host>:8081/admin` | **`user:password` in `/etc/simplepool/admin.cred` on the box** |
 | Admin JSON API | `http://<pool-host>:8081/api/admin/summary` | same basic auth |
 | Everything as JSON | `http://<pool-host>:8081/api/status` | none |
 | Which commit is running | `http://<pool-host>:8081/api/versions` | none |
@@ -25,11 +25,12 @@ tracked by git.
 | SSH | `root@<pool-host>` | `<ssh-key>` |
 | Everything from the shell | `simplepoolctl status` / `doctor` / `logs -f` | root for `restart`, `upgrade`, `uninstall` |
 
-The admin password is stashed at `/root/simplepool-admin-cred.txt` on the
-box (root-only). To rotate, edit
-`/etc/systemd/system/simplepool-dashboard.service.d/pps-thunder.conf`
-and `systemctl daemon-reload && systemctl restart simplepool-dashboard`
-— there's a scripted version in [Rotating the admin
+The installer writes the admin credentials to `/etc/simplepool/admin.cred`
+as one `user:password` line (owned by the service user, mode 0400 — read it
+with `sudo cat`), and points the dashboard at it with
+`ADMIN_CREDENTIALS_FILE` in its drop-in. That file takes precedence over any
+`ADMIN_USER` / `ADMIN_PASSWORD` environment variables, so editing those in a
+drop-in changes nothing. To rotate, see [Rotating the admin
 password](#rotating-the-admin-password) below.
 
 ---
@@ -434,18 +435,36 @@ to slice the extranonce2 space per machine. simplepool advertises **8**.
 
 ## Rotating the admin password
 
+The password lives in two places the installer keeps in step:
+`/etc/simplepool/admin.cred` (what the dashboard actually checks — one
+`user:password` line, owned by the service user, mode 0400) and
+`ADMIN_PASSWORD` in `/etc/simplepool/install.env` (the saved answer every
+later `install.sh` run, including `simplepoolctl upgrade`, rewrites
+`admin.cred` from). Change only the first and the next upgrade quietly puts
+the old password back.
+
+The simple way is to re-run the installer and type the new password at the
+`admin password [keep current]` prompt (Enter keeps every other answer).
+That also rebuilds and restarts everything, so to change just the password:
+
 ```sh
 ssh -i <ssh-key> root@<pool-host>
-NEW_PASS=$(openssl rand -base64 21 | tr -d '=+/')
-sed -i "s/^Environment=ADMIN_PASSWORD=.*/Environment=ADMIN_PASSWORD=$NEW_PASS/" \
-  /etc/systemd/system/simplepool-dashboard.service.d/pps-thunder.conf
-echo "admin / $NEW_PASS" > /root/simplepool-admin-cred.txt
-systemctl daemon-reload
+. /etc/simplepool/install.env          # ADMIN_USER, SVC_USER
+NEW_PASS=$(openssl rand -base64 21 | tr -d '=+/')   # no ':' allowed
+# Written 0600 from the start, then handed to the service user: the
+# dashboard refuses to boot if it can't read the file.
+( umask 077; printf '%s:%s\n' "$ADMIN_USER" "$NEW_PASS" > /etc/simplepool/admin.cred.new )
+chown "$SVC_USER:$SVC_USER" /etc/simplepool/admin.cred.new
+chmod 0400 /etc/simplepool/admin.cred.new
+mv /etc/simplepool/admin.cred.new /etc/simplepool/admin.cred
+sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$NEW_PASS/" /etc/simplepool/install.env
 systemctl restart simplepool-dashboard.service
-cat /root/simplepool-admin-cred.txt
+cat /etc/simplepool/admin.cred
 ```
 
-Old password stops working immediately; the dashboard is up in ~1s.
+The dashboard reads the file once at start-up, so the old password keeps
+working until that restart and stops immediately after it; the dashboard
+is up again in ~1s.
 
 ---
 

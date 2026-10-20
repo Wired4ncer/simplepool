@@ -520,7 +520,24 @@ HTTP Basic auth separator — the dashboard refuses to boot if one does).
 
 The shipped `deploy/systemd/simplepool-dashboard.service` unit sets
 sane defaults. Override deployment-specific things with a drop-in
-so you don't fork the shipped template:
+so you don't fork the shipped template.
+
+**Admin credentials first** — the same file the installer writes, so the
+rest of this guide (and OPERATOR_GUIDE.md) applies unchanged. A fresh
+password, written 0600 from the start (never `tee` a secret: it lands
+world-readable under the default umask), then handed to the service user —
+the dashboard refuses to boot if it can't read the file. Do NOT commit or
+share it:
+
+```sh
+sudo install -d -m 0755 /etc/simplepool
+sudo sh -c 'umask 077; printf "admin:%s\n" "$(openssl rand -base64 21 | tr -d "=+/")" > /etc/simplepool/admin.cred'
+sudo chown simplepool:simplepool /etc/simplepool/admin.cred
+sudo chmod 0400 /etc/simplepool/admin.cred
+sudo cat /etc/simplepool/admin.cred      # admin:<password>
+```
+
+Then the drop-in:
 
 ```sh
 sudo mkdir -p /etc/systemd/system/simplepool-dashboard.service.d
@@ -529,9 +546,9 @@ sudo tee /etc/systemd/system/simplepool-dashboard.service.d/local.conf <<'CONF'
 # Public "connect a miner" URL rendered on the About card
 Environment=PUBLIC_STRATUM_URL=stratum+tcp://pool.example.com:3334
 
-# Admin panel — omit both vars to keep /admin returning 503
-Environment=ADMIN_USER=admin
-Environment=ADMIN_PASSWORD=<paste from openssl rand -base64 21 | tr -d '=+/'>
+# Admin panel — omit to keep /admin returning 503. Keeps the password out
+# of the unit file and out of `systemctl show` / the process environment.
+Environment=ADMIN_CREDENTIALS_FILE=/etc/simplepool/admin.cred
 
 # Only used by /admin: needed for the reserve-balance probe and audit
 # math cross-check
@@ -543,16 +560,10 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now simplepool-dashboard.service
 ```
 
-**Generate a fresh admin password** — do NOT commit or share:
-
-```sh
-openssl rand -base64 21 | tr -d '=+/' \
-    | sudo tee /root/simplepool-admin-cred.txt
-sudo chmod 600 /root/simplepool-admin-cred.txt
-```
-
-Then paste into the drop-in and reload. To rotate later, see the
-scripted one-liner in [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md#rotating-the-admin-password).
+To rotate later, see
+[OPERATOR_GUIDE.md](OPERATOR_GUIDE.md#rotating-the-admin-password) (with no
+`/etc/simplepool/install.env` on a manual box, skip its two `install.env`
+lines and set `ADMIN_USER=admin SVC_USER=simplepool` instead).
 
 ### Reverse proxy (recommended)
 
@@ -647,8 +658,9 @@ Then check:
    ```sh
    curl -sS -o /dev/null -w "no auth: %{http_code}\n" http://127.0.0.1:8081/admin
    # expect: no auth: 401
-   ADMIN_PASS=$(sudo cat /root/simplepool-admin-cred.txt | cut -d' ' -f3)
-   curl -sS -o /dev/null -w "with pw: %{http_code}\n" -u "admin:$ADMIN_PASS" http://127.0.0.1:8081/admin
+   # the file is already "user:password", exactly what curl -u takes
+   curl -sS -o /dev/null -w "with pw: %{http_code}\n" \
+       -u "$(sudo cat /etc/simplepool/admin.cred)" http://127.0.0.1:8081/admin
    # expect: with pw: 200
    ```
 5. **First miner authorizes**:
